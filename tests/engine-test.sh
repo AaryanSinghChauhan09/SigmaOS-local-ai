@@ -1084,6 +1084,10 @@ with patch.object(a, "known_models", return_value=["current"]), patch.object(a, 
   a.save_shares(["current"])
   record = a.write_status(cat, profile)
   check("a refused share is reported with the fix", record["share_error"] == a.OPERATOR_HINT)
+  os.unlink(a.share_error_path())
+  with patch.object(a, "tailscale_status", return_value=None):
+    record = a.write_status(cat, profile)
+  check("a refresh before tailscaled is up reports nothing to fix", record["share_error"] == "", repr(record["share_error"]))
 a.save_shares([])
 
 # The share proxy: a request the model accepts counts its machine for the
