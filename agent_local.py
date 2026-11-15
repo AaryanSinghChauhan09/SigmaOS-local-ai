@@ -3693,8 +3693,14 @@ def publish_shares(record, catalog, profile, force=False):
     published = _read(published_path())
     if not shares and not published and not force:
       return
+    # Without tailscaled running, as for a while after boot, there is nothing
+    # to publish to, and the survey already says the tailnet is missing. The
+    # serve routes outlast a restart, so the next refresh brings them in line.
+    status = tailscale_status()
+    if not status and not force:
+      return
     try:
-      dns = self_dns()
+      dns = self_dns(status)
       have = serve_handlers(dns)
       want = {f"{SHARE_ROOT}/{rid}": f"http://127.0.0.1:{SHARE_PROXY_PORT}/{rid}" for rid in shares if rid in record["models"]}
       if want:
