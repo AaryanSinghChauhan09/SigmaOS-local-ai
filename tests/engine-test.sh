@@ -158,6 +158,17 @@ check("RAM fit preserves desktop reserve", not a.fits(dict(variant, peak_ram_gib
 with patch.object(a, "free_memory", return_value=(1, 1)), patch.object(a, "top_memory_users", return_value="browser (12 GiB), editor (4 GiB)"), patch.object(a.time, "sleep"):
   raises("headroom failure lists largest memory users", lambda: a.check_headroom(variant, gpu), "browser (12 GiB), editor (4 GiB)")
 
+# A 64 GB Strix Halo on a stock kernel: the GPU maps half of RAM until use raises the cap.
+halo = {"vendor": "amd", "family": "amd-strix-halo", "memory_gib": 31.6, "unified": True}
+with patch.object(a, "platform_name", return_value="x86"), patch.object(a, "amd_gpus", return_value=[dict(halo)]), patch.object(a, "meminfo", return_value={"MemTotal": 62 * 2**30}):
+  halo = a.machine_profile()["gpus"][0]
+needs_more = dict(variant, peak_gpu_gib=38, peak_ram_gib=38)
+check("a unified AMD GPU fits by the cap use can raise it to", halo["max_memory_gib"] == 54 and a.fits(needs_more, profile, halo)[0])
+check("a GPU with VRAM of its own fits only by what it has", not a.fits(needs_more, profile, dict(halo, max_memory_gib=a.gpu_memory_ceiling_gib(dict(halo, unified=False), 62)))[0])
+raises("a model past the current cap waits for the reboot that raises it", lambda: a.check_headroom(needs_more, halo), "until a reboot")
+with patch.object(a, "choose_gpu", return_value=halo):
+  check("the panel is told to reboot, not that memory is short", a.start_fit({"variant": needs_more}, profile) == (False, a.REBOOT_FOR_GPU_MEMORY))
+
 payload = b'{"ok":true}'
 oid = hashlib.sha1(f"blob {len(payload)}\0".encode() + payload).hexdigest()
 tree = [{"type": "file", "path": "model.gguf", "size": 2, "lfs": {"oid": "c" * 64, "size": 3}},
