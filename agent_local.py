@@ -50,7 +50,8 @@ REBOOT_FOR_GPU_MEMORY = "Reboot to raise the GPU memory limit"
 # The kernel lets a GPU map at most half of RAM. A unified-memory AMD GPU has next to no VRAM of
 # its own, so that is all it can use; use raises the cap to all of RAM but the desktop's reserve,
 # through a kernel parameter in this drop-in that applies at the next boot.
-GPU_MEMORY_DROP_IN = "/etc/limine-entry-tool.d/omarchy-local-ai-gpu-memory.conf"
+# The same drop-in Omarchy writes on AMD machines (omarchy-apply-amd-gpu-memory).
+GPU_MEMORY_DROP_IN = "/etc/limine-entry-tool.d/amd-gpu-memory.conf"
 RAM_CLASSES = (32, 64, 96, 128, 192, 256, 512)
 STANDARD_INPUTS = ("model", "draft", "ctx", "alias", "key", "temperature", "top_p", "top_k")
 GFX_FAMILIES = {"gfx1151": "amd-strix-halo", "gfx1150": "amd-strix-point"}
