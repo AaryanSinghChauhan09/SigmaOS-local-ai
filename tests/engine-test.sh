@@ -158,6 +158,17 @@ check("RAM fit preserves desktop reserve", not a.fits(dict(variant, peak_ram_gib
 with patch.object(a, "free_memory", return_value=(1, 1)), patch.object(a, "top_memory_users", return_value="browser (12 GiB), editor (4 GiB)"), patch.object(a.time, "sleep"):
   raises("headroom failure lists largest memory users", lambda: a.check_headroom(variant, gpu), "browser (12 GiB), editor (4 GiB)")
 
+# A 64 GB Strix Halo with a desktop open: the 262K variant fits on paper, not in what's free.
+long_ctx = {"ctx": 262144, "peak_ram_gib": 42, "peak_gpu_gib": 40}
+short_ctx = {"ctx": 131072, "peak_ram_gib": 40, "peak_gpu_gib": 38}
+two = dict(recipe, variant=[short_ctx, long_ctx])
+roomy = dict(gpu, memory_gib=54)
+with patch.object(a, "free_memory", return_value=(48.6, 54)), patch.object(a, "top_memory_users", return_value=""), patch.object(a.time, "sleep"):
+  check("a setup steps down to the context that fits what's free", a.start_variant(two, long_ctx, dict(profile, ram_gib=62), roomy) == short_ctx)
+  raises("an asked-for context isn't swapped", lambda: a.start_variant(two, long_ctx, dict(profile, ram_gib=62), roomy, ctx=262144), "Not enough free memory")
+with patch.object(a, "free_memory", return_value=(40.0, 54)), patch.object(a, "top_memory_users", return_value=""), patch.object(a.time, "sleep"):
+  raises("with no variant fitting, the picked one's shortfall is reported", lambda: a.start_variant(two, long_ctx, dict(profile, ram_gib=62), roomy), "needs 42 GiB RAM")
+
 # A 64 GB Strix Halo on a stock kernel: the GPU maps half of RAM until use raises the cap.
 halo = {"vendor": "amd", "family": "amd-strix-halo", "memory_gib": 31.6, "unified": True}
 with patch.object(a, "platform_name", return_value="x86"), patch.object(a, "amd_gpus", return_value=[dict(halo)]), patch.object(a, "meminfo", return_value={"MemTotal": 62 * 2**30}):
