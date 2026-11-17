@@ -1,5 +1,5 @@
 name = "Qwen3.8 Flash Next"
-summary = "125B mixture of experts, 6B active per token, 4-bit, with MTP drafting. The fastest agent turns, and twice the speed on code edits."
+summary = "125B mixture of experts, 6B active per token, 4-bit, with MTP drafting. The fastest agent turns on Strix Halo, more than twice Qwen3.8 27B's speed on long ones."
 runtime = "gufo"
 vendor = "qwen"
 architecture = "moe"
