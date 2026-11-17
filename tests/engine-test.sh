@@ -722,7 +722,7 @@ with patch.object(a, "load_catalog", return_value=cat), patch.object(a, "machine
 for response, succeeds in (([(200, b"")], False),
                            ([(401, b""), (200, b'{"data":[{"id":"other"}]}')], False),
                            ([(401, b""), (200, json.dumps({"data": [{"id": rid}]}).encode())], True)):
-  with patch.object(a, "unit_active", return_value=False), patch.object(a, "write_status"), patch.object(a, "evict_idle_weights"), patch.object(a, "check_headroom", return_value=(100.0, 90.0)), patch.object(a, "free_memory", return_value=(52.0, 64.0)), patch.object(a, "ensure_key", return_value="test-key"), patch.object(a, "http_status", side_effect=response) as http, patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0)) as systemctl:
+  with patch.object(a, "unit_active", return_value=False), patch.object(a, "write_status"), patch.object(a, "evict_idle_weights"), patch.object(a, "check_headroom", return_value=(100.0, 90.0)), patch.object(a, "free_memory", return_value=(52.0, 64.0)), patch.object(a, "ensure_key", return_value="test-key"), patch.object(a, "http_status", side_effect=response) as http, patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0, stdout="")) as systemctl:
     if succeeds:
       a._start(SimpleNamespace(recipe=rid), cat, profile)
       check("first checked start clears the unchecked flag", not a.load_model(rid).get("unchecked") and http.call_count == 2)
@@ -775,9 +775,24 @@ a.clear_installing(rid)
 Path(a.model_manifest_path("dismissed")).unlink(missing_ok=True)
 a.begin_installing("dismissed", {"name": "Dismissed"})
 a.fail_installing("dismissed", "Download failed")
-with patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0)) as stop, patch.object(a, "known_models", return_value=[]), patch.object(a, "write_unit_files"), patch.object(a, "refresh_list_cache"), patch.object(a, "write_status"):
+with patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0, stdout="")) as stop, patch.object(a, "known_models", return_value=[]), patch.object(a, "write_unit_files"), patch.object(a, "refresh_list_cache"), patch.object(a, "write_status"):
   check("remove dismisses a failed setup", a.cmd_remove(["dismissed"]) == 0 and a.load_installing("dismissed") is None)
   check("remove stops the setup's unit first", ("stop", a.install_unit("dismissed")) in [call.args for call in stop.call_args_list])
+
+# Stopped mid-load, systemd skips ExecStop and conmon ignores SIGTERM: the container goes first.
+for state, removed in (("activating", True), ("active", False)):
+  calls = []
+  with patch.object(a, "unit_props", return_value={"ActiveState": state}), \
+       patch.object(a, "systemctl", side_effect=lambda *args, **_: calls.append(args)), \
+       patch.object(a.subprocess, "run", side_effect=lambda argv, **_: calls.append(tuple(argv))):
+    a.stop_unit("loading")
+  unit, container = a.unit_name("loading"), a.unit_base("loading")
+  expected = [("stop", "--no-block", unit), ("podman", "rm", "-v", "-f", "-i", "-t", "0", container), ("stop", unit), ("reset-failed", unit)] if removed else [("stop", unit)]
+  check(f"stopping a model that is {state} {'removes its container' if removed else 'leaves it to ExecStop'}", calls == expected, repr(calls))
+a.clear_error("loading")
+with patch.dict(os.environ, {"SERVICE_RESULT": "exit-code"}), patch.object(a, "unit_props", return_value={"InactiveExitTimestamp": "@1"}), patch.object(a, "write_status") as written:
+  a.cmd_status(["--write", "--stopped", "loading"])
+check("a model stopped mid-load ends stopped, not failed", written.call_args.args[2] == {"loading": "inactive"} and not os.path.exists(a.error_path("loading")), repr(written.call_args))
 
 # A setup waiting for another's lock is already cancellable, and stops if its
 # record was removed while it waited.
@@ -813,7 +828,7 @@ with patch.object(a, "load_catalog", return_value=cat), patch.object(a, "machine
     pass
 check("interrupting a use still waiting leaves the active setup's record", (a.load_installing(rid) or {}).get("pid") == os.getppid())
 a.update_installing(rid, image=runtime["image"])
-with patch.object(a, "load_catalog", return_value=cat), patch.object(a, "machine_profile", return_value=profile), patch.object(a, "Lock", return_value=Waiting()), patch.object(a, "load_model", return_value=None), patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0)), patch.object(a, "stop_setup_process"), patch.object(a, "write_status"), patch.object(a, "refresh_list_cache"), patch.object(a, "_remove_files", return_value=(0, [])) as removed:
+with patch.object(a, "load_catalog", return_value=cat), patch.object(a, "machine_profile", return_value=profile), patch.object(a, "Lock", return_value=Waiting()), patch.object(a, "load_model", return_value=None), patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0, stdout="")), patch.object(a, "stop_setup_process"), patch.object(a, "write_status"), patch.object(a, "refresh_list_cache"), patch.object(a, "_remove_files", return_value=(0, [])) as removed:
   a.cmd_remove([rid])
 check("cancelling a setup removes the image it pulled", removed.call_args.args == (rid, runtime["image"]))
 with patch.object(a, "known_models", return_value=[]), patch.object(a, "write_unit_files"), patch.object(a.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as rmi:
@@ -849,7 +864,7 @@ mine, other = "a" * 64 + ".part", "b" * 64 + ".part"
 (staging / other).write_bytes(b"y" * 10)
 a.begin_installing("cancelled", {"name": "Cancelled"})
 a.update_installing("cancelled", partials=[mine, "../escape.part"])
-with patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0)) as stop, patch.object(a, "known_models", return_value=[]), patch.object(a, "write_unit_files"), patch.object(a, "refresh_list_cache"), patch.object(a, "write_status"):
+with patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0, stdout="")) as stop, patch.object(a, "known_models", return_value=[]), patch.object(a, "write_unit_files"), patch.object(a, "refresh_list_cache"), patch.object(a, "write_status"):
   a.cmd_remove(["cancelled"])
 check("cancelling a setup stops its model service", ("stop", a.unit_name("cancelled")) in [call.args for call in stop.call_args_list])
 check("cancelling a setup drops only its own partial downloads", not (staging / mine).exists() and (staging / other).exists())

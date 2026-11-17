@@ -1740,6 +1740,34 @@ def unit_active(rid):
   return unit_props(rid, "ActiveState").get("ActiveState") in ("active", "activating", "reloading")
 
 
+def stop_unit(rid):
+  """Stop a model's unit, as promptly mid-load as once it's up. systemd runs ExecStop only for a
+  unit that went active: one still loading just has conmon sent SIGTERM, which it doesn't pass on,
+  so the stop sat out the 90s timeout and then killed. The stop is queued first, so the container
+  ending isn't taken for a crash to restart, then the container is removed as ExecStop would, at
+  once: a server mid-load doesn't heed SIGTERM, and a half-loaded model has nothing to save. The
+  marker tells the stop hook and the start this was asked for, not a crash or a failed start, and
+  systemd's own failed state, from the killed server's exit, is cleared for the same reason."""
+  if unit_props(rid, "ActiveState").get("ActiveState") != "activating":
+    return systemctl("stop", unit_name(rid))
+  write_atomic(stop_requested_path(rid), "")
+  systemctl("stop", "--no-block", unit_name(rid))
+  subprocess.run(["podman", "rm", "-v", "-f", "-i", "-t", "0", unit_base(rid)], capture_output=True)
+  result = systemctl("stop", unit_name(rid))
+  systemctl("reset-failed", unit_name(rid))
+  return result
+
+
+def stop_requested_path(rid):
+  return os.path.join(state_dir(), "stopping", rid)
+
+
+def stop_requested(rid, since_ms):
+  """Whether a stop was asked for since since_ms, the start it would have cut short."""
+  path = stop_requested_path(rid)
+  return bool(since_ms) and os.path.exists(path) and os.path.getmtime(path) * 1000 >= since_ms
+
+
 SERVER_ERROR_RE = re.compile(r"^(error|tensorfold|fatal):\s*(.+)", re.IGNORECASE)
 
 
@@ -2751,7 +2779,7 @@ def activate(manifest, recipe, runtime, gpu, key, catalog, profile):
   if was_running:
     say(f"Restarting {rid} with the new setup (its in-flight requests are interrupted)")
     write_status(catalog, profile, {rid: "deactivating"})
-    systemctl("stop", unit_name(rid))
+    stop_unit(rid)
   clear_error(rid)
   try:
     evict_idle_weights(keep=[rid])
@@ -2764,7 +2792,7 @@ def activate(manifest, recipe, runtime, gpu, key, catalog, profile):
     load_seconds = start_unit(rid)
     post_start_checks(rid, key)
   except (LocalError, subprocess.CalledProcessError) as error:
-    systemctl("stop", unit_name(rid))
+    stop_unit(rid)
     write_unit_files(rid, previous_text)
     if os.path.exists(pair_setup_path(rid)):
       os.unlink(pair_setup_path(rid))
@@ -3045,7 +3073,7 @@ def start_fit(manifest, profile):
 
 
 def model_record(rid, manifest, profile):
-  props = unit_props(rid, "ActiveState", "SubState", "Result", "InactiveExitTimestamp", "ActiveExitTimestamp")
+  props = unit_props(rid, "ActiveState", "SubState", "Result", "InactiveExitTimestamp", "ActiveExitTimestamp", "StateChangeTimestamp")
   unit = props.get("ActiveState", "inactive") or "inactive"
   # A removal in progress outranks the unit's own state, which passes
   # through stopping and stopped on the way.
@@ -3087,7 +3115,7 @@ def model_record(rid, manifest, profile):
     "ram_total_gib": nodes_ram_gib(manifest, profile),
     # When the current start or stop began, and how long the last load took:
     # the panel's progress bar measures the one against the other.
-    "since_ms": int(os.path.getmtime(removing_path(rid)) * 1000) if removing else _unix_ms(props.get("InactiveExitTimestamp") if unit == "activating" else props.get("ActiveExitTimestamp") if unit == "deactivating" else ""),
+    "since_ms": int(os.path.getmtime(removing_path(rid)) * 1000) if removing else _unix_ms(props.get("InactiveExitTimestamp") if unit == "activating" else (props.get("ActiveExitTimestamp") or props.get("StateChangeTimestamp")) if unit == "deactivating" else ""),
     "expected_load_seconds": expected_load_seconds(rid, manifest),
     "expected_stop_seconds": expected_stop_seconds(rid),
     "expected_remove_seconds": float(removing) if removing else None,
@@ -3175,7 +3203,8 @@ def cmd_status(argv):
       transitions[args.started] = "active"
     if args.stopped and ID_RE.match(args.stopped):
       result = os.environ.get("SERVICE_RESULT", "success")
-      if result == "success":
+      started = _unix_ms(unit_props(args.stopped, "InactiveExitTimestamp").get("InactiveExitTimestamp"))
+      if result == "success" or stop_requested(args.stopped, started):
         transitions[args.stopped] = "inactive"
       else:
         record_error(args.stopped, failure_reason(args.stopped, result))
@@ -3217,7 +3246,7 @@ def cmd_stop(argv):
   write_status(catalog, profile, {rid: "deactivating" for rid in targets})
   for rid in targets:
     started = time.time()
-    systemctl("stop", unit_name(rid))
+    stop_unit(rid)
     # How long this model takes to let go; the panel's stopping bar measures
     # the next stop against it.
     write_atomic(stop_seconds_path(rid), f"{time.time() - started:.1f}\n")
@@ -3263,6 +3292,10 @@ def _start(args, catalog, profile):
   systemctl("reset-failed", unit_name(rid))
   result = systemctl("start", unit_name(rid))
   write_atomic(os.path.join(state_dir(), "last"), rid + "\n")
+  if result.returncode != 0 and stop_requested(rid, int(started * 1000)):
+    write_status(catalog, profile)
+    say(f"{rid} was stopped before it finished loading")
+    return 1
   if result.returncode != 0:
     record_error(rid, "Didn't start: omarchy agent local status shows why")
   else:
@@ -3275,7 +3308,7 @@ def _start(args, catalog, profile):
     try:
       post_start_checks(rid, ensure_key())
     except LocalError as error:
-      systemctl("stop", unit_name(rid))
+      stop_unit(rid)
       record_error(rid, error.short)
       write_status(catalog, profile)
       raise
@@ -3315,7 +3348,7 @@ def cmd_remove(argv):
     if manifest is None and setting_up is not None:
       # Cancelled while its model loaded: activation starts the unit before
       # the manifest exists, so stop it before its files go.
-      systemctl("stop", unit_name(rid))
+      stop_unit(rid)
       # Read again: the setup may have reached its image since the first look.
       setting_up = load_installing(rid) or setting_up
       if setting_up.get("pair"):
@@ -3345,7 +3378,7 @@ def cmd_remove(argv):
     try:
       if running:
         say(f"Stopping {rid}")
-        systemctl("stop", unit_name(rid))
+        stop_unit(rid)
       deleting = time.time()
       if manifest:
         pair_remove(manifest, args.local_only)
