@@ -986,15 +986,10 @@ def fits(variant, profile, gpu):
   return True, ""
 
 
-def pick_variant(recipe, profile, gpu, ctx=None, measured_ctx=None):
+def pick_variant(recipe, profile, gpu, ctx=None):
   # The largest context first, and at the same context the larger setup (more streams, a bigger
   # prompt cache) where it fits, so a smaller machine falls back to the variant sized for it.
   variants = sorted(recipe.get("variant", []), key=lambda v: (v["ctx"], v["peak_ram_gib"]), reverse=True)
-  # A class runs no larger a context than it was measured at: fit counts the desktop's reserve
-  # against all of RAM, but a 64 GB Strix Halo's desktop holds more than that, and its 262K
-  # variant fits on paper without the memory free to start. An asked-for context still goes.
-  if measured_ctx and not ctx:
-    variants = [v for v in variants if v["ctx"] <= measured_ctx] or variants
   if ctx:
     variants = [v for v in variants if v["ctx"] == ctx]
     if not variants:
@@ -1016,7 +1011,7 @@ def compatibility(catalog, rid, profile, gpu, ctx=None):
   if not qualified(recipe, profile, gpu):
     classes = ", ".join(f"{hw.get('gpu')} {hw.get('ram_class')} GB" for hw in recipe.get("hardware", []))
     return None, f"not measured on {gpu['family']} {profile['ram_class']} GB (measured: {classes})"
-  return pick_variant(recipe, profile, gpu, ctx, load_measurement(catalog, recipe, profile, gpu).get("ctx"))
+  return pick_variant(recipe, profile, gpu, ctx)
 
 
 def match_class(best, profile, gpu):
@@ -1970,6 +1965,14 @@ def evict_idle_weights(keep=()):
         os.close(fd)
 
 
+def start_needs_gib(variant):
+  """The RAM free a model needs to start. Fit already keeps RESERVE_GIB of the machine's RAM for
+  the desktop, and what the desktop holds now is not free, so start counts the reserve no second
+  time: a 64 GB Strix Halo whose desktop holds 13 GiB has 48.6 free, short of 42 + 8 but with room
+  for the model's 42."""
+  return variant["peak_ram_gib"]
+
+
 def check_headroom(variant, gpu):
   if variant["peak_gpu_gib"] > gpu["memory_gib"]:
     raise gpu_short_error(variant, gpu)
@@ -1978,15 +1981,15 @@ def check_headroom(variant, gpu):
     peer_headroom(gpu["peer"], variant)
   for _ in range(15):
     available, gpu_free = free_memory(gpu)
-    if available >= variant["peak_ram_gib"] + RESERVE_GIB and gpu_free >= variant["peak_gpu_gib"]:
+    if available >= start_needs_gib(variant) and gpu_free >= variant["peak_gpu_gib"]:
       return available, gpu_free
     time.sleep(1)
   running = [rid for rid in known_models() if unit_active(rid)]
   names = [(load_model(rid) or {}).get("recipe", {}).get("name", rid) for rid in running]
-  need = variant["peak_ram_gib"] + RESERVE_GIB
+  need = start_needs_gib(variant)
   short = f"{NOT_ENOUGH_MEMORY} (needs {need:g} GiB)"
   raise LocalError(
-    f"Not enough free memory right now: the model needs {variant['peak_ram_gib']:g} GiB RAM plus {RESERVE_GIB} GiB for the desktop "
+    f"Not enough free memory right now: the model needs {need:g} GiB RAM "
     f"and {variant['peak_gpu_gib']:g} GiB GPU-addressable; {available:.1f} GiB RAM and {gpu_free:.1f} GiB GPU are free.\n"
     + (f"Local models running: {', '.join(running)} (stop one with: omarchy agent local stop <recipe>)\n" if running else "")
     + f"Largest memory users: {top_memory_users()}",
@@ -2044,6 +2047,7 @@ def pair_manifest(rid):
 
 
 def peer_headroom(peer, variant):
+  # Fit counts the reserve against this machine's RAM only, so the peer's is kept here.
   node = pair_python(peer, "node()", timeout=10)
   available = gib(node["ram_available"])
   need = variant["peak_ram_gib"] + RESERVE_GIB
@@ -3044,7 +3048,7 @@ def start_fit(manifest, profile):
   if variant["peak_gpu_gib"] > gpu["memory_gib"]:
     return False, gpu_short_error(variant, gpu).short
   available, gpu_free = free_memory(gpu)
-  if available >= variant["peak_ram_gib"] + RESERVE_GIB and gpu_free >= variant["peak_gpu_gib"]:
+  if available >= start_needs_gib(variant) and gpu_free >= variant["peak_gpu_gib"]:
     return True, ""
   return False, "Not enough memory"
 

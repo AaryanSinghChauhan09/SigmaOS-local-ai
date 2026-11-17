@@ -111,7 +111,7 @@ for role in ("model", "draft"):
 check("identical best selectors are rejected", any("same selectors" in e for e in a.validate_best({"class": [entry, entry]}, {"model": recipe})))
 check("best cannot recommend an unmeasured class", any("no measured" in e for e in a.validate_best({"class": [dict(entry, ram_class=128)]}, {"model": recipe})))
 
-catalog = SimpleNamespace(recipes={"model": copy.deepcopy(recipe)}, runtimes={"server": runtime}, best={"class": [entry]}, root=os.environ["HOME"])
+catalog = SimpleNamespace(recipes={"model": copy.deepcopy(recipe)}, runtimes={"server": runtime}, best={"class": [entry]})
 check("best requires an exact GPU and RAM pair", a.match_class({"class": [entry]}, profile, dict(gpu, family="other")) is None and a.match_class({"class": [entry]}, dict(profile, ram_class=128), gpu) is None)
 check("best requires a GPU selector", any(".gpu" in e for e in a.validate_best({"class": [{"ram_class": 64, "recipes": ["model"]}]}, {"model": recipe})))
 check("best rejects platform selectors", any(".platform" in e for e in a.validate_best({"class": [dict(entry, platform="x86")]}, {"model": recipe})))
@@ -158,12 +158,11 @@ check("RAM fit preserves desktop reserve", not a.fits(dict(variant, peak_ram_gib
 with patch.object(a, "free_memory", return_value=(1, 1)), patch.object(a, "top_memory_users", return_value="browser (12 GiB), editor (4 GiB)"), patch.object(a.time, "sleep"):
   raises("headroom failure lists largest memory users", lambda: a.check_headroom(variant, gpu), "browser (12 GiB), editor (4 GiB)")
 
-# A class runs no larger a context than it was measured at, unless one is asked for.
-two = dict(recipe, variant=[{"ctx": 131072, "peak_ram_gib": 40, "peak_gpu_gib": 38}, {"ctx": 262144, "peak_ram_gib": 42, "peak_gpu_gib": 40}])
-roomy = dict(gpu, memory_gib=54)
-check("a class measured at 131K gets the 131K variant", a.pick_variant(two, dict(profile, ram_gib=62), roomy, measured_ctx=131072)[0]["ctx"] == 131072)
-check("a class measured at 262K keeps the 262K variant", a.pick_variant(two, dict(profile, ram_gib=62), roomy, measured_ctx=262144)[0]["ctx"] == 262144)
-check("an asked-for context passes the measured one", a.pick_variant(two, dict(profile, ram_gib=62), roomy, ctx=262144, measured_ctx=131072)[0]["ctx"] == 262144)
+# A 64 GB Strix Halo whose desktop holds 13 GiB: fit kept its reserve, so start needs only the peak.
+long_ctx = {"ctx": 262144, "peak_ram_gib": 42, "peak_gpu_gib": 40}
+with patch.object(a, "free_memory", return_value=(48.6, 54)), patch.object(a, "choose_gpu", return_value=dict(gpu, memory_gib=54)):
+  check("start counts the desktop's reserve once", a.check_headroom(long_ctx, dict(gpu, memory_gib=54)) == (48.6, 54)
+        and a.start_fit({"variant": long_ctx}, profile) == (True, ""))
 
 # A 64 GB Strix Halo on a stock kernel: the GPU maps half of RAM until use raises the cap.
 halo = {"vendor": "amd", "family": "amd-strix-halo", "memory_gib": 31.6, "unified": True}
@@ -369,7 +368,7 @@ paired = dict(recipe, hardware=[{"gpu": "nvidia-gb10-pair", "ram_class": 128, "m
               variant=[{"ctx": 4096, "peak_ram_gib": 104, "peak_gpu_gib": 104}])
 check("a pair machine runs single-node recipes on its own GPU", a.recipe_gpu(pair_profile, single)["family"] == "nvidia-gb10" and a.recipe_gpu(pair_profile, paired)["family"] == "nvidia-gb10-pair")
 nv_rt = dict(runtime, run={"devices": ["cdi-nvidia"]})
-pair_catalog = SimpleNamespace(root=os.environ["HOME"], recipes={"single": single, "paired": paired}, runtimes={"server": nv_rt, "pair": pair_rt},
+pair_catalog = SimpleNamespace(recipes={"single": single, "paired": paired}, runtimes={"server": nv_rt, "pair": pair_rt},
                                best={"class": [{"gpu": "nvidia-gb10", "ram_class": 128, "recipes": ["single"]},
                                                {"gpu": "nvidia-gb10-pair", "ram_class": 128, "recipes": ["paired"]}]})
 check("best on a pair is the pair's recipe", a.resolve_best(pair_catalog, pair_profile)[0] == "paired")
