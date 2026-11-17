@@ -61,7 +61,7 @@ runtime = {
 variant = {"ctx": 4096, "peak_ram_gib": 16, "peak_gpu_gib": 16}
 artifact = {"repo": "test/model", "revision": "b" * 40, "license": "mit",
             "files": ["model.gguf", "tokenizer/*.json"], "model": "model.gguf"}
-recipe = {"name": "Test model", "summary": "Fixture", "runtime": "server",
+recipe = {"name": "Test model", "runtime": "server",
           "hardware": [{"gpu": "amd-strix-halo", "ram_class": 64, "measured": "measurements/model.toml"}],
           "artifacts": [artifact], "variant": [variant]}
 gpu = {"vendor": "amd", "family": "amd-strix-halo", "memory_gib": 48}

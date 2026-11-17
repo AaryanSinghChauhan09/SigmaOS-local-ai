@@ -45,7 +45,7 @@ The real records are the examples and source of values:
 | Path | Rules |
 | --- | --- |
 | [catalog.toml](../catalog.toml) | The catalog schema, 1. |
-| [recipes/](../recipes/) | Name, summary, runtime, pinned artifacts, measured hardware, context variants, sampling and optional server arguments. Vendor names the panel logo; architecture is `dense` or `moe`; `input` is `["text"]` (the default) or `["text", "image"]`, which the agent overlays declare so agents can send screenshots. |
+| [recipes/](../recipes/) | Name, runtime, pinned artifacts, measured hardware, context variants, sampling and optional server arguments. Vendor names the panel logo; architecture is `dense` or `moe`; `input` is `["text"]` (the default) or `["text", "image"]`, which the agent overlays declare so agents can send screenshots. |
 | [runtimes/](../runtimes/) | Digest-pinned image, tier, port, command, standard input mappings, reserved options and nonempty `health.probe` argv. A paired runtime adds `listen` (its bind flags), `@PORT@` in its probe and a `[pair]` table: `nodes = 2`, `master_port`, the `state` path where each rank's own folder is mounted writable for the server's caches, and `env` for both ranks (any names but the link's `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA` and `NCCL_IB_GID_INDEX`, which the engine sets), whose values may hold `@RANK@`, `@WORLD@`, `@MASTER_ADDR@`, `@MASTER_PORT@` and `@RDMA_DEVICES@`. Both ranks run the runtime's command with the same arguments. |
 | [reviews/](../reviews/) | Third-party image digest, publisher, reviewer, date, license URL/hash and checked properties. |
 | [measurements/](../measurements/) | Hardware evidence, artifact identities, context, memory, load time and short, long and code-edit prompt timings. |
@@ -205,7 +205,7 @@ error, the setup and model journals and, for a paired model, rank 1's container
 log from the peer. Transition timestamps are Unix milliseconds. Pending activation uses
 the current manifest's observations until the new setup has been measured.
 
-`list.json` rows contain `id`, `name`, `summary`, `runtime`, `tier`, `publisher`,
+`list.json` rows contain `id`, `name`, `runtime`, `tier`, `publisher`,
 `vendor`, `architecture`, `installed`, `available`, `reason`, `best`, `active`,
 `memory_gib`, `context`, `decode_tok_s` and `prefill_tok_s`. Unavailable variants
 have null memory/context; missing measurements have null speeds.
