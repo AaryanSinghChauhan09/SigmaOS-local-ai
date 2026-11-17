@@ -165,9 +165,26 @@ with patch.object(a, "platform_name", return_value="x86"), patch.object(a, "amd_
 needs_more = dict(variant, peak_gpu_gib=38, peak_ram_gib=38)
 check("a unified AMD GPU fits by the cap use can raise it to", halo["max_memory_gib"] == 54 and a.fits(needs_more, profile, halo)[0])
 check("a GPU with VRAM of its own fits only by what it has", not a.fits(needs_more, profile, dict(halo, max_memory_gib=a.gpu_memory_ceiling_gib(dict(halo, unified=False), 62)))[0])
-raises("a model past the current cap waits for the reboot that raises it", lambda: a.check_headroom(needs_more, halo), "until a reboot")
-with patch.object(a, "choose_gpu", return_value=halo):
+page = os.sysconf("SC_PAGE_SIZE")
+with patch.object(a, "pending_pages_limit", return_value=54 * 2**30 // page), patch.object(a, "_read", return_value=str(31 * 2**30 // page)), patch.object(a, "choose_gpu", return_value=halo):
+  raises("a model past the current cap waits for the reboot that raises it", lambda: a.check_headroom(needs_more, halo), "until a reboot")
   check("the panel is told to reboot, not that memory is short", a.start_fit({"variant": needs_more}, profile) == (False, a.REBOOT_FOR_GPU_MEMORY))
+with patch.object(a, "pending_pages_limit", return_value=0), patch.object(a, "_read", return_value=str(31 * 2**30 // page)), patch.object(a, "choose_gpu", return_value=halo):
+  raises("with no raise waiting, use is named instead of a reboot", lambda: a.check_headroom(needs_more, halo), "use raises its memory limit")
+  check("and the panel isn't told a reboot would help", a.start_fit({"variant": needs_more}, profile) == (False, a.GPU_TOO_SMALL))
+
+# The root script against a limine-mkinitcpio that fails a kernel and still exits 0, as it does.
+fake = Path(os.environ["HOME"]) / "fake-limine"
+fake.mkdir()
+(fake / "limine-mkinitcpio").write_text("#!/bin/bash\necho 'mkinitcpio failed for kernel linux'\n")
+(fake / "limine-mkinitcpio").chmod(0o755)
+drop_in = fake / "limine-entry-tool.d" / "amd-gpu-memory.conf"
+run_script = lambda: subprocess.run(["bash", "-c", a.GPU_MEMORY_SCRIPT, "test", str(drop_in), "14185506"], capture_output=True, env=dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}")).returncode
+check("a failed rebuild fails and leaves no drop-in to skip the retry", run_script() == 1 and not drop_in.exists())
+drop_in.write_text("# Omarchy's\n")
+check("a failed rebuild puts the earlier drop-in back", run_script() == 1 and drop_in.read_text() == "# Omarchy's\n")
+(fake / "limine-mkinitcpio").write_text("#!/bin/bash\necho rebuilt\n")
+check("a rebuild that succeeds keeps the raised cap", run_script() == 0 and drop_in.read_text() == 'KERNEL_CMDLINE[default]+=" ttm.pages_limit=14185506"\n')
 
 payload = b'{"ok":true}'
 oid = hashlib.sha1(f"blob {len(payload)}\0".encode() + payload).hexdigest()
