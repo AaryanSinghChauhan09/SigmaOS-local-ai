@@ -46,6 +46,34 @@ RESERVE_GIB = 8
 PROGRESS_PUBLISH_SECONDS = 0.5
 PROGRESS_WINDOW_SECONDS = 4
 NOT_ENOUGH_MEMORY = "Not enough memory to start model"
+REBOOT_FOR_GPU_MEMORY = "Reboot to raise the GPU memory limit"
+# The kernel lets a GPU map at most half of RAM. A unified-memory AMD GPU has next to no VRAM of
+# its own, so that is all it can use; use raises the cap to all of RAM but the desktop's reserve,
+# through a kernel parameter in this drop-in that applies at the next boot.
+# The same drop-in Omarchy writes on AMD machines (omarchy-apply-amd-gpu-memory).
+GPU_MEMORY_DROP_IN = "/etc/limine-entry-tool.d/amd-gpu-memory.conf"
+TTM_PAGES_LIMIT = "/sys/module/ttm/parameters/pages_limit"
+GPU_TOO_SMALL = "Not enough GPU memory"
+# Run as root with the drop-in and the page count. A failed rebuild puts the drop-in back as it
+# was, so the next use rebuilds again rather than finding its value already saved.
+GPU_MEMORY_SCRIPT = r"""
+drop_in=$1 pages=$2 previous=
+if [[ -f $drop_in ]]; then
+  previous=$(<"$drop_in")
+fi
+# A drop-in that can't be written stops here, before a rebuild that would succeed without it.
+mkdir -p "${drop_in%/*}" && printf 'KERNEL_CMDLINE[default]+=" ttm.pages_limit=%s"\n' "$pages" > "$drop_in" || exit 1
+# limine-mkinitcpio reports a kernel it could not rebuild and still exits 0.
+if ! log=$(limine-mkinitcpio 2>&1) || grep -q 'mkinitcpio failed for kernel' <<<"$log"; then
+  printf '%s\n' "$log" >&2
+  if [[ -n $previous ]]; then
+    printf '%s\n' "$previous" > "$drop_in"
+  else
+    rm -f "$drop_in"
+  fi
+  exit 1
+fi
+"""
 RAM_CLASSES = (32, 64, 96, 128, 192, 256, 512)
 STANDARD_INPUTS = ("model", "draft", "ctx", "alias", "key", "temperature", "top_p", "top_k")
 GFX_FAMILIES = {"gfx1151": "amd-strix-halo", "gfx1150": "amd-strix-point"}
@@ -222,6 +250,64 @@ def amd_gpus(kfd_root="/sys/class/kfd/kfd/topology/nodes", drm_root="/sys/class/
   return gpus
 
 
+def gpu_memory_ceiling_gib(gpu, ram_gib):
+  """The most memory this GPU can be given to address: a unified AMD GPU's cap can rise to all of
+  RAM but the desktop's reserve, any other GPU has what it has."""
+  if gpu["vendor"] == "amd" and gpu.get("unified"):
+    return round(max(gpu["memory_gib"], ram_gib - RESERVE_GIB), 2)
+  return gpu["memory_gib"]
+
+
+def gpu_pages_limit(ram_bytes):
+  return (ram_bytes - RESERVE_GIB * 2**30) // os.sysconf("SC_PAGE_SIZE")
+
+
+def pending_pages_limit():
+  match = re.search(r"ttm\.pages_limit=(\d+)", _read(GPU_MEMORY_DROP_IN))
+  return int(match.group(1)) if match else 0
+
+
+def gpu_memory_pending(variant, gpu):
+  """Whether a raised cap waits for the next boot, and covers the variant once it applies."""
+  pending = pending_pages_limit()
+  current = int(_read(TTM_PAGES_LIMIT, "0") or 0)
+  return pending > current and gib(pending * os.sysconf("SC_PAGE_SIZE")) + gpu.get("vram_gib", 0) >= variant["peak_gpu_gib"]
+
+
+def gpu_short_error(variant, gpu):
+  """Why a variant can't start on what the GPU addresses now: a reboot when a raised cap is
+  waiting for it, otherwise the shortfall, and that use raises the cap where it can."""
+  if gpu_memory_pending(variant, gpu):
+    return LocalError(f"the GPU addresses {gpu['memory_gib']:.0f} GiB and the model needs {variant['peak_gpu_gib']:g}, until a reboot raises its memory limit",
+                      short=REBOOT_FOR_GPU_MEMORY)
+  hint = "; omarchy agent local use raises its memory limit" if variant["peak_gpu_gib"] <= gpu.get("max_memory_gib", gpu["memory_gib"]) else ""
+  return LocalError(f"the GPU addresses {gpu['memory_gib']:.0f} GiB and the model needs {variant['peak_gpu_gib']:g}{hint}", short=GPU_TOO_SMALL)
+
+
+def raise_gpu_memory(variant, gpu, detach=False):
+  """Raises a unified AMD GPU's memory cap when the variant needs more than the GPU addresses now.
+  It applies at the next boot, so the model starts once the machine has rebooted. The panel's
+  setup has no terminal for sudo, so polkit asks for the password instead."""
+  if variant["peak_gpu_gib"] <= gpu["memory_gib"] or variant["peak_gpu_gib"] > gpu.get("max_memory_gib", gpu["memory_gib"]):
+    return
+  pages = gpu_pages_limit(meminfo().get("MemTotal", 0))
+  if int(_read(TTM_PAGES_LIMIT, "0") or 0) >= pages:
+    raise LocalError(f"The kernel already lets the GPU map {gib(pages * os.sysconf('SC_PAGE_SIZE')):.0f} GiB, but it addresses {gpu['memory_gib']:.0f}: "
+                     "amdgpu.gttsize on the kernel command line may be holding it lower")
+  if pending_pages_limit() >= pages:
+    return
+  if not shutil.which("limine-mkinitcpio"):
+    raise LocalError(f"The model needs {variant['peak_gpu_gib']:g} GiB of GPU-addressable memory and the kernel lets this GPU map {gpu['memory_gib']:.0f}. "
+                     f"Add ttm.pages_limit={pages} to the kernel command line and reboot.")
+  say(f"Raising the GPU memory limit to {gib(pages * os.sysconf('SC_PAGE_SIZE')):.0f} GiB from the next boot, which rebuilds the boot image")
+  argv = ["pkexec" if detach else "sudo", "/usr/bin/bash", "-c", GPU_MEMORY_SCRIPT, "omarchy-local-ai", GPU_MEMORY_DROP_IN, str(pages)]
+  status = subprocess.run(argv).returncode
+  if detach and status == 126:
+    raise LocalError("Authentication was cancelled")
+  if status != 0:
+    raise LocalError("Couldn't raise the GPU memory limit (see above)")
+
+
 def ram_class(ram_gib):
   for size in RAM_CLASSES:
     if ram_gib <= size:
@@ -236,6 +322,8 @@ def machine_profile():
   ram = gib(mem.get("MemTotal", 0))
   platform = platform_name()
   gpus = amd_gpus()
+  for gpu in gpus:
+    gpu["max_memory_gib"] = gpu_memory_ceiling_gib(gpu, ram)
   if platform in NVIDIA_UNIFIED_FAMILIES:
     gpus.append({"vendor": "nvidia", "family": NVIDIA_UNIFIED_FAMILIES[platform], "render_node": "", "vram_gib": 0, "gtt_gib": 0, "unified": True, "memory_gib": round(ram, 2), "sysfs": ""})
   profile = {"platform": platform, "ram_gib": round(ram, 2), "ram_class": ram_class(ram), "gpus": gpus}
@@ -889,8 +977,10 @@ def qualified(recipe, profile, gpu):
 
 def fits(variant, profile, gpu):
   """Static fit of a variant on this machine: (ok, reason)."""
-  if variant["peak_gpu_gib"] > gpu["memory_gib"]:
-    return False, f"needs {variant['peak_gpu_gib']:g} GiB GPU-addressable memory, this GPU has {gpu['memory_gib']:.0f}"
+  # Judged by the most the GPU can be given: use raises a cap that's lower.
+  ceiling = gpu.get("max_memory_gib", gpu["memory_gib"])
+  if variant["peak_gpu_gib"] > ceiling:
+    return False, f"needs {variant['peak_gpu_gib']:g} GiB GPU-addressable memory, this GPU has {ceiling:.0f}"
   if variant["peak_ram_gib"] + RESERVE_GIB > profile["ram_gib"]:
     return False, f"needs {variant['peak_ram_gib']:g} GiB RAM plus {RESERVE_GIB} GiB for the desktop, this machine has {profile['ram_gib']:.0f}"
   return True, ""
@@ -1876,6 +1966,8 @@ def evict_idle_weights(keep=()):
 
 
 def check_headroom(variant, gpu):
+  if variant["peak_gpu_gib"] > gpu["memory_gib"]:
+    raise gpu_short_error(variant, gpu)
   if gpu.get("nodes") == 2:
     pair_limits(gpu["peer"])
     peer_headroom(gpu["peer"], variant)
@@ -2732,6 +2824,8 @@ def cmd_use(argv):
         raise LocalError(f"{rid} doesn't fit: {fit_reason}")
       say(f"Warning: {reason}")
   measured_load = load_measurement(catalog, catalog.recipes[rid], profile, gpu).get("load_seconds")
+  # Before a detached setup leaves this process, so polkit can still ask in the user's session.
+  raise_gpu_memory(variant, gpu, args.detach)
   if args.detach:
     return detach_use(rid, args, catalog.recipes[rid], measured_load)
   # A first setup shows in the panel from now on: waiting for the lock, then
@@ -2872,7 +2966,12 @@ def _use_setup(rid, variant, args, catalog, profile, gpu, fresh, measured_load=N
       write_status(catalog, profile)
       say("")
       say(f"Installed {rid}, but it can't start now: {error}")
-      first = "Stop another model, then press" if error.short.startswith(NOT_ENOUGH_MEMORY) else "Then press"
+      if error.short == REBOOT_FOR_GPU_MEMORY:
+        first = "Reboot, then press"
+      elif error.short.startswith(NOT_ENOUGH_MEMORY):
+        first = "Stop another model, then press"
+      else:
+        first = "Then press"
       say(f"{first} play in the agents panel or run: omarchy agent local start {rid}")
       say(f"Manifest: {path}")
       return 0
@@ -2937,6 +3036,8 @@ def start_fit(manifest, profile):
     gpu = choose_gpu(profile, manifest.get("gpu"))
   except LocalError as error:
     return False, error.short
+  if variant["peak_gpu_gib"] > gpu["memory_gib"]:
+    return False, gpu_short_error(variant, gpu).short
   available, gpu_free = free_memory(gpu)
   if available >= variant["peak_ram_gib"] + RESERVE_GIB and gpu_free >= variant["peak_gpu_gib"]:
     return True, ""

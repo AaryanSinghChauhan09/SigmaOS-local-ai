@@ -158,6 +158,37 @@ check("RAM fit preserves desktop reserve", not a.fits(dict(variant, peak_ram_gib
 with patch.object(a, "free_memory", return_value=(1, 1)), patch.object(a, "top_memory_users", return_value="browser (12 GiB), editor (4 GiB)"), patch.object(a.time, "sleep"):
   raises("headroom failure lists largest memory users", lambda: a.check_headroom(variant, gpu), "browser (12 GiB), editor (4 GiB)")
 
+# A 64 GB Strix Halo on a stock kernel: the GPU maps half of RAM until use raises the cap.
+halo = {"vendor": "amd", "family": "amd-strix-halo", "memory_gib": 31.6, "unified": True}
+with patch.object(a, "platform_name", return_value="x86"), patch.object(a, "amd_gpus", return_value=[dict(halo)]), patch.object(a, "meminfo", return_value={"MemTotal": 62 * 2**30}):
+  halo = a.machine_profile()["gpus"][0]
+needs_more = dict(variant, peak_gpu_gib=38, peak_ram_gib=38)
+check("a unified AMD GPU fits by the cap use can raise it to", halo["max_memory_gib"] == 54 and a.fits(needs_more, profile, halo)[0])
+check("a GPU with VRAM of its own fits only by what it has", not a.fits(needs_more, profile, dict(halo, max_memory_gib=a.gpu_memory_ceiling_gib(dict(halo, unified=False), 62)))[0])
+page = os.sysconf("SC_PAGE_SIZE")
+with patch.object(a, "pending_pages_limit", return_value=54 * 2**30 // page), patch.object(a, "_read", return_value=str(31 * 2**30 // page)), patch.object(a, "choose_gpu", return_value=halo):
+  raises("a model past the current cap waits for the reboot that raises it", lambda: a.check_headroom(needs_more, halo), "until a reboot")
+  check("the panel is told to reboot, not that memory is short", a.start_fit({"variant": needs_more}, profile) == (False, a.REBOOT_FOR_GPU_MEMORY))
+with patch.object(a, "pending_pages_limit", return_value=0), patch.object(a, "_read", return_value=str(31 * 2**30 // page)), patch.object(a, "choose_gpu", return_value=halo):
+  raises("with no raise waiting, use is named instead of a reboot", lambda: a.check_headroom(needs_more, halo), "use raises its memory limit")
+  check("and the panel isn't told a reboot would help", a.start_fit({"variant": needs_more}, profile) == (False, a.GPU_TOO_SMALL))
+
+# The root script against a limine-mkinitcpio that fails a kernel and still exits 0, as it does.
+fake = Path(os.environ["HOME"]) / "fake-limine"
+fake.mkdir()
+(fake / "limine-mkinitcpio").write_text("#!/bin/bash\necho 'mkinitcpio failed for kernel linux'\n")
+(fake / "limine-mkinitcpio").chmod(0o755)
+drop_in = fake / "limine-entry-tool.d" / "amd-gpu-memory.conf"
+run_script = lambda: subprocess.run(["bash", "-c", a.GPU_MEMORY_SCRIPT, "test", str(drop_in), "14185506"], capture_output=True, env=dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}")).returncode
+check("a failed rebuild fails and leaves no drop-in to skip the retry", run_script() == 1 and not drop_in.exists())
+drop_in.write_text("# Omarchy's\n")
+check("a failed rebuild puts the earlier drop-in back", run_script() == 1 and drop_in.read_text() == "# Omarchy's\n")
+(fake / "limine-mkinitcpio").write_text("#!/bin/bash\necho rebuilt\n")
+(fake / "not-a-dir").write_text("")
+unwritable = subprocess.run(["bash", "-c", a.GPU_MEMORY_SCRIPT, "test", str(fake / "not-a-dir" / "amd-gpu-memory.conf"), "14185506"], capture_output=True, env=dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}"))
+check("a drop-in that can't be written fails before the rebuild", unwritable.returncode == 1 and b"rebuilt" not in unwritable.stdout + unwritable.stderr)
+check("a rebuild that succeeds keeps the raised cap", run_script() == 0 and drop_in.read_text() == 'KERNEL_CMDLINE[default]+=" ttm.pages_limit=14185506"\n')
+
 payload = b'{"ok":true}'
 oid = hashlib.sha1(f"blob {len(payload)}\0".encode() + payload).hexdigest()
 tree = [{"type": "file", "path": "model.gguf", "size": 2, "lfs": {"oid": "c" * 64, "size": 3}},
