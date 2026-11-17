@@ -986,10 +986,15 @@ def fits(variant, profile, gpu):
   return True, ""
 
 
-def pick_variant(recipe, profile, gpu, ctx=None):
+def pick_variant(recipe, profile, gpu, ctx=None, measured_ctx=None):
   # The largest context first, and at the same context the larger setup (more streams, a bigger
   # prompt cache) where it fits, so a smaller machine falls back to the variant sized for it.
   variants = sorted(recipe.get("variant", []), key=lambda v: (v["ctx"], v["peak_ram_gib"]), reverse=True)
+  # A class runs no larger a context than it was measured at: fit counts the desktop's reserve
+  # against all of RAM, but a 64 GB Strix Halo's desktop holds more than that, and its 262K
+  # variant fits on paper without the memory free to start. An asked-for context still goes.
+  if measured_ctx and not ctx:
+    variants = [v for v in variants if v["ctx"] <= measured_ctx] or variants
   if ctx:
     variants = [v for v in variants if v["ctx"] == ctx]
     if not variants:
@@ -1003,27 +1008,6 @@ def pick_variant(recipe, profile, gpu, ctx=None):
   return None, reasons[-1] if reasons else "no variants"
 
 
-def start_variant(recipe, variant, profile, gpu, ctx=None):
-  """The variant a setup starts with: the one picked, or, when the memory free right now can't
-  hold it and no context was asked for, the largest smaller one that can. Its variants share
-  the weights, so stepping down downloads nothing. A 64 GB Strix Halo fits the 262K variant on
-  paper but has about 48 GiB free with a desktop open, a little short of its 50."""
-  try:
-    check_headroom(variant, gpu)
-    return variant
-  except LocalError as error:
-    if ctx or gpu.get("nodes") == 2 or not error.short.startswith(NOT_ENOUGH_MEMORY):
-      raise
-    available, gpu_free = free_memory(gpu)
-    key = lambda v: (v["ctx"], v["peak_ram_gib"])
-    for smaller in sorted((v for v in recipe.get("variant", []) if key(v) < key(variant)), key=key, reverse=True):
-      if (fits(smaller, profile, gpu)[0] and smaller["peak_gpu_gib"] <= gpu["memory_gib"]
-          and available >= smaller["peak_ram_gib"] + RESERVE_GIB and gpu_free >= smaller["peak_gpu_gib"]):
-        say(f"Not enough free memory for context {variant['ctx']} right now; using context {smaller['ctx']}")
-        return smaller
-    raise
-
-
 def compatibility(catalog, rid, profile, gpu, ctx=None):
   recipe = catalog.recipes[rid]
   runtime = catalog.runtimes.get(recipe.get("runtime"), {})
@@ -1032,7 +1016,7 @@ def compatibility(catalog, rid, profile, gpu, ctx=None):
   if not qualified(recipe, profile, gpu):
     classes = ", ".join(f"{hw.get('gpu')} {hw.get('ram_class')} GB" for hw in recipe.get("hardware", []))
     return None, f"not measured on {gpu['family']} {profile['ram_class']} GB (measured: {classes})"
-  return pick_variant(recipe, profile, gpu, ctx)
+  return pick_variant(recipe, profile, gpu, ctx, load_measurement(catalog, recipe, profile, gpu).get("ctx"))
 
 
 def match_class(best, profile, gpu):
@@ -2973,7 +2957,7 @@ def _use_setup(rid, variant, args, catalog, profile, gpu, fresh, measured_load=N
   # the setup is kept, stopped, and starts later from the panel's play.
   if not unit_active(rid) and load_model(rid) is None:
     try:
-      variant = manifest["variant"] = start_variant(recipe, variant, profile, gpu, args.ctx)
+      check_headroom(variant, gpu)
     except LocalError as error:
       write_unit_files(rid, render_container(rid, recipe, runtime, variant, roles, gpu, fileset))
       write_pair_setup(manifest)
