@@ -158,6 +158,12 @@ check("RAM fit preserves desktop reserve", not a.fits(dict(variant, peak_ram_gib
 with patch.object(a, "free_memory", return_value=(1, 1)), patch.object(a, "top_memory_users", return_value="browser (12 GiB), editor (4 GiB)"), patch.object(a.time, "sleep"):
   raises("headroom failure lists largest memory users", lambda: a.check_headroom(variant, gpu), "browser (12 GiB), editor (4 GiB)")
 
+# A 64 GB Strix Halo whose desktop holds 13 GiB: fit kept its reserve, so start needs only the peak.
+long_ctx = {"ctx": 262144, "peak_ram_gib": 42, "peak_gpu_gib": 40}
+with patch.object(a, "free_memory", return_value=(48.6, 54)), patch.object(a, "choose_gpu", return_value=dict(gpu, memory_gib=54)):
+  check("start counts the desktop's reserve once", a.check_headroom(long_ctx, dict(gpu, memory_gib=54)) == (48.6, 54)
+        and a.start_fit({"variant": long_ctx}, profile) == (True, ""))
+
 # A 64 GB Strix Halo on a stock kernel: the GPU maps half of RAM until use raises the cap.
 halo = {"vendor": "amd", "family": "amd-strix-halo", "memory_gib": 31.6, "unified": True}
 with patch.object(a, "platform_name", return_value="x86"), patch.object(a, "amd_gpus", return_value=[dict(halo)]), patch.object(a, "meminfo", return_value={"MemTotal": 62 * 2**30}):
