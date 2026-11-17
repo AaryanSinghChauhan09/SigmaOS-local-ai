@@ -61,8 +61,8 @@ drop_in=$1 pages=$2 previous=
 if [[ -f $drop_in ]]; then
   previous=$(<"$drop_in")
 fi
-mkdir -p "${drop_in%/*}"
-printf 'KERNEL_CMDLINE[default]+=" ttm.pages_limit=%s"\n' "$pages" > "$drop_in"
+# A drop-in that can't be written stops here, before a rebuild that would succeed without it.
+mkdir -p "${drop_in%/*}" && printf 'KERNEL_CMDLINE[default]+=" ttm.pages_limit=%s"\n' "$pages" > "$drop_in" || exit 1
 # limine-mkinitcpio reports a kernel it could not rebuild and still exits 0.
 if ! log=$(limine-mkinitcpio 2>&1) || grep -q 'mkinitcpio failed for kernel' <<<"$log"; then
   printf '%s\n' "$log" >&2

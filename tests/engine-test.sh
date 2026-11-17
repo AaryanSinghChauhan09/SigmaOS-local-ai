@@ -184,6 +184,9 @@ check("a failed rebuild fails and leaves no drop-in to skip the retry", run_scri
 drop_in.write_text("# Omarchy's\n")
 check("a failed rebuild puts the earlier drop-in back", run_script() == 1 and drop_in.read_text() == "# Omarchy's\n")
 (fake / "limine-mkinitcpio").write_text("#!/bin/bash\necho rebuilt\n")
+(fake / "not-a-dir").write_text("")
+unwritable = subprocess.run(["bash", "-c", a.GPU_MEMORY_SCRIPT, "test", str(fake / "not-a-dir" / "amd-gpu-memory.conf"), "14185506"], capture_output=True, env=dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}"))
+check("a drop-in that can't be written fails before the rebuild", unwritable.returncode == 1 and b"rebuilt" not in unwritable.stdout + unwritable.stderr)
 check("a rebuild that succeeds keeps the raised cap", run_script() == 0 and drop_in.read_text() == 'KERNEL_CMDLINE[default]+=" ttm.pages_limit=14185506"\n')
 
 payload = b'{"ok":true}'
