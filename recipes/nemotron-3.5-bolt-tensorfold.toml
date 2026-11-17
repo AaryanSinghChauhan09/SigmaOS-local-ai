@@ -1,5 +1,4 @@
 name = "Nemotron 3.5 Bolt"
-summary = "74B mixture of experts, 9B active per token, packed into 24 GB. The fastest long agent turns on NVIDIA's unified memory, and the full 262K window on 64 GB."
 runtime = "tensorfold-bolt"
 vendor = "nvidia"
 architecture = "moe"

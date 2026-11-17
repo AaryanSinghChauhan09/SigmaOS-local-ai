@@ -730,8 +730,7 @@ def validate_recipe(rid, recipe, runtimes, root=None):
   where = f"recipes/{rid}"
   if not ID_RE.match(rid):
     errors.append(f"{where}: id must match {ID_RE.pattern}")
-  for field in ("name", "summary"):
-    _safe_string(recipe.get(field), f"{where}.{field}", errors)
+  _safe_string(recipe.get("name"), f"{where}.name", errors)
   # The model maker, naming the logo the agents panel shows (assets/<vendor>.svg).
   if "vendor" in recipe and not (isinstance(recipe["vendor"], str) and ID_RE.match(recipe["vendor"])):
     errors.append(f"{where}.vendor: must match {ID_RE.pattern}")
@@ -1087,7 +1086,6 @@ def recipe_listing(catalog, profile, running=()):
     rows.append({
       "id": rid,
       "name": recipe.get("name", rid),
-      "summary": recipe.get("summary", ""),
       "runtime": recipe.get("runtime", ""),
       "tier": runtime.get("tier", ""),
       "publisher": review.get("publisher", ""),
@@ -3054,7 +3052,7 @@ def cmd_list(argv):
     marks = [mark for mark, on in (("best", row["best"]), ("running", row["active"]), ("installed", row["installed"])) if on]
     tier = f" · third-party ({row['publisher']})" if row["tier"] == "third-party" else ""
     say(f"{'●' if row['available'] else '○'} {row['id']}{' [' + ', '.join(marks) + ']' if marks else ''}")
-    say(f"    {row['name']} on {row['runtime']}{tier} — {row['summary']}")
+    say(f"    {row['name']} on {row['runtime']}{tier}")
     if not row["available"]:
       say(f"    unavailable: {row['reason']}")
   return 0

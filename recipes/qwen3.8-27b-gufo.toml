@@ -1,5 +1,4 @@
 name = "Qwen3.8 27B"
-summary = "Dense 27B at 4-bit with DFlash2 drafting. Under half the memory of Flash Next, at about half its speed."
 runtime = "gufo"
 vendor = "qwen"
 architecture = "dense"
