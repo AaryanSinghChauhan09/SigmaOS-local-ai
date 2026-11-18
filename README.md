@@ -22,9 +22,9 @@ The engine reads the catalog beside `agent_local.py`, following the installed en
 ## Catalog layout
 
 - `catalog.toml` — the catalog schema.
-- `best.toml` — ordered recommendations per hardware class.
-- `recipes/<id>.toml` — runtime, pinned Hugging Face artifacts, measured context variants, memory peaks and sampling defaults.
-- `runtimes/<id>.toml` — image pinned by digest, input mappings, health probe and allowlisted run options.
+- `best.toml` — ordered recommendations per hardware class: text recipes for the agents, and image models beside them.
+- `recipes/<id>.toml` — kind (text or image), runtime, pinned Hugging Face artifacts, measured context variants, memory peaks and sampling defaults.
+- `runtimes/<id>.toml` — image pinned by digest, input mappings, health probe, post-start check (`api`) and allowlisted run options.
 - `reviews/` — license and behavior reviews for third-party image digests.
 - `measurements/` — evidence for hardware classes a recipe claims.
 - `tools/bench` and `bench/context.txt` — checkout-only benchmark script and long prompt.
