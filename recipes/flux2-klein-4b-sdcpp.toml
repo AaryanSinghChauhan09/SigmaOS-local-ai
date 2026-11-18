@@ -32,6 +32,15 @@ license = "apache-2.0"
 files = ["split_files/vae/flux2-vae.safetensors"]
 vae = "split_files/vae/flux2-vae.safetensors"
 
+
+# Real-ESRGAN x4plus (BSD-3-Clause, xinntao), which the server runs to make a picture four times
+# larger: 6144x3456 from 1536x864 in 36 s on 64 GB Strix Halo.
+[[artifacts]]
+repo = "Comfy-Org/Real-ESRGAN"
+revision = "5fd49b7b278836f48af63ecd314d0f98ab336105"
+license = "bsd-3-clause"
+files = ["RealESRGAN_x4plus.safetensors"]
+upscaler = "RealESRGAN_x4plus.safetensors"
 # Measured: 9.7 GiB of GPU memory at its peak, generating at 1024x1024.
 [[variant]]
 peak_ram_gib = 11
