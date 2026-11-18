@@ -17,6 +17,7 @@ import ipaddress
 import itertools
 import json
 import os
+import posixpath
 import pty
 import re
 import shlex
@@ -75,14 +76,14 @@ if ! log=$(limine-mkinitcpio 2>&1) || grep -q 'mkinitcpio failed for kernel' <<<
 fi
 """
 RAM_CLASSES = (32, 64, 96, 128, 192, 256, 512)
-STANDARD_INPUTS = ("model", "draft", "text_encoder", "vae", "ctx", "alias", "key", "temperature", "top_p", "top_k")
+STANDARD_INPUTS = ("model", "draft", "text_encoder", "vae", "audio_vae", "lora", "ctx", "alias", "key", "temperature", "top_p", "top_k")
 # The files a recipe's artifacts can name, each reaching the server through the runtime input of
 # the same name: the model, and a draft for speculative decoding (text) or the text encoder and
 # VAE a diffusion model needs beside it (image).
-ROLES = ("model", "draft", "text_encoder", "vae")
+ROLES = ("model", "draft", "text_encoder", "vae", "audio_vae", "lora")
 # What a recipe serves: text (chat completions, for the agents) or images. Agents, overlays, the
 # default model and tailnet sharing only ever see text models.
-KINDS = ("text", "image")
+KINDS = ("text", "image", "video")
 # How the engine checks a server it just started answers only with the key: an OpenAI-compatible
 # /v1/models that lists the recipe id, or stable-diffusion.cpp's model status reporting ready.
 APIS = ("openai", "sdcpp")
@@ -874,7 +875,7 @@ def validate_recipe(rid, recipe, runtimes, root=None):
       errors.append(f"{at}: must be a table")
       continue
     # An image model has no context: its variants may leave it out. A text model's is required.
-    if ("ctx" in variant or kind != "image") and (not isinstance(variant.get("ctx"), int) or variant["ctx"] <= 0):
+    if ("ctx" in variant or kind == "text") and (not isinstance(variant.get("ctx"), int) or variant["ctx"] <= 0):
       errors.append(f"{at}.ctx: must be a positive integer")
       continue
     for field in ("peak_ram_gib", "peak_gpu_gib"):
@@ -1589,6 +1590,10 @@ def server_invocation(runtime, recipe, variant, roles, rid):
     "draft": f"/models/{roles['draft']}" if roles.get("draft") else None,
     "text_encoder": f"/models/{roles['text_encoder']}" if roles.get("text_encoder") else None,
     "vae": f"/models/{roles['vae']}" if roles.get("vae") else None,
+    # A video model's sound, decoded beside its frames.
+    "audio_vae": f"/models/{roles['audio_vae']}" if roles.get("audio_vae") else None,
+    # A LoRA the model is run with, which sd-server finds in the folder holding it.
+    "lora": posixpath.dirname(f"/models/{roles['lora']}") if roles.get("lora") else None,
     "ctx": str(variant["ctx"]) if variant.get("ctx") else None,
     "alias": rid,
     "key": KEY_PLACEHOLDER,
@@ -1607,7 +1612,7 @@ def server_invocation(runtime, recipe, variant, roles, rid):
       if name in ("temperature", "top_p", "top_k"):
         skipped.append(name)
         continue
-      if name in ("draft", "text_encoder", "vae", "ctx"):
+      if name in ("draft", "text_encoder", "vae", "audio_vae", "lora", "ctx"):
         raise LocalError(f"Runtime has no mapping for {name}")
       continue
     if "arg" in mapping:
