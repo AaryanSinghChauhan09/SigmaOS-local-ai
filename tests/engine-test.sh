@@ -1366,15 +1366,21 @@ with patch.object(a, "known_models", return_value=["picture"]), patch.object(a, 
   check("start and stop still find an image model by name", a.resolve_model("picture", running_only=True)["recipe_id"] == "picture")
 os.unlink(os.path.join(a.state_dir(), "last"))
 
-# Sharing on the tailnet is for text models for now.
-with patch.object(a, "machine_profile", return_value=profile), patch.object(a, "tailscale_status", return_value=ts_status):
-  raises("an image model can't be shared on the tailnet yet", lambda: a.cmd_share(["picture"]), "image model")
+# An image model is shared on the tailnet like a text one, for Fantasi on the other machines.
 with patch.object(a, "shared_recipes", return_value=["picture"]):
-  check("a shared image model stays out of the tailnet listing", a.shared_listing({"models": {"picture": picture_row}, "ram_total_gib": 64}, img_catalog, profile, "me.tail.ts.net")["models"] == [])
+  listed = a.shared_listing({"models": {"picture": dict(picture_row, edit=True)}, "ram_total_gib": 64}, img_catalog, profile, "me.tail.ts.net")["models"]
+  check("a shared image model is listed with its kind and whether it edits", [(m["recipe"], m["kind"], m["edit"]) for m in listed] == [("picture", "image", True)], repr(listed))
   handlers.clear()
   with patch.object(a, "tailscale", side_effect=fake_tailscale), patch.object(a, "tailscale_status", return_value=ts_status), patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0, stderr="")):
     a.publish_shares({"models": {"picture": picture_row}, "ram_total_gib": 64}, img_catalog, profile, force=True)
-  check("nor gets a tailnet route", "/local-ai/picture" not in handlers, repr(handlers))
+  check("and gets a tailnet route", "/local-ai/picture" in handlers, repr(handlers))
+peer = a.clean_listing({"schema": a.NETWORK_SCHEMA, "models": [dict(listed[0]), {"recipe": "old", "name": "Old"}]}, "me.tail.ts.net")["models"]
+check("a peer's listing keeps an image model's kind, and a row without one is text", [(m["kind"], m["edit"]) for m in peer] == [("image", True), ("text", False)], repr(peer))
+image_remote = a.remote_record("spark", "spark.tail.ts.net", peer[0], True, 128, 0)
+with patch.object(a, "resolve_remote", return_value=image_remote):
+  raises("a paired host's image model is refused as an agent's", lambda: a.overlay_target("spark/picture"), "image model")
+with patch.object(a, "load_remotes", return_value={"spark": {"host": "spark"}}), patch.object(a, "load_network", return_value={"hosts": {}, "models": {"spark/picture": image_remote}}):
+  check("nor is it one of pi's providers", a.remote_targets() == [])
 
 # sd-server lists no recipe id: it's ready when its model status, asked with the key, says so.
 status_url = f"http://127.0.0.1:{a.port_for('picture')}/sdcpp/v1/models/status"

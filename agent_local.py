@@ -4005,7 +4005,7 @@ def shared_listing(record, catalog, profile, dns):
   models = []
   for rid in shared_recipes():
     model = record["models"].get(rid)
-    if not model or model.get("kind", "text") != "text":
+    if not model:
       continue
     recipe = catalog.recipes.get(rid) or (load_model(rid) or {}).get("recipe") or {}
     measured = load_measurement(catalog, recipe, profile, gpu).get("long", {}) if gpu and recipe else {}
@@ -4014,6 +4014,10 @@ def shared_listing(record, catalog, profile, dns):
       "recipe": rid,
       "name": model["name"],
       "vendor": model["vendor"],
+      # text or image, and whether an image model edits by instruction: an
+      # image model is for Fantasi, never for an agent.
+      "kind": model.get("kind", "text"),
+      "edit": bool(model.get("edit")),
       # Dense or mixture of experts, which a peer's panel shows beside the
       # speeds instead of this machine's memory.
       "architecture": recipe.get("architecture", ""),
@@ -4056,8 +4060,7 @@ def publish_shares(record, catalog, profile, force=False):
     try:
       dns = self_dns(status)
       have = serve_handlers(dns)
-      # Only text models are shared: the listing and remote agents speak chat completions.
-      want = {f"{SHARE_ROOT}/{rid}": f"http://127.0.0.1:{SHARE_PROXY_PORT}/{rid}" for rid in shares if rid in record["models"] and record["models"][rid].get("kind", "text") == "text"}
+      want = {f"{SHARE_ROOT}/{rid}": f"http://127.0.0.1:{SHARE_PROXY_PORT}/{rid}" for rid in shares if rid in record["models"]}
       if want:
         ensure_share_proxy()
       for path, target in want.items():
@@ -4113,8 +4116,6 @@ def cmd_share(argv):
   if not args.off:
     if not load_model(rid):
       raise LocalError(f"{rid} isn't set up. Run: omarchy agent local use {rid}")
-    if manifest_kind(load_model(rid)) != "text":
-      raise LocalError(f"{rid} is an image model, and only text models can be shared on the tailnet for now")
     self_dns()
   with share_lock():
     shares = set(shared_recipes())
@@ -4479,6 +4480,8 @@ def clean_listing(listing, dns):
       "recipe": model["recipe"],
       "name": _clean(model.get("name") or model["recipe"]),
       "vendor": model.get("vendor") if ID_RE.match(str(model.get("vendor", ""))) else "",
+      "kind": model.get("kind") if model.get("kind") in KINDS else "text",
+      "edit": model.get("edit") is True,
       "architecture": model.get("architecture") if model.get("architecture") in ARCHITECTURES else "",
       "ctx": int(ctx) if ctx and ctx > 0 else 0,
       "max_tokens": int(min(tokens, ctx or tokens)) if tokens and tokens > 0 else DEFAULT_MAX_OUTPUT_TOKENS,
@@ -4783,7 +4786,10 @@ def overlay_target(rid=None):
   """The running model an overlay points at: a local recipe, or host/recipe
   on a paired machine of the tailnet."""
   if rid and "/" in rid:
-    return remote_target(resolve_remote(rid))
+    model = resolve_remote(rid)
+    if model.get("kind", "text") != "text":
+      raise LocalError(f"{rid} is an image model; agents run on text models")
+    return remote_target(model)
   return local_target(resolve_model(rid, running_only=True))
 
 
@@ -4871,7 +4877,8 @@ def remote_targets():
   targets = []
   for model in load_network()["models"].values():
     try:
-      if model.get("paired") and model["host"] in remotes:
+      # An image model is for Fantasi, not an agent.
+      if model.get("paired") and model["host"] in remotes and model.get("kind", "text") == "text":
         targets.append(remote_target(model))
     except (KeyError, TypeError, AttributeError):
       pass
