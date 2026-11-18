@@ -30,8 +30,11 @@ capabilities dropped, `NoNewPrivileges`, and only the GPU and `/dev/infiniband`.
 The host key is mode 0600 and passed as a Podman secret, never embedded in a unit.
 Runtimes taking a key argument must explicitly opt in and use the engine's Bash
 substitution inside the container; installation warns that local process listings
-can expose it. Post-start checks require `/v1/models` to reject an unauthenticated
-request, accept the key and advertise the recipe ID. A failed activation stops
+can expose it. Post-start checks require the server to reject an unauthenticated
+request, accept the key and serve the recipe: for an OpenAI runtime (`api = "openai"`, the
+default) `/v1/models` advertises the recipe ID; for stable-diffusion.cpp's sd-server
+(`api = "sdcpp"`), which lists no recipe ID, `/sdcpp/v1/models/status` reports `state: "ready"`.
+A failed activation stops
 the new unit and restores that recipe's previous unit and running state.
 
 Quadlet generation uses typed fields and escapes systemd substitutions, quotes
@@ -45,34 +48,37 @@ The real records are the examples and source of values:
 | Path | Rules |
 | --- | --- |
 | [catalog.toml](../catalog.toml) | The catalog schema, 1. |
-| [recipes/](../recipes/) | Name, runtime, pinned artifacts, measured hardware, context variants, sampling and optional server arguments. Vendor names the panel logo; architecture is `dense` or `moe`; `input` is `["text"]` (the default) or `["text", "image"]`, which the agent overlays declare so agents can send screenshots. |
-| [runtimes/](../runtimes/) | Digest-pinned image, tier, port, command, standard input mappings, reserved options and nonempty `health.probe` argv. A paired runtime adds `listen` (its bind flags), `@PORT@` in its probe and a `[pair]` table: `nodes = 2`, `master_port`, optional `prepare` and `worker` commands (without one, rank 1 runs the head's own invocation, for servers that compare the ranks' arguments), an optional served `model` under `/prepared`, an optional `state` path where each rank's folder is mounted writable for the server's caches (else read-only at `/prepared`), and `env`, `head_env` and `worker_env` (any names but the link's `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA` and `NCCL_IB_GID_INDEX`, which the engine sets), whose values may hold `@RANK@`, `@WORLD@`, `@MASTER_ADDR@`, `@MASTER_PORT@`, `@CTX@`, `@RDMA_DEVICES@`, `@GID_INDEX@` and `@SOCKET_IFNAME@`. |
+| [recipes/](../recipes/) | Name, runtime, pinned artifacts, measured hardware, context variants, sampling and optional server arguments. `kind` is `text` (the default: chat models for the agents) or `image` (image generation, whose variants may omit `ctx`). Vendor names the panel logo; architecture is `dense` or `moe`; `input` is `["text"]` (the default) or `["text", "image"]`, which the agent overlays declare so agents can send screenshots. |
+| [runtimes/](../runtimes/) | Digest-pinned image, tier, port, command, standard input mappings, reserved options, nonempty `health.probe` argv and `api` (`openai`, the default, or `sdcpp`), which selects the post-start check; an `openai` runtime must map `alias`. A paired runtime adds `listen` (its bind flags), `@PORT@` in its probe and a `[pair]` table: `nodes = 2`, `master_port`, optional `prepare` and `worker` commands (without one, rank 1 runs the head's own invocation, for servers that compare the ranks' arguments), an optional served `model` under `/prepared`, an optional `state` path where each rank's folder is mounted writable for the server's caches (else read-only at `/prepared`), and `env`, `head_env` and `worker_env` (any names but the link's `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA` and `NCCL_IB_GID_INDEX`, which the engine sets), whose values may hold `@RANK@`, `@WORLD@`, `@MASTER_ADDR@`, `@MASTER_PORT@`, `@CTX@`, `@RDMA_DEVICES@`, `@GID_INDEX@` and `@SOCKET_IFNAME@`. |
 | [reviews/](../reviews/) | Third-party image digest, publisher, reviewer, date, license URL/hash and checked properties. |
-| [measurements/](../measurements/) | Hardware evidence, artifact identities, context, memory, load time and short, long and code-edit prompt timings. |
-| [best.toml](../best.toml) | Unique classes requiring both `gpu` and `ram_class`, with an ordered list of measured recipes. |
+| [measurements/](../measurements/) | Hardware evidence, artifact identities, context, memory, load time and short, long and code-edit prompt timings; for an image model, seconds per image at a size and step count instead. |
+| [best.toml](../best.toml) | Unique classes requiring both `gpu` and `ram_class`, with an ordered list of measured text recipes (`recipes`) and optionally of measured image models (`images`), each holding only its kind. |
 
 IDs contain lowercase alphanumeric components separated by single dots or hyphens.
 Artifact repositories are `owner/name`, revisions are 40-hex commits, and files,
 destinations and role paths must be relative without empty, `.` or `..` components.
 File globs expand against the pinned Hugging Face tree. LFS files verify by SHA256;
-small files verify by Git blob identity. Destinations cannot collide and model/draft
-roles must name selected files, or `"."` for the whole directory an artifact with a
-`dest` lands in, for servers that load a checkpoint directory. Variants require positive context and memory peaks.
+small files verify by Git blob identity. Destinations cannot collide and roles (`model`,
+`draft`, `text_encoder`, `vae`) must name selected files, or `"."` for the whole directory an artifact with a
+`dest` lands in, for servers that load a checkpoint directory. Every role but `model` needs the
+runtime input of the same name. Variants require positive memory peaks, and a positive context
+except in image recipes, where `ctx` may be left out.
 A variant may add `args` after the recipe's server arguments, for settings sized to its memory such as streams
 and caches; they follow the same rules and may not repeat a flag the server arguments already set.
 
 Runtime inputs map exactly one argument or environment variable per supported
-standard input; the model may instead be `{ positional = true }`, placed right after
+standard input (`model`, `draft`, `text_encoder`, `vae`, `ctx`, `alias`, `key`, `temperature`, `top_p`, `top_k`); the model may instead be `{ positional = true }`, placed right after
 the command for servers that take it bare (`serve <dir>`). Run options support a `devices` list (`render`, `kfd`,
 `cdi-nvidia`), scalar `group_add = "keep-groups"`, scalar `memlock = "unlimited"`,
-numeric `shm_size_gib` greater than zero and at most 16, `infiniband` among the
+numeric `shm_size_gib` greater than zero and at most 16, scalar `tmpfs = "/tmp"` for a writable
+tmpfs at `/tmp` under the read-only root, `infiniband` among the
 devices and scalar `network = "fabric"` for paired runtimes. Other run options are
 rejected. `validate <catalog-dir>` checks the records and referenced evidence;
 `--online` also checks upstream artifacts and licenses.
 
 ## Lifecycle
 
-`use best` matches the GPU class and RAM class, tries the class's recipes
+`use best` matches the GPU class and RAM class, tries the class's text recipes
 in order, checks runtime compatibility and measured hardware qualification, and
 chooses the largest fitting context, and at the same context the variant with the larger memory peak that fits.
 A GPU class is its family, except that the N1x (`nvidia-n1x`) shares the GB10's (`nvidia-gb10`): the same
@@ -103,8 +109,9 @@ If a new setup cannot start because memory is busy, its manifest and unit are
 saved with `unchecked = true`. Its first plain `start [recipe]` performs the
 post-start authentication and model-ID checks; failure stops it and retains the
 flag for a retry. Autostart cannot be enabled before that first checked start.
-`start` defaults to the last started model; `stop [recipe]` defaults to all running
-models.
+`start` defaults to the last started text model; `stop [recipe]` defaults to all running
+models. Image models are set up, started and stopped like any other, but never become `last`,
+the agents' default or an overlay, pi provider or tailnet share.
 
 `remove <recipe>` stops it, removes its unit and file sets, drops blobs unused by
 other recipes and removes its image only if no surviving current manifest uses
@@ -162,10 +169,10 @@ Paths are relative to the user's home. JSON caches are atomically replaced.
 | `.local/state/omarchy/agent-local/models/<recipe>.json` | One current resolved manifest: schema, recipe/runtime IDs and definitions, profile, GPU, variant, image, files, roles, required fileset, creation time, optional observations and unchecked flag. Its existence means installed. |
 | `.local/state/omarchy/agent-local/status.json` | Current model state and recommendation; shape below. |
 | `.local/state/omarchy/agent-local/list.json` | Array of recipe cards; shape below. |
-| `.local/state/omarchy/agent-local/ports.json`, `last` | Stable port assignments and last started recipe. |
+| `.local/state/omarchy/agent-local/ports.json`, `last` | Stable port assignments and last started text recipe. |
 | `.local/state/omarchy/agent-local/loads/`, `stops/`, `removal_rate` | Measured progress timings. |
 | `.local/state/omarchy/agent-local/errors/`, `removing/` | Per-model error and removal prediction. |
-| `.local/state/omarchy/agent-local/installing/<recipe>.json` | A first setup in progress or failed: name, vendor, phase, bytes, speed, start, error and the `use` process id. |
+| `.local/state/omarchy/agent-local/installing/<recipe>.json` | A first setup in progress or failed: name, kind, vendor, phase, bytes, speed, start, error and the `use` process id. |
 | `.local/state/omarchy/agent-local/pair.json`, `pair/<recipe>.env` | The detected peer (address, host name, home, RAM); a paired unit's link environment, written at each start. |
 | `.local/state/omarchy/agent-local/lock`, `status.lock` | Lifecycle admission and status snapshot locks. |
 | `.local/share/omarchy/agent-local/blobs/`, `models/` | Shared blob store and immutable file sets. |
@@ -174,7 +181,7 @@ Paths are relative to the user's home. JSON caches are atomically replaced.
 | `.pi/agent/extensions/omarchy-local.ts` | Pi's standing providers for every model set up or paired, where pi is installed. |
 
 `status.json` is `{models: {<recipe>: <model>}, last, ram_total_gib, best,
-link}`. `last` and `best` may be null. `link` is what the
+link}`. `last` and `best` may be null, and name text models only. `link` is what the
 ConnectX-7 cable shows: `{state: "none"}`, `{state: "linked", host}`, or, for another
 Spark answering on the cable's IPv6 link-local all-nodes address before `link setup`,
 `{state: "available", address, host}` (`host` from mDNS, may be null). `refresh` and
@@ -184,7 +191,7 @@ to `/etc/NetworkManager/dispatcher.d/`: when a ConnectX-7 port comes up it runs
 `link notify` for each logged-in user, which announces a newly available Spark once,
 with a notification whose action opens `link setup` in a terminal. Each model contains:
 
-- Identity: `recipe`, `name`, `vendor`, `runtime`, `image`, `ctx`.
+- Identity: `recipe`, `kind` (`text` or `image`; installing rows too), `name`, `vendor`, `runtime`, `image`, `ctx` (null for an image model).
 - Connection: `port`, `endpoint` (including `/v1`).
 - State: `unit`, `sub_state`, `result`, `error`, `fits`, `fit_reason`.
 - Progress: `since_ms`, `expected_load_seconds`, `expected_stop_seconds`,
@@ -206,10 +213,12 @@ error, the setup and model journals and, for a paired model, rank 1's container
 log from the peer. Transition timestamps are Unix milliseconds. Pending activation uses
 the current manifest's observations until the new setup has been measured.
 
-`list.json` rows contain `id`, `name`, `runtime`, `tier`, `publisher`,
+`list.json` rows contain `id`, `kind`, `name`, `runtime`, `tier`, `publisher`,
 `vendor`, `architecture`, `installed`, `available`, `reason`, `best`, `active`,
-`memory_gib`, `context`, `decode_tok_s` and `prefill_tok_s`. Unavailable variants
-have null memory/context; missing measurements have null speeds.
+`memory_gib`, `context`, `decode_tok_s` and `prefill_tok_s`. `best` marks the
+recommendation of the row's kind: the class's first fitting text recipe and, apart from it,
+its first fitting image model. Unavailable variants have null memory/context, as image models
+always have a null context; missing measurements have null speeds.
 
 The panel calls plain `start <recipe>`, `stop <recipe>`, `remove <recipe>`,
 `use --detach <recipe>`, `refresh --quiet` on opening the add view, and
@@ -222,7 +231,7 @@ catalog without changing running models.
 
 ## Client integration
 
-`overlay pi|opencode|qwen [recipe]` requires a running model and prints three lines:
+`overlay pi|opencode|qwen [recipe]` requires a running text model and prints three lines:
 overlay path, provider ID (`omarchy-local`) and recipe/model ID. With no recipe it
 prefers the last started running model, then another running model. Omarchy's
 `omarchy agent --local` and `--local-model <recipe>` consume this output.
@@ -238,7 +247,7 @@ other's configuration. The generated files contain no literal key.
 
 Pi also gets a standing extension, `~/.pi/agent/extensions/omarchy-local.ts`,
 which pi loads on every start. It registers the same `omarchy-local` provider
-with every model set up here, each at its own endpoint, and an
+with every text model set up here, each at its own endpoint, and an
 `omarchy-local-<host>` provider with its stored key for each paired host's
 connected models in `network.json`, offline ones included. So plain `pi`, its
 model picker and a default of `omarchy-local/<recipe>` or
@@ -251,7 +260,7 @@ leaves the picker whole.
 
 ## Tailnet sharing
 
-`share <recipe>` lets the other machines of the user's tailnet use a model, and `share <recipe> --off` stops. The container, its loopback port and its key check are unchanged: `tailscale serve` proxies `https://<host>.<tailnet>.ts.net/local-ai/<recipe>`, reachable only on the tailnet, to the share proxy at `127.0.0.1:11430/<recipe>`, which forwards each request untouched to the model's loopback port and streams the answer back, and the model still refuses a request without the key. Beside the models, a `text:` route at `/local-ai/models.json` lists the shared models with their state, context, reply cap, inputs, memory and measured speeds. It never contains the key. Every status write republishes the listing when it changed, so remote machines see starts and stops as they happen. Changing Serve needs the user to be Tailscale's operator (`sudo tailscale set --operator=$USER`); a refusal is recorded as `share_error` in `status.json` with that fix. Removing a model unshares it.
+`share <recipe>` lets the other machines of the user's tailnet use a text model, and `share <recipe> --off` stops. Image models can't be shared yet. The container, its loopback port and its key check are unchanged: `tailscale serve` proxies `https://<host>.<tailnet>.ts.net/local-ai/<recipe>`, reachable only on the tailnet, to the share proxy at `127.0.0.1:11430/<recipe>`, which forwards each request untouched to the model's loopback port and streams the answer back, and the model still refuses a request without the key. Beside the models, a `text:` route at `/local-ai/models.json` lists the shared models with their state, context, reply cap, inputs, memory and measured speeds. It never contains the key. Every status write republishes the listing when it changed, so remote machines see starts and stops as they happen. Changing Serve needs the user to be Tailscale's operator (`sudo tailscale set --operator=$USER`); a refusal is recorded as `share_error` in `status.json` with that fix. Removing a model unshares it.
 
 The share proxy (`share-proxy`, run as the `omarchy-agent-local-share.service` user unit while anything is shared, and stopped once nothing is) counts who uses each shared model. A request the model accepted counts the machine that sent it, by the tailnet address `tailscale serve` puts in `X-Forwarded-For`, for five minutes after its last one; a refused request counts nothing. `.local/state/omarchy/agent-local/clients.json` is `{models: {<recipe>: <machines>}}`, rewritten only when a count changes, as a machine starts or lapses, and removed when the proxy stops. The agents panel watches it to say how many machines use a shared model.
 
@@ -265,5 +274,7 @@ The agents panel watches `network.json` and runs `network --write` when it opens
 
 Maintainers run [tools/bench](../tools/bench) from a checkout against a running
 model. It imports the checkout engine and uses [bench/context.txt](../bench/context.txt)
-for the long prompt. Measurements remain catalog evidence; the benchmark tool
+for the long prompt. For an image model it times a warmup and three 1024×1024 images through
+`/v1/images/generations` at the recipe's default steps, keeping the median, and the GPU memory
+at its peak. Measurements remain catalog evidence; the benchmark tool
 and prompt corpus do not need to be installed.

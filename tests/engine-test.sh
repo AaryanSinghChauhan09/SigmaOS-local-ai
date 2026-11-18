@@ -1288,4 +1288,105 @@ check("once everyone is idle nothing counts and nothing is pending", tracker.exp
 proxy.shutdown()
 model.shutdown()
 
+
+# ---- image models
+
+# An image runtime: sd-server names no model, so it maps no alias, and takes a text encoder and a VAE.
+sd_rt = {"image": "registry.example/test/sd@sha256:" + "d" * 64, "tier": "omarchy", "api": "sdcpp", "port": 1234,
+         "health": {"probe": ["curl", "http://127.0.0.1:1234/sdcpp/v1/models/status"]}, "command": ["sd-server"],
+         "reserved": ["--listen-port", "SD_API_KEY"], "run": {"devices": ["render"], "tmpfs": "/tmp"},
+         "inputs": {"model": {"arg": "--diffusion-model"}, "text_encoder": {"arg": "--llm"}, "vae": {"arg": "--vae"}, "key": {"env": "SD_API_KEY"}}}
+picture_variant = {"peak_ram_gib": 14, "peak_gpu_gib": 14}
+picture = {"name": "Picture", "kind": "image", "runtime": "sd", "hardware": recipe["hardware"],
+           "artifacts": [dict(artifact, files=["model.gguf"]),
+                         {"repo": "test/encoder", "revision": "c" * 40, "license": "mit", "files": ["te.gguf"], "text_encoder": "te.gguf"},
+                         {"repo": "test/vae", "revision": "e" * 40, "license": "mit", "files": ["vae/ae.safetensors"], "vae": "vae/ae.safetensors"}],
+           "variant": [picture_variant], "server": {"args": ["--steps", "8"]}}
+both = {"server": runtime, "sd": sd_rt}
+check("an image runtime without an alias and an image recipe without a context validate", not a.validate_runtime("sd", sd_rt) and not a.validate_recipe("picture", picture, both),
+      "\n".join(a.validate_runtime("sd", sd_rt) + a.validate_recipe("picture", picture, both)))
+check("a text recipe still needs a context", any(".ctx" in e for e in a.validate_recipe("model", dict(recipe, variant=[picture_variant]), both)))
+check("an OpenAI runtime still needs an alias", any("'alias'" in e for e in a.validate_runtime("server", dict(runtime, inputs={k: v for k, v in runtime["inputs"].items() if k != "alias"}))))
+check("a recipe's kind is text or image", any(".kind" in e for e in a.validate_recipe("model", dict(recipe, kind="video"), both)))
+check("a runtime's api is a known one", any(".api" in e for e in a.validate_runtime("sd", dict(sd_rt, api="grpc"))))
+check("a text encoder or VAE needs a runtime input for it", {"no text_encoder input", "no vae input"} <= {e.split(" but runtime ")[1].split("' has ")[1] for e in a.validate_recipe("picture", dict(picture, runtime="server"), both) if " but runtime " in e})
+trees = {"test/model": [{"type": "file", "path": "model.gguf", "size": 1, "lfs": {"oid": "1" * 64, "size": 1}}],
+         "test/encoder": [{"type": "file", "path": "te.gguf", "size": 1, "lfs": {"oid": "2" * 64, "size": 1}}],
+         "test/vae": [{"type": "file", "path": "vae/ae.safetensors", "size": 1, "lfs": {"oid": "3" * 64, "size": 1}}]}
+with patch.object(a, "hf_tree", side_effect=lambda repo, revision, cache: trees[repo]):
+  picture_files, picture_roles = a.build_artifacts(picture)
+a.validate_files(picture_files, picture_roles)
+_, picture_argv, picture_env, _ = a.server_invocation(sd_rt, picture, picture_variant, picture_roles, "picture")
+check("the diffusion model, text encoder and VAE reach the server, and no context",
+      picture_argv == ["sd-server", "--diffusion-model", "/models/model.gguf", "--llm", "/models/te.gguf", "--vae", "/models/vae/ae.safetensors", "--steps", "8"] and picture_env == {}, repr(picture_argv))
+picture_unit = a.render_container("picture", picture, sd_rt, picture_variant, picture_roles, dict(gpu, render_node="/dev/dri/renderD128"), "f" * 16)
+check("a runtime asking for a /tmp tmpfs gets one, others don't", "Tmpfs=/tmp" in picture_unit and "Tmpfs=" not in text and not a.validate_runtime("sd", sd_rt))
+check("an image model's variant is chosen without a context", a.pick_variant(picture, profile, gpu) == (picture_variant, ""))
+raises("asking an image model for a context names none", lambda: a.pick_variant(picture, profile, gpu, ctx=4096), "have: none")
+
+# Image models are recommended beside text ones, never instead of them.
+images_best = {"class": [dict(entry, images=["picture"])]}
+check("best.toml lists image models apart from text ones", not a.validate_best(images_best, {"model": recipe, "picture": picture}))
+check("an image model can't compete for the agents' default", any(".recipes: 'picture' is of kind image, not text" in e for e in a.validate_best({"class": [dict(entry, recipes=["picture", "model"])]}, {"model": recipe, "picture": picture})))
+check("nor can a text model be offered as an image one", any(".images: 'model' is of kind text, not image" in e for e in a.validate_best({"class": [dict(entry, images=["model"])]}, {"model": recipe, "picture": picture})))
+img_catalog = SimpleNamespace(root=str(repo), recipes={"model": recipe, "picture": picture}, runtimes=both, best=images_best)
+check("best stays the text recommendation, and image models resolve on their own", a.resolve_best(img_catalog, profile, gpu)[0] == "model" and a.resolve_best(img_catalog, profile, gpu, field="images")[0] == "picture")
+rows = {row["id"]: row for row in a.recipe_listing(img_catalog, profile)}
+check("list rows carry their kind and the best of each kind", (rows["picture"]["kind"], rows["model"]["kind"]) == ("image", "text") and rows["picture"]["best"] and rows["model"]["best"]
+      and rows["picture"]["available"] and rows["picture"]["context"] is None and rows["picture"]["reason"] == "", repr(rows["picture"]))
+
+# Status rows say what kind of model they are; an image model's has no context.
+picture_manifest = {"schema": 1, "recipe_id": "picture", "recipe": picture, "runtime": sd_rt, "runtime_id": "sd", "image": sd_rt["image"],
+                    "variant": picture_variant, "files": picture_files, "roles": picture_roles, "fileset": "f" * 16, "gpu": gpu["family"], "profile": profile}
+with patch.object(a, "unit_props", return_value={}), patch.object(a, "free_memory", return_value=(64, 48)):
+  picture_row = a.model_record("picture", picture_manifest, profile)
+  text_row = a.model_record("current", manifest, profile)
+check("an image model's status row says so, without a context, and fits by its memory", (picture_row["kind"], picture_row["ctx"], picture_row["fits"], picture_row["endpoint"]) == ("image", None, True, a.endpoint("picture")), repr(picture_row))
+check("a text model's status row says text", text_row["kind"] == "text" and text_row["ctx"] == variant["ctx"])
+# An edit model says so in its status row; only an image model may be one.
+editor_manifest = dict(picture_manifest, recipe=dict(picture, edit=True))
+with patch.object(a, "unit_props", return_value={}), patch.object(a, "free_memory", return_value=(64, 48)):
+  check("an edit model's status row says it edits", a.model_record("picture", editor_manifest, profile)["edit"] is True and not picture_row["edit"])
+check("only an image model can be an edit model", any(".edit" in e for e in a.validate_recipe("model", dict(recipe, edit=True), {"server": runtime})))
+a.begin_installing("picture-setup", picture)
+check("an image model being set up is listed as one", json.loads(Path(a.state_dir(), "status.json").read_text())["models"]["picture-setup"]["kind"] == "image")
+a.clear_installing("picture-setup")
+check("an installing row from before kinds reads as text", a.install_row("old", {"phase": "waiting"})["kind"] == "text")
+
+# An image model is never the agents' model: not the last one, not the default, not an overlay or pi provider.
+Path(a.state_dir(), "last").unlink(missing_ok=True)
+a.save_model(picture_manifest)
+check("starting an image model doesn't make it the last one started", not Path(a.state_dir(), "last").exists())
+a.write_atomic(os.path.join(a.state_dir(), "last"), "picture\n")
+check("a last that names an image model isn't the agents' default", a.last_model_id() is None)
+with patch.object(a, "known_models", return_value=["picture"]), patch.object(a, "unit_active", return_value=True):
+  raises("an agent launch never falls back to a running image model", lambda: a.resolve_model(running_only=True), "No local model is running")
+  raises("an image model named for an agent is refused", lambda: a.overlay_target("picture"), "image model")
+  check("pi's providers leave image models out", a.local_targets() == [])
+  check("start and stop still find an image model by name", a.resolve_model("picture", running_only=True)["recipe_id"] == "picture")
+os.unlink(os.path.join(a.state_dir(), "last"))
+
+# Sharing on the tailnet is for text models for now.
+with patch.object(a, "machine_profile", return_value=profile), patch.object(a, "tailscale_status", return_value=ts_status):
+  raises("an image model can't be shared on the tailnet yet", lambda: a.cmd_share(["picture"]), "image model")
+with patch.object(a, "shared_recipes", return_value=["picture"]):
+  check("a shared image model stays out of the tailnet listing", a.shared_listing({"models": {"picture": picture_row}, "ram_total_gib": 64}, img_catalog, profile, "me.tail.ts.net")["models"] == [])
+  handlers.clear()
+  with patch.object(a, "tailscale", side_effect=fake_tailscale), patch.object(a, "tailscale_status", return_value=ts_status), patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0, stderr="")):
+    a.publish_shares({"models": {"picture": picture_row}, "ram_total_gib": 64}, img_catalog, profile, force=True)
+  check("nor gets a tailnet route", "/local-ai/picture" not in handlers, repr(handlers))
+
+# sd-server lists no recipe id: it's ready when its model status, asked with the key, says so.
+status_url = f"http://127.0.0.1:{a.port_for('picture')}/sdcpp/v1/models/status"
+with patch.object(a, "http_status", side_effect=[(401, b""), (200, b'{"state": "ready", "model": "sd-cpp-local"}')]) as http:
+  a.post_start_checks("picture", "test-key", sd_rt)
+check("an sd-server is checked by its model status, without and then with the key",
+      [call.args for call in http.call_args_list] == [(status_url,), (status_url, "test-key")], repr(http.call_args_list))
+for name, answers, message in (("that answers without the key", [(200, b'{"state": "ready"}')], "doesn't enforce its key"),
+                               ("whose model isn't ready", [(401, b""), (200, b'{"state": "loading"}')], "loading, not ready"),
+                               ("that answers no status", [(401, b""), (200, b"not json")], "unknown state")):
+  with patch.object(a, "http_status", side_effect=answers):
+    raises(f"an sd-server {name} is refused", lambda: a.post_start_checks("picture", "test-key", sd_rt), message)
+os.unlink(a.model_manifest_path("picture"))
+
 PY
