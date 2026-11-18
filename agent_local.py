@@ -792,6 +792,10 @@ def validate_recipe(rid, recipe, runtimes, root=None):
   kind = recipe_kind(recipe)
   if kind not in KINDS:
     errors.append(f"{where}.kind: must be one of {', '.join(KINDS)}")
+  # An image model that changes a picture by an instruction, given it as a reference image,
+  # rather than redrawing it from a description.
+  if "edit" in recipe and (not isinstance(recipe["edit"], bool) or kind != "image"):
+    errors.append(f"{where}.edit: true or false, for image models only")
   # Dense or mixture of experts, shown on the recipe's card.
   if "architecture" in recipe and recipe["architecture"] not in ARCHITECTURES:
     errors.append(f"{where}.architecture: must be one of {', '.join(ARCHITECTURES)}")
@@ -1160,6 +1164,7 @@ def recipe_listing(catalog, profile, running=()):
     rows.append({
       "id": rid,
       "kind": recipe_kind(recipe),
+      "edit": bool(recipe.get("edit")),
       "name": recipe.get("name", rid),
       "runtime": recipe.get("runtime", ""),
       "tier": runtime.get("tier", ""),
@@ -3308,6 +3313,8 @@ def model_record(rid, manifest, profile):
     "recipe": rid,
     # text or image: rows without it are text models.
     "kind": recipe_kind(recipe),
+    # An image model that edits by instruction.
+    "edit": bool(recipe.get("edit")),
     "name": recipe.get("name", rid),
     "vendor": vendor,
     "runtime": manifest["runtime_id"],

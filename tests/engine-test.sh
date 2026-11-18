@@ -1343,6 +1343,11 @@ with patch.object(a, "unit_props", return_value={}), patch.object(a, "free_memor
   text_row = a.model_record("current", manifest, profile)
 check("an image model's status row says so, without a context, and fits by its memory", (picture_row["kind"], picture_row["ctx"], picture_row["fits"], picture_row["endpoint"]) == ("image", None, True, a.endpoint("picture")), repr(picture_row))
 check("a text model's status row says text", text_row["kind"] == "text" and text_row["ctx"] == variant["ctx"])
+# An edit model says so in its status row; only an image model may be one.
+editor_manifest = dict(picture_manifest, recipe=dict(picture, edit=True))
+with patch.object(a, "unit_props", return_value={}), patch.object(a, "free_memory", return_value=(64, 48)):
+  check("an edit model's status row says it edits", a.model_record("picture", editor_manifest, profile)["edit"] is True and not picture_row["edit"])
+check("only an image model can be an edit model", any(".edit" in e for e in a.validate_recipe("model", dict(recipe, edit=True), {"server": runtime})))
 a.begin_installing("picture-setup", picture)
 check("an image model being set up is listed as one", json.loads(Path(a.state_dir(), "status.json").read_text())["models"]["picture-setup"]["kind"] == "image")
 a.clear_installing("picture-setup")
