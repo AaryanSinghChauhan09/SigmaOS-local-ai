@@ -15,6 +15,7 @@ recipes = ["qwen3.8-flash-next-gufo"]
 gpu = "amd-strix-halo"
 ram_class = 192
 recipes = ["qwen3.8-flash-next-gufo"]
+images = ["flux2-klein-4b-sdcpp", "z-image-turbo-sdcpp"]
 
 [[class]]
 gpu = "amd-strix-halo"
