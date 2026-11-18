@@ -10,6 +10,11 @@ gpu = "amd-strix-halo"
 ram_class = 64
 measured = "measurements/z-image-turbo-sdcpp-strix-halo-64.toml"
 
+[[hardware]]
+gpu = "amd-strix-halo"
+ram_class = 192
+measured = "measurements/z-image-turbo-sdcpp-strix-halo-192.toml"
+
 [[artifacts]]
 repo = "leejet/Z-Image-Turbo-GGUF"
 revision = "c61c0e422dc8b541b7548cf33a4ef8302b0f8085"

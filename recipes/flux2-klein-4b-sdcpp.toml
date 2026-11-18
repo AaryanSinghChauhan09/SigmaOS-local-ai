@@ -12,6 +12,11 @@ gpu = "amd-strix-halo"
 ram_class = 64
 measured = "measurements/flux2-klein-4b-sdcpp-strix-halo-64.toml"
 
+[[hardware]]
+gpu = "amd-strix-halo"
+ram_class = 192
+measured = "measurements/flux2-klein-4b-sdcpp-strix-halo-192.toml"
+
 [[artifacts]]
 repo = "leejet/FLUX.2-klein-4B-GGUF"
 revision = "3b1f5a9dc3abb32238b053aeb3d823c30afdacbd"
