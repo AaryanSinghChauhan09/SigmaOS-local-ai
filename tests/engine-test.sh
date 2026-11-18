@@ -1307,7 +1307,7 @@ check("an image runtime without an alias and an image recipe without a context v
       "\n".join(a.validate_runtime("sd", sd_rt) + a.validate_recipe("picture", picture, both)))
 check("a text recipe still needs a context", any(".ctx" in e for e in a.validate_recipe("model", dict(recipe, variant=[picture_variant]), both)))
 check("an OpenAI runtime still needs an alias", any("'alias'" in e for e in a.validate_runtime("server", dict(runtime, inputs={k: v for k, v in runtime["inputs"].items() if k != "alias"}))))
-check("a recipe's kind is text, image or video", any(".kind" in e for e in a.validate_recipe("model", dict(recipe, kind="audio"), both)))
+check("a recipe's kind is text, image, video or music", any(".kind" in e for e in a.validate_recipe("model", dict(recipe, kind="audio"), both)))
 check("a runtime's api is a known one", any(".api" in e for e in a.validate_runtime("sd", dict(sd_rt, api="grpc"))))
 check("a text encoder or VAE needs a runtime input for it", {"no text_encoder input", "no vae input"} <= {e.split(" but runtime ")[1].split("' has ")[1] for e in a.validate_recipe("picture", dict(picture, runtime="server"), both) if " but runtime " in e})
 trees = {"test/model": [{"type": "file", "path": "model.gguf", "size": 1, "lfs": {"oid": "1" * 64, "size": 1}}],
@@ -1415,5 +1415,33 @@ for name, answers, message in (("that answers without the key", [(200, b'{"state
   with patch.object(a, "http_status", side_effect=answers):
     raises(f"an sd-server {name} is refused", lambda: a.post_start_checks("picture", "test-key", sd_rt), message)
 os.unlink(a.model_manifest_path("picture"))
+
+# A music model runs on acestep.cpp's ace-server, which takes the folder holding its models and
+# loads one only when asked for a song: it's ready when it has found every model a song takes.
+ace_rt = {"image": "registry.example/test/ace@sha256:" + "e" * 64, "tier": "omarchy", "api": "acestep", "port": 8085,
+          "health": {"probe": ["curl", "http://127.0.0.1:8085/health"]}, "command": ["ace-server"],
+          "reserved": ["--port", "ACE_API_KEY"], "run": {"devices": ["render"], "tmpfs": "/tmp"},
+          "inputs": {"model": {"arg": "--models"}, "key": {"env": "ACE_API_KEY"}}}
+song = {"name": "Song", "kind": "music", "runtime": "ace", "hardware": recipe["hardware"],
+        "artifacts": [{"repo": "test/ace", "revision": "a" * 40, "license": "mit", "files": ["lm.gguf", "dit.gguf"], "dest": "acestep", "model": "."}],
+        "variant": [picture_variant]}
+check("a music runtime and a music recipe validate, without an alias or a context", not a.validate_runtime("ace", ace_rt) and not a.validate_recipe("song", song, {"ace": ace_rt}),
+      "\n".join(a.validate_runtime("ace", ace_rt) + a.validate_recipe("song", song, {"ace": ace_rt})))
+ace_tree = [{"type": "file", "path": name, "size": 1, "lfs": {"oid": oid * 64, "size": 1}} for name, oid in (("lm.gguf", "7"), ("dit.gguf", "8"))]
+with patch.object(a, "hf_tree", return_value=ace_tree):
+  song_files, song_roles = a.build_artifacts(song)
+_, song_argv, _, _ = a.server_invocation(ace_rt, song, picture_variant, song_roles, "song")
+check("a music model's folder reaches the server", song_argv == ["ace-server", "--models", "/models/acestep"], repr(song_argv))
+props_url = f"http://127.0.0.1:{a.port_for('song')}/props"
+found = b'{"models": {"lm": ["lm.gguf"], "embedding": ["te.gguf"], "dit": ["dit.gguf"], "vae": ["vae.gguf"]}}'
+with patch.object(a, "http_status", side_effect=[(401, b""), (200, found)]) as http:
+  a.post_start_checks("song", "test-key", ace_rt)
+check("an ace-server is checked by the models it found, without and then with the key",
+      [call.args for call in http.call_args_list] == [(props_url,), (props_url, "test-key")], repr(http.call_args_list))
+for name, answers, message in (("that answers without the key", [(200, found)], "doesn't enforce its key"),
+                               ("missing a model a song takes", [(401, b""), (200, b'{"models": {"lm": ["lm.gguf"], "embedding": [], "dit": ["dit.gguf"]}}')], "found no embedding, vae model"),
+                               ("that lists no models", [(401, b""), (200, b"not json")], "found no lm, embedding, dit, vae model")):
+  with patch.object(a, "http_status", side_effect=answers):
+    raises(f"an ace-server {name} is refused", lambda: a.post_start_checks("song", "test-key", ace_rt), message)
 
 PY
