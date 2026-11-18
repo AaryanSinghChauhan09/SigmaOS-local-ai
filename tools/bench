@@ -220,7 +220,8 @@ def cmd_bench(argv):
   sampler.start()
   try:
     if image:
-      timings = {"image": bench_image(rid, key, active)}
+      # Not under "image", which names the runtime image the record was measured with.
+      timings = {"generation": bench_image(rid, key, active)}
     else:
       timings = bench_text(rid, key, corpus)
   finally:
