@@ -1307,7 +1307,7 @@ check("an image runtime without an alias and an image recipe without a context v
       "\n".join(a.validate_runtime("sd", sd_rt) + a.validate_recipe("picture", picture, both)))
 check("a text recipe still needs a context", any(".ctx" in e for e in a.validate_recipe("model", dict(recipe, variant=[picture_variant]), both)))
 check("an OpenAI runtime still needs an alias", any("'alias'" in e for e in a.validate_runtime("server", dict(runtime, inputs={k: v for k, v in runtime["inputs"].items() if k != "alias"}))))
-check("a recipe's kind is text or image", any(".kind" in e for e in a.validate_recipe("model", dict(recipe, kind="video"), both)))
+check("a recipe's kind is text, image or video", any(".kind" in e for e in a.validate_recipe("model", dict(recipe, kind="audio"), both)))
 check("a runtime's api is a known one", any(".api" in e for e in a.validate_runtime("sd", dict(sd_rt, api="grpc"))))
 check("a text encoder or VAE needs a runtime input for it", {"no text_encoder input", "no vae input"} <= {e.split(" but runtime ")[1].split("' has ")[1] for e in a.validate_recipe("picture", dict(picture, runtime="server"), both) if " but runtime " in e})
 trees = {"test/model": [{"type": "file", "path": "model.gguf", "size": 1, "lfs": {"oid": "1" * 64, "size": 1}}],
@@ -1322,6 +1322,21 @@ check("the diffusion model, text encoder and VAE reach the server, and no contex
 picture_unit = a.render_container("picture", picture, sd_rt, picture_variant, picture_roles, dict(gpu, render_node="/dev/dri/renderD128"), "f" * 16)
 check("a runtime asking for a /tmp tmpfs gets one, others don't", "Tmpfs=/tmp" in picture_unit and "Tmpfs=" not in text and not a.validate_runtime("sd", sd_rt))
 check("an image model's variant is chosen without a context", a.pick_variant(picture, profile, gpu) == (picture_variant, ""))
+
+# A video model is an image model's kin: no context, and its sound decoder and its LoRA reach
+# the server, the LoRA as the folder sd-server finds it in.
+video_rt = dict(sd_rt, inputs=dict(sd_rt["inputs"], audio_vae={"arg": "--audio-vae"}, lora={"arg": "--lora-model-dir"}))
+clip = dict(picture, name="Clip", kind="video",
+            artifacts=picture["artifacts"] + [{"repo": "test/av", "revision": "b" * 40, "license": "mit", "files": ["vae/audio.safetensors", "loras/turbo.safetensors"],
+                                               "audio_vae": "vae/audio.safetensors", "lora": "loras/turbo.safetensors"}])
+check("a video recipe validates without a context", not a.validate_recipe("clip", clip, {"sd": video_rt}), "\n".join(a.validate_recipe("clip", clip, {"sd": video_rt})))
+clip_trees = dict(trees, **{"test/av": [{"type": "file", "path": "vae/audio.safetensors", "size": 1, "lfs": {"oid": "5" * 64, "size": 1}},
+                                        {"type": "file", "path": "loras/turbo.safetensors", "size": 1, "lfs": {"oid": "6" * 64, "size": 1}}]})
+with patch.object(a, "hf_tree", side_effect=lambda repo, revision, cache: clip_trees[repo]):
+  clip_files, clip_roles = a.build_artifacts(clip)
+_, clip_argv, _, _ = a.server_invocation(video_rt, clip, picture_variant, clip_roles, "clip")
+check("a video model's sound decoder and LoRA folder reach the server",
+      clip_argv[clip_argv.index("--audio-vae") + 1] == "/models/vae/audio.safetensors" and clip_argv[clip_argv.index("--lora-model-dir") + 1] == "/models/loras", repr(clip_argv))
 raises("asking an image model for a context names none", lambda: a.pick_variant(picture, profile, gpu, ctx=4096), "have: none")
 
 # Image models are recommended beside text ones, never instead of them.
