@@ -1353,6 +1353,12 @@ check("list rows carry their kind and the best of each kind", (rows["picture"]["
 # Status rows say what kind of model they are; an image model's has no context.
 picture_manifest = {"schema": 1, "recipe_id": "picture", "recipe": picture, "runtime": sd_rt, "runtime_id": "sd", "image": sd_rt["image"],
                     "variant": picture_variant, "files": picture_files, "roles": picture_roles, "fileset": "f" * 16, "gpu": gpu["family"], "profile": profile}
+# An image model's start measures nothing, since its server reads its weights in with the
+# first image: it holds its measured peak. A text model holds what its start took.
+check("an image model's memory is its peak, not what its start took",
+      a.memory_used_gib(dict(picture_manifest, observed={"load_seconds": 4, "ram_used_gib": -1.2})) == picture_variant["peak_ram_gib"])
+check("a text model's memory is what its start took",
+      a.memory_used_gib({"recipe": recipe, "variant": {"peak_ram_gib": 40}, "observed": {"ram_used_gib": 38.2}}) == 38.2)
 with patch.object(a, "unit_props", return_value={}), patch.object(a, "free_memory", return_value=(64, 48)):
   picture_row = a.model_record("picture", picture_manifest, profile)
   text_row = a.model_record("current", manifest, profile)

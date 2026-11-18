@@ -2266,6 +2266,16 @@ def peer_free_gib(manifest):
     return None
 
 
+def memory_used_gib(manifest):
+  """The memory a running model holds. An image model's server maps its weights at
+  start and reads them in with the first image, so what its start took says
+  nothing: its measured peak does."""
+  observed = manifest.get("observed") or {}
+  if manifest_kind(manifest) != "text":
+    return (manifest.get("variant") or {}).get("peak_ram_gib", observed.get("ram_used_gib"))
+  return observed.get("ram_used_gib")
+
+
 def ram_used_gib(manifest, before, after, peer_before, peer_after):
   """What a start took, on every machine the model runs on: a pair's figure is both ranks'.
   A peer that didn't answer counts as holding what this rank holds."""
@@ -3226,7 +3236,7 @@ def _use_setup(rid, variant, args, catalog, profile, gpu, fresh, measured_load=N
   write_status(catalog, profile)
   say("")
   say(f"Running {rid} at {endpoint(rid)} (model id {rid}, key in {key_path()})")
-  say(f"Loaded in {manifest['observed']['load_seconds']:.0f}s, using about {manifest['observed']['ram_used_gib']:.0f} GiB")
+  say(f"Loaded in {manifest['observed']['load_seconds']:.0f}s, using about {memory_used_gib(manifest):.0f} GiB")
   say(f"Manifest: {path}")
   if manifest_kind(manifest) == "text":
     say(f"Launch an agent against it with: omarchy agent --local-model {rid}")
@@ -3299,6 +3309,8 @@ def model_record(rid, manifest, profile):
   recipe = manifest["recipe"]
   vendor = recipe.get("vendor", "")
   observed = manifest.get("observed") or {}
+  if observed:
+    observed = {**observed, "ram_used_gib": memory_used_gib(manifest)}
   fits, fit_reason = (True, "") if unit in ("active", "activating", "deactivating", "removing") else start_fit(manifest, profile)
   error = _read(error_path(rid))
   # A memory refusal isn't a failure to show: play is greyed out with its
