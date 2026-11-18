@@ -17,7 +17,6 @@ import ipaddress
 import itertools
 import json
 import os
-import posixpath
 import pty
 import re
 import shlex
@@ -76,11 +75,11 @@ if ! log=$(limine-mkinitcpio 2>&1) || grep -q 'mkinitcpio failed for kernel' <<<
 fi
 """
 RAM_CLASSES = (32, 64, 96, 128, 192, 256, 512)
-STANDARD_INPUTS = ("model", "draft", "text_encoder", "vae", "upscaler", "ctx", "alias", "key", "temperature", "top_p", "top_k")
+STANDARD_INPUTS = ("model", "draft", "text_encoder", "vae", "ctx", "alias", "key", "temperature", "top_p", "top_k")
 # The files a recipe's artifacts can name, each reaching the server through the runtime input of
 # the same name: the model, and a draft for speculative decoding (text) or the text encoder and
 # VAE a diffusion model needs beside it (image).
-ROLES = ("model", "draft", "text_encoder", "vae", "upscaler")
+ROLES = ("model", "draft", "text_encoder", "vae")
 # What a recipe serves: text (chat completions, for the agents) or images. Agents, overlays, the
 # default model and tailnet sharing only ever see text models.
 KINDS = ("text", "image")
@@ -1166,7 +1165,6 @@ def recipe_listing(catalog, profile, running=()):
       "id": rid,
       "kind": recipe_kind(recipe),
       "edit": bool(recipe.get("edit")),
-      "upscale": recipe_upscales(recipe),
       "name": recipe.get("name", rid),
       "runtime": recipe.get("runtime", ""),
       "tier": runtime.get("tier", ""),
@@ -1591,8 +1589,6 @@ def server_invocation(runtime, recipe, variant, roles, rid):
     "draft": f"/models/{roles['draft']}" if roles.get("draft") else None,
     "text_encoder": f"/models/{roles['text_encoder']}" if roles.get("text_encoder") else None,
     "vae": f"/models/{roles['vae']}" if roles.get("vae") else None,
-    # An image server finds its upscalers in a folder: the one holding the file.
-    "upscaler": posixpath.dirname(f"/models/{roles['upscaler']}") if roles.get("upscaler") else None,
     "ctx": str(variant["ctx"]) if variant.get("ctx") else None,
     "alias": rid,
     "key": KEY_PLACEHOLDER,
@@ -1611,7 +1607,7 @@ def server_invocation(runtime, recipe, variant, roles, rid):
       if name in ("temperature", "top_p", "top_k"):
         skipped.append(name)
         continue
-      if name in ("draft", "text_encoder", "vae", "upscaler", "ctx"):
+      if name in ("draft", "text_encoder", "vae", "ctx"):
         raise LocalError(f"Runtime has no mapping for {name}")
       continue
     if "arg" in mapping:
@@ -3287,10 +3283,6 @@ def start_fit(manifest, profile):
   return False, "Not enough memory"
 
 
-def recipe_upscales(recipe):
-  return any("upscaler" in artifact for artifact in recipe.get("artifacts", []))
-
-
 def model_record(rid, manifest, profile):
   props = unit_props(rid, "ActiveState", "SubState", "Result", "InactiveExitTimestamp", "ActiveExitTimestamp", "StateChangeTimestamp")
   unit = props.get("ActiveState", "inactive") or "inactive"
@@ -3323,8 +3315,6 @@ def model_record(rid, manifest, profile):
     "kind": recipe_kind(recipe),
     # An image model that edits by instruction.
     "edit": bool(recipe.get("edit")),
-    # An image model whose server can also upscale a picture.
-    "upscale": recipe_upscales(recipe),
     "name": recipe.get("name", rid),
     "vendor": vendor,
     "runtime": manifest["runtime_id"],

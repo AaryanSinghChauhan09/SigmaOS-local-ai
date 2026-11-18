@@ -1295,13 +1295,12 @@ model.shutdown()
 sd_rt = {"image": "registry.example/test/sd@sha256:" + "d" * 64, "tier": "omarchy", "api": "sdcpp", "port": 1234,
          "health": {"probe": ["curl", "http://127.0.0.1:1234/sdcpp/v1/models/status"]}, "command": ["sd-server"],
          "reserved": ["--listen-port", "SD_API_KEY"], "run": {"devices": ["render"], "tmpfs": "/tmp"},
-         "inputs": {"model": {"arg": "--diffusion-model"}, "text_encoder": {"arg": "--llm"}, "vae": {"arg": "--vae"}, "upscaler": {"arg": "--hires-upscalers-dir"}, "key": {"env": "SD_API_KEY"}}}
+         "inputs": {"model": {"arg": "--diffusion-model"}, "text_encoder": {"arg": "--llm"}, "vae": {"arg": "--vae"}, "key": {"env": "SD_API_KEY"}}}
 picture_variant = {"peak_ram_gib": 14, "peak_gpu_gib": 14}
 picture = {"name": "Picture", "kind": "image", "runtime": "sd", "hardware": recipe["hardware"],
            "artifacts": [dict(artifact, files=["model.gguf"]),
                          {"repo": "test/encoder", "revision": "c" * 40, "license": "mit", "files": ["te.gguf"], "text_encoder": "te.gguf"},
-                         {"repo": "test/vae", "revision": "e" * 40, "license": "mit", "files": ["vae/ae.safetensors"], "vae": "vae/ae.safetensors"},
-                         {"repo": "test/up", "revision": "a" * 40, "license": "bsd-3-clause", "files": ["up/x4.safetensors"], "upscaler": "up/x4.safetensors"}],
+                         {"repo": "test/vae", "revision": "e" * 40, "license": "mit", "files": ["vae/ae.safetensors"], "vae": "vae/ae.safetensors"}],
            "variant": [picture_variant], "server": {"args": ["--steps", "8"]}}
 both = {"server": runtime, "sd": sd_rt}
 check("an image runtime without an alias and an image recipe without a context validate", not a.validate_runtime("sd", sd_rt) and not a.validate_recipe("picture", picture, both),
@@ -1313,14 +1312,13 @@ check("a runtime's api is a known one", any(".api" in e for e in a.validate_runt
 check("a text encoder or VAE needs a runtime input for it", {"no text_encoder input", "no vae input"} <= {e.split(" but runtime ")[1].split("' has ")[1] for e in a.validate_recipe("picture", dict(picture, runtime="server"), both) if " but runtime " in e})
 trees = {"test/model": [{"type": "file", "path": "model.gguf", "size": 1, "lfs": {"oid": "1" * 64, "size": 1}}],
          "test/encoder": [{"type": "file", "path": "te.gguf", "size": 1, "lfs": {"oid": "2" * 64, "size": 1}}],
-         "test/vae": [{"type": "file", "path": "vae/ae.safetensors", "size": 1, "lfs": {"oid": "3" * 64, "size": 1}}],
-         "test/up": [{"type": "file", "path": "up/x4.safetensors", "size": 1, "lfs": {"oid": "4" * 64, "size": 1}}]}
+         "test/vae": [{"type": "file", "path": "vae/ae.safetensors", "size": 1, "lfs": {"oid": "3" * 64, "size": 1}}]}
 with patch.object(a, "hf_tree", side_effect=lambda repo, revision, cache: trees[repo]):
   picture_files, picture_roles = a.build_artifacts(picture)
 a.validate_files(picture_files, picture_roles)
 _, picture_argv, picture_env, _ = a.server_invocation(sd_rt, picture, picture_variant, picture_roles, "picture")
-check("the diffusion model, text encoder and VAE reach the server, the upscaler as its folder, and no context",
-      picture_argv == ["sd-server", "--diffusion-model", "/models/model.gguf", "--llm", "/models/te.gguf", "--vae", "/models/vae/ae.safetensors", "--hires-upscalers-dir", "/models/up", "--steps", "8"] and picture_env == {}, repr(picture_argv))
+check("the diffusion model, text encoder and VAE reach the server, and no context",
+      picture_argv == ["sd-server", "--diffusion-model", "/models/model.gguf", "--llm", "/models/te.gguf", "--vae", "/models/vae/ae.safetensors", "--steps", "8"] and picture_env == {}, repr(picture_argv))
 picture_unit = a.render_container("picture", picture, sd_rt, picture_variant, picture_roles, dict(gpu, render_node="/dev/dri/renderD128"), "f" * 16)
 check("a runtime asking for a /tmp tmpfs gets one, others don't", "Tmpfs=/tmp" in picture_unit and "Tmpfs=" not in text and not a.validate_runtime("sd", sd_rt))
 check("an image model's variant is chosen without a context", a.pick_variant(picture, profile, gpu) == (picture_variant, ""))
@@ -1336,7 +1334,6 @@ check("best stays the text recommendation, and image models resolve on their own
 rows = {row["id"]: row for row in a.recipe_listing(img_catalog, profile)}
 check("list rows carry their kind and the best of each kind", (rows["picture"]["kind"], rows["model"]["kind"]) == ("image", "text") and rows["picture"]["best"] and rows["model"]["best"]
       and rows["picture"]["available"] and rows["picture"]["context"] is None and rows["picture"]["reason"] == "", repr(rows["picture"]))
-check("an image model with an upscaler says it upscales, a text model doesn't", rows["picture"]["upscale"] and not rows["model"]["upscale"])
 
 # Status rows say what kind of model they are; an image model's has no context.
 picture_manifest = {"schema": 1, "recipe_id": "picture", "recipe": picture, "runtime": sd_rt, "runtime_id": "sd", "image": sd_rt["image"],
