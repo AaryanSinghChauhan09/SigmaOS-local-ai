@@ -81,12 +81,13 @@ STANDARD_INPUTS = ("model", "draft", "text_encoder", "vae", "audio_vae", "lora",
 # the same name: the model, and a draft for speculative decoding (text) or the text encoder and
 # VAE a diffusion model needs beside it (image).
 ROLES = ("model", "draft", "text_encoder", "vae", "audio_vae", "lora")
-# What a recipe serves: text (chat completions, for the agents) or images. Agents, overlays, the
-# default model and tailnet sharing only ever see text models.
-KINDS = ("text", "image", "video")
+# What a recipe serves: text (chat completions, for the agents), images, video or music. Agents,
+# overlays, the default model and tailnet sharing only ever see text models.
+KINDS = ("text", "image", "video", "music")
 # How the engine checks a server it just started answers only with the key: an OpenAI-compatible
-# /v1/models that lists the recipe id, or stable-diffusion.cpp's model status reporting ready.
-APIS = ("openai", "sdcpp")
+# /v1/models that lists the recipe id, stable-diffusion.cpp's model status reporting ready, or
+# acestep.cpp's list of the models it found.
+APIS = ("openai", "sdcpp", "acestep")
 GFX_FAMILIES = {"gfx1151": "amd-strix-halo", "gfx1150": "amd-strix-point"}
 # NVIDIA platforms whose GPU shares the system's memory. The N1x is the GB10's GPU in a
 # laptop: it keeps its own family name so a measurement records which machine it came from,
@@ -2020,16 +2021,19 @@ def http_status(url, key=None, timeout=10):
 
 
 # stable-diffusion.cpp's sd-server lists itself as sd-cpp-local, never the recipe, so it is
-# checked by the state of the model it loaded instead.
-SDCPP_STATUS = "/sdcpp/v1/models/status"
+# checked by the state of the model it loaded instead. acestep.cpp's ace-server loads a model
+# only when asked for a song, so it is checked by the models it found to load.
+STATUS_PATHS = {"sdcpp": "/sdcpp/v1/models/status", "acestep": "/props"}
+ACESTEP_PARTS = ("lm", "embedding", "dit", "vae")
 
 
 def post_start_checks(rid, key, runtime=None):
   """The server just started must refuse a request without the key, accept the key and serve
-  this recipe: by its OpenAI model list naming the recipe id, or for sd-server by its loaded
-  model reporting ready."""
-  sdcpp = (runtime or {}).get("api") == "sdcpp"
-  base = f"http://127.0.0.1:{port_for(rid)}{SDCPP_STATUS}" if sdcpp else f"{endpoint(rid)}/models"
+  this recipe: by its OpenAI model list naming the recipe id, for sd-server by its loaded
+  model reporting ready, or for ace-server by its finding every model a song takes."""
+  api = (runtime or {}).get("api", "openai")
+  sdcpp = api == "sdcpp"
+  base = f"http://127.0.0.1:{port_for(rid)}{STATUS_PATHS[api]}" if api in STATUS_PATHS else f"{endpoint(rid)}/models"
   status, _ = http_status(base)
   if status not in (401, 403):
     raise LocalError(f"The server answered {status or 'nothing'} without the key; refusing a model that doesn't enforce its key")
@@ -2043,6 +2047,15 @@ def post_start_checks(rid, key, runtime=None):
       state = None
     if state != "ready":
       raise LocalError(f"Port {port_for(rid)} reports its image model {state or 'in an unknown state'}, not ready")
+    return
+  if api == "acestep":
+    try:
+      found = json.loads(body).get("models", {})
+    except (ValueError, AttributeError):
+      found = {}
+    missing = [part for part in ACESTEP_PARTS if not found.get(part)]
+    if missing:
+      raise LocalError(f"Port {port_for(rid)} found no {', '.join(missing)} model to make music with")
     return
   try:
     ids = [entry.get("id") for entry in json.loads(body).get("data", [])]
