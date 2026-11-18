@@ -2229,7 +2229,8 @@ def pair_setup(rid, manifest, runtime, pair):
   q = shlex.quote
   # Before writing anything: the prepared files on each Spark, and the file set on the peer.
   prepared = runtime["pair"].get("prepared_gib", 0) * 2**30
-  have = sum(os.path.getsize(os.path.join(d, f)) for d, _, names in os.walk(local_rank) for f in names)
+  # lstat: the served model folder links into /models, which only resolves inside the container.
+  have = sum(os.lstat(os.path.join(d, f)).st_size for d, _, names in os.walk(local_rank) for f in names)
   need_disk("this machine", shutil.disk_usage(local_rank).free, prepared - have)
   # Only what this setup reuses counts as already there: its file set and its generation's rank
   # folder, not an older generation that stays until the new setup has started.
@@ -3710,7 +3711,10 @@ def _remove_files(rid, setup_image=None):
   used = set()
   for directory, _, names in os.walk(os.path.join(data_dir(), "models")):
     for name in names:
-      info = os.stat(os.path.join(directory, name))
+      try:
+        info = os.stat(os.path.join(directory, name))
+      except FileNotFoundError:
+        continue  # a link that resolves only inside a container, like a served model folder's
       used.add((info.st_dev, info.st_ino))
   for directory, _, names in os.walk(os.path.join(data_dir(), "blobs")):
     for name in names:

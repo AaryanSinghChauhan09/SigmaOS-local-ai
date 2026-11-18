@@ -454,6 +454,11 @@ with patch.object(a.subprocess, "run", side_effect=lambda argv, **k: SimpleNames
 # Disk for the prepared files is checked on both Sparks before anything is written, and
 # prepare containers carry names remove can stop.
 big = dict(pair_rt, pair=dict(pair_rt["pair"], prepared_gib=100))
+# A served model folder links into /models, which only resolves inside the container.
+served = Path(a.rank_dir("paired", "e" * 16, 0, runtime=big), "model")
+served.mkdir(parents=True, exist_ok=True)
+(served / "config.json").unlink(missing_ok=True)
+(served / "config.json").symlink_to("/models/model/config.json")
 ran.clear()
 with patch.object(a.subprocess, "run", side_effect=fake_prepare), patch.object(a, "load_installing", return_value=None), \
      patch.object(a.shutil, "disk_usage", return_value=SimpleNamespace(free=500 * 2**30)), \
