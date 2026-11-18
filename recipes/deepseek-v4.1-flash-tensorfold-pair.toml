@@ -1,5 +1,4 @@
 name = "DeepSeek V4.1 Flash"
-summary = "552B mixture of experts, 16B active per token, 2.9-bit, split across two DGX Sparks. The largest model a Spark pair runs."
 runtime = "tensorfold-dsv41-pair"
 vendor = "deepseek"
 architecture = "moe"

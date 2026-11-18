@@ -9,6 +9,7 @@ server answers only with the key. See docs/engine.md.
 
 import argparse
 import concurrent.futures
+import contextlib
 import fcntl
 import fnmatch
 import hashlib
@@ -45,6 +46,34 @@ RESERVE_GIB = 8
 PROGRESS_PUBLISH_SECONDS = 0.5
 PROGRESS_WINDOW_SECONDS = 4
 NOT_ENOUGH_MEMORY = "Not enough memory to start model"
+REBOOT_FOR_GPU_MEMORY = "Reboot to raise the GPU memory limit"
+# The kernel lets a GPU map at most half of RAM. A unified-memory AMD GPU has next to no VRAM of
+# its own, so that is all it can use; use raises the cap to all of RAM but the desktop's reserve,
+# through a kernel parameter in this drop-in that applies at the next boot.
+# The same drop-in Omarchy writes on AMD machines (omarchy-apply-amd-gpu-memory).
+GPU_MEMORY_DROP_IN = "/etc/limine-entry-tool.d/amd-gpu-memory.conf"
+TTM_PAGES_LIMIT = "/sys/module/ttm/parameters/pages_limit"
+GPU_TOO_SMALL = "Not enough GPU memory"
+# Run as root with the drop-in and the page count. A failed rebuild puts the drop-in back as it
+# was, so the next use rebuilds again rather than finding its value already saved.
+GPU_MEMORY_SCRIPT = r"""
+drop_in=$1 pages=$2 previous=
+if [[ -f $drop_in ]]; then
+  previous=$(<"$drop_in")
+fi
+# A drop-in that can't be written stops here, before a rebuild that would succeed without it.
+mkdir -p "${drop_in%/*}" && printf 'KERNEL_CMDLINE[default]+=" ttm.pages_limit=%s"\n' "$pages" > "$drop_in" || exit 1
+# limine-mkinitcpio reports a kernel it could not rebuild and still exits 0.
+if ! log=$(limine-mkinitcpio 2>&1) || grep -q 'mkinitcpio failed for kernel' <<<"$log"; then
+  printf '%s\n' "$log" >&2
+  if [[ -n $previous ]]; then
+    printf '%s\n' "$previous" > "$drop_in"
+  else
+    rm -f "$drop_in"
+  fi
+  exit 1
+fi
+"""
 RAM_CLASSES = (32, 64, 96, 128, 192, 256, 512)
 STANDARD_INPUTS = ("model", "draft", "ctx", "alias", "key", "temperature", "top_p", "top_k")
 GFX_FAMILIES = {"gfx1151": "amd-strix-halo", "gfx1150": "amd-strix-point"}
@@ -221,6 +250,64 @@ def amd_gpus(kfd_root="/sys/class/kfd/kfd/topology/nodes", drm_root="/sys/class/
   return gpus
 
 
+def gpu_memory_ceiling_gib(gpu, ram_gib):
+  """The most memory this GPU can be given to address: a unified AMD GPU's cap can rise to all of
+  RAM but the desktop's reserve, any other GPU has what it has."""
+  if gpu["vendor"] == "amd" and gpu.get("unified"):
+    return round(max(gpu["memory_gib"], ram_gib - RESERVE_GIB), 2)
+  return gpu["memory_gib"]
+
+
+def gpu_pages_limit(ram_bytes):
+  return (ram_bytes - RESERVE_GIB * 2**30) // os.sysconf("SC_PAGE_SIZE")
+
+
+def pending_pages_limit():
+  match = re.search(r"ttm\.pages_limit=(\d+)", _read(GPU_MEMORY_DROP_IN))
+  return int(match.group(1)) if match else 0
+
+
+def gpu_memory_pending(variant, gpu):
+  """Whether a raised cap waits for the next boot, and covers the variant once it applies."""
+  pending = pending_pages_limit()
+  current = int(_read(TTM_PAGES_LIMIT, "0") or 0)
+  return pending > current and gib(pending * os.sysconf("SC_PAGE_SIZE")) + gpu.get("vram_gib", 0) >= variant["peak_gpu_gib"]
+
+
+def gpu_short_error(variant, gpu):
+  """Why a variant can't start on what the GPU addresses now: a reboot when a raised cap is
+  waiting for it, otherwise the shortfall, and that use raises the cap where it can."""
+  if gpu_memory_pending(variant, gpu):
+    return LocalError(f"the GPU addresses {gpu['memory_gib']:.0f} GiB and the model needs {variant['peak_gpu_gib']:g}, until a reboot raises its memory limit",
+                      short=REBOOT_FOR_GPU_MEMORY)
+  hint = "; omarchy agent local use raises its memory limit" if variant["peak_gpu_gib"] <= gpu.get("max_memory_gib", gpu["memory_gib"]) else ""
+  return LocalError(f"the GPU addresses {gpu['memory_gib']:.0f} GiB and the model needs {variant['peak_gpu_gib']:g}{hint}", short=GPU_TOO_SMALL)
+
+
+def raise_gpu_memory(variant, gpu, detach=False):
+  """Raises a unified AMD GPU's memory cap when the variant needs more than the GPU addresses now.
+  It applies at the next boot, so the model starts once the machine has rebooted. The panel's
+  setup has no terminal for sudo, so polkit asks for the password instead."""
+  if variant["peak_gpu_gib"] <= gpu["memory_gib"] or variant["peak_gpu_gib"] > gpu.get("max_memory_gib", gpu["memory_gib"]):
+    return
+  pages = gpu_pages_limit(meminfo().get("MemTotal", 0))
+  if int(_read(TTM_PAGES_LIMIT, "0") or 0) >= pages:
+    raise LocalError(f"The kernel already lets the GPU map {gib(pages * os.sysconf('SC_PAGE_SIZE')):.0f} GiB, but it addresses {gpu['memory_gib']:.0f}: "
+                     "amdgpu.gttsize on the kernel command line may be holding it lower")
+  if pending_pages_limit() >= pages:
+    return
+  if not shutil.which("limine-mkinitcpio"):
+    raise LocalError(f"The model needs {variant['peak_gpu_gib']:g} GiB of GPU-addressable memory and the kernel lets this GPU map {gpu['memory_gib']:.0f}. "
+                     f"Add ttm.pages_limit={pages} to the kernel command line and reboot.")
+  say(f"Raising the GPU memory limit to {gib(pages * os.sysconf('SC_PAGE_SIZE')):.0f} GiB from the next boot, which rebuilds the boot image")
+  argv = ["pkexec" if detach else "sudo", "/usr/bin/bash", "-c", GPU_MEMORY_SCRIPT, "omarchy-local-ai", GPU_MEMORY_DROP_IN, str(pages)]
+  status = subprocess.run(argv).returncode
+  if detach and status == 126:
+    raise LocalError("Authentication was cancelled")
+  if status != 0:
+    raise LocalError("Couldn't raise the GPU memory limit (see above)")
+
+
 def ram_class(ram_gib):
   for size in RAM_CLASSES:
     if ram_gib <= size:
@@ -235,6 +322,8 @@ def machine_profile():
   ram = gib(mem.get("MemTotal", 0))
   platform = platform_name()
   gpus = amd_gpus()
+  for gpu in gpus:
+    gpu["max_memory_gib"] = gpu_memory_ceiling_gib(gpu, ram)
   if platform in NVIDIA_UNIFIED_FAMILIES:
     gpus.append({"vendor": "nvidia", "family": NVIDIA_UNIFIED_FAMILIES[platform], "render_node": "", "vram_gib": 0, "gtt_gib": 0, "unified": True, "memory_gib": round(ram, 2), "sysfs": ""})
   profile = {"platform": platform, "ram_gib": round(ram, 2), "ram_class": ram_class(ram), "gpus": gpus}
@@ -672,8 +761,7 @@ def validate_recipe(rid, recipe, runtimes, root=None):
   where = f"recipes/{rid}"
   if not ID_RE.match(rid):
     errors.append(f"{where}: id must match {ID_RE.pattern}")
-  for field in ("name", "summary"):
-    _safe_string(recipe.get(field), f"{where}.{field}", errors)
+  _safe_string(recipe.get("name"), f"{where}.name", errors)
   # The model maker, naming the logo the agents panel shows (assets/<vendor>.svg).
   if "vendor" in recipe and not (isinstance(recipe["vendor"], str) and ID_RE.match(recipe["vendor"])):
     errors.append(f"{where}.vendor: must match {ID_RE.pattern}")
@@ -860,7 +948,6 @@ class Catalog:
     self.root = root
     with open(os.path.join(root, "catalog.toml"), "rb") as handle:
       self.meta = tomllib.load(handle)
-    self.version = self.meta.get("version", "unknown")
     self.runtimes = _load_toml_dir(root, "runtimes")
     self.recipes = _load_toml_dir(root, "recipes")
     with open(os.path.join(root, "best.toml"), "rb") as handle:
@@ -920,8 +1007,10 @@ def qualified(recipe, profile, gpu):
 
 def fits(variant, profile, gpu):
   """Static fit of a variant on this machine: (ok, reason)."""
-  if variant["peak_gpu_gib"] > gpu["memory_gib"]:
-    return False, f"needs {variant['peak_gpu_gib']:g} GiB GPU-addressable memory, this GPU has {gpu['memory_gib']:.0f}"
+  # Judged by the most the GPU can be given: use raises a cap that's lower.
+  ceiling = gpu.get("max_memory_gib", gpu["memory_gib"])
+  if variant["peak_gpu_gib"] > ceiling:
+    return False, f"needs {variant['peak_gpu_gib']:g} GiB GPU-addressable memory, this GPU has {ceiling:.0f}"
   if variant["peak_ram_gib"] + RESERVE_GIB > profile["ram_gib"]:
     return False, f"needs {variant['peak_ram_gib']:g} GiB RAM plus {RESERVE_GIB} GiB for the desktop, this machine has {profile['ram_gib']:.0f}"
   return True, ""
@@ -1028,7 +1117,6 @@ def recipe_listing(catalog, profile, running=()):
     rows.append({
       "id": rid,
       "name": recipe.get("name", rid),
-      "summary": recipe.get("summary", ""),
       "runtime": recipe.get("runtime", ""),
       "tier": runtime.get("tier", ""),
       "publisher": review.get("publisher", ""),
@@ -1686,8 +1774,56 @@ def unit_active(rid):
   return unit_props(rid, "ActiveState").get("ActiveState") in ("active", "activating", "reloading")
 
 
-def journal_tail(rid, lines=15):
-  result = subprocess.run(["journalctl", "--user", "-u", unit_name(rid), "-n", str(lines), "-o", "cat", "--no-pager"], capture_output=True, text=True)
+def stop_unit(rid):
+  """Stop a model's unit, as promptly mid-load as once it's up. systemd runs ExecStop only for a
+  unit that went active: one still loading just has conmon sent SIGTERM, which it doesn't pass on,
+  so the stop sat out the 90s timeout and then killed. The stop is queued first, so the container
+  ending isn't taken for a crash to restart, then the container is removed as ExecStop would, at
+  once: a server mid-load doesn't heed SIGTERM, and a half-loaded model has nothing to save. The
+  marker tells the stop hook and the start this was asked for, not a crash or a failed start, and
+  systemd's own failed state, from the killed server's exit, is cleared for the same reason."""
+  if unit_props(rid, "ActiveState").get("ActiveState") != "activating":
+    return systemctl("stop", unit_name(rid))
+  write_atomic(stop_requested_path(rid), "")
+  systemctl("stop", "--no-block", unit_name(rid))
+  subprocess.run(["podman", "rm", "-v", "-f", "-i", "-t", "0", unit_base(rid)], capture_output=True)
+  result = systemctl("stop", unit_name(rid))
+  systemctl("reset-failed", unit_name(rid))
+  return result
+
+
+def stop_requested_path(rid):
+  return os.path.join(state_dir(), "stopping", rid)
+
+
+def stop_requested(rid, since_ms):
+  """Whether a stop was asked for since since_ms, the start it would have cut short."""
+  path = stop_requested_path(rid)
+  return bool(since_ms) and os.path.exists(path) and os.path.getmtime(path) * 1000 >= since_ms
+
+
+SERVER_ERROR_RE = re.compile(r"^(error|tensorfold|fatal):\s*(.+)", re.IGNORECASE)
+
+
+def failure_reason(rid, result):
+  """Why a model stopped unexpectedly, for the panel's line: a reason this start already recorded
+  (the start hook's, say), else the server's own last error line from this start, not an
+  earlier one's, else systemd's result."""
+  started = _unix_ms(unit_props(rid, "InactiveExitTimestamp").get("InactiveExitTimestamp"))
+  if started:
+    path = error_path(rid)
+    if os.path.exists(path) and os.path.getmtime(path) * 1000 >= started:
+      return _read(path)
+    for line in reversed(journal_tail(rid, 60, started).splitlines()):
+      match = SERVER_ERROR_RE.match(line.strip())
+      if match:
+        return match.group(2).strip()[:160]
+  return f"Stopped unexpectedly ({result})"
+
+
+def journal_tail(rid, lines=15, since_ms=None):
+  since = ["--since", f"@{since_ms // 1000}"] if since_ms else []
+  result = subprocess.run(["journalctl", "--user", "-u", unit_name(rid), *since, "-n", str(lines), "-o", "cat", "--no-pager"], capture_output=True, text=True)
   return result.stdout.strip()
 
 
@@ -1805,13 +1941,18 @@ def pair_limits(peer):
     raise LocalError(f"Locked memory is limited for services on the peer {peer}, which RDMA between the two machines needs unlimited; {fix}", short="Locked memory limited on the peer: run link setup")
 
 
+# No answer we read is near this; a peer's listing that is gets cut off, fails to parse and
+# leaves that peer unreachable instead of filling this machine's memory.
+HTTP_MAX_BYTES = 1 << 20
+
+
 def http_status(url, key=None, timeout=10):
   headers = {"User-Agent": "omarchy-agent-local"}
   if key:
     headers["Authorization"] = f"Bearer {key}"
   try:
     with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as response:
-      return response.status, response.read()
+      return response.status, response.read(HTTP_MAX_BYTES)
   except urllib.error.HTTPError as error:
     return error.code, b""
   except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
@@ -1895,21 +2036,31 @@ def evict_idle_weights(keep=()):
       scope["drop_cache"](os.path.join(data_dir(), "models", rid), ".rank")
 
 
+def start_needs_gib(variant):
+  """The RAM free a model needs to start. Fit already keeps RESERVE_GIB of the machine's RAM for
+  the desktop, and what the desktop holds now is not free, so start counts the reserve no second
+  time: a 64 GB Strix Halo whose desktop holds 13 GiB has 48.6 free, short of 42 + 8 but with room
+  for the model's 42."""
+  return variant["peak_ram_gib"]
+
+
 def check_headroom(variant, gpu):
+  if variant["peak_gpu_gib"] > gpu["memory_gib"]:
+    raise gpu_short_error(variant, gpu)
   if gpu.get("nodes") == 2:
     pair_limits(gpu["peer"])
     peer_headroom(gpu["peer"], variant)
   for _ in range(15):
     available, gpu_free = free_memory(gpu)
-    if available >= variant["peak_ram_gib"] + RESERVE_GIB and gpu_free >= variant["peak_gpu_gib"]:
+    if available >= start_needs_gib(variant) and gpu_free >= variant["peak_gpu_gib"]:
       return available, gpu_free
     time.sleep(1)
   running = [rid for rid in known_models() if unit_active(rid)]
   names = [(load_model(rid) or {}).get("recipe", {}).get("name", rid) for rid in running]
-  need = variant["peak_ram_gib"] + RESERVE_GIB
+  need = start_needs_gib(variant)
   short = f"{NOT_ENOUGH_MEMORY} (needs {need:g} GiB)"
   raise LocalError(
-    f"Not enough free memory right now: the model needs {variant['peak_ram_gib']:g} GiB RAM plus {RESERVE_GIB} GiB for the desktop "
+    f"Not enough free memory right now: the model needs {need:g} GiB RAM "
     f"and {variant['peak_gpu_gib']:g} GiB GPU-addressable; {available:.1f} GiB RAM and {gpu_free:.1f} GiB GPU are free.\n"
     + (f"Local models running: {', '.join(running)} (stop one with: omarchy agent local stop <recipe>)\n" if running else "")
     + f"Largest memory users: {top_memory_users()}",
@@ -1994,6 +2145,7 @@ def pair_manifest(rid):
 
 
 def peer_headroom(peer, variant):
+  # Fit counts the reserve against this machine's RAM only, so the peer's is kept here.
   node = pair_python(peer, "node()", timeout=10)
   available = gib(node["ram_available"])
   need = variant["peak_ram_gib"] + RESERVE_GIB
@@ -2023,6 +2175,39 @@ def prepare_name(rid, rank):
 def need_disk(where, free, need):
   if free < need:
     raise LocalError(f"{where} has {gib(free):.0f} GiB free, and this setup needs {gib(need):.0f} GiB more there", short=f"Not enough disk on {where}")
+
+
+def peer_free_gib(manifest):
+  """Free memory on a paired setup's other machine; None when the setup isn't paired or the
+  peer doesn't answer."""
+  setup = manifest.get("pair")
+  if not setup:
+    return None
+  try:
+    return gib(pair_python(setup["peer"], "node()", timeout=10)["ram_available"])
+  except (LocalError, ValueError, KeyError):
+    return None
+
+
+def ram_used_gib(manifest, before, after, peer_before, peer_after):
+  """What a start took, on every machine the model runs on: a pair's figure is both ranks'.
+  A peer that didn't answer counts as holding what this rank holds."""
+  used = before - after
+  if manifest.get("pair"):
+    used += peer_before - peer_after if None not in (peer_before, peer_after) else used
+  return round(used, 1)
+
+
+def nodes_ram_gib(manifest, profile):
+  """Total memory of the machines a model runs on, which its memory use is shown against."""
+  total = profile.get("ram_gib") or gib(meminfo().get("MemTotal", 0))
+  if manifest.get("pair"):
+    # The peer the model was set up with, which is the one it starts on: a link made to another
+    # machine since doesn't change it.
+    linked, saved = profile.get("pair") or {}, (manifest.get("profile") or {}).get("pair") or {}
+    peer = linked if linked.get("peer") == manifest["pair"].get("peer") else saved
+    total += peer.get("ram_gib") or total
+  return round(total, 1)
 
 
 def pair_setup(rid, manifest, runtime, pair):
@@ -2094,6 +2279,7 @@ def pair_worker_start(rid):
   pair = {"peer": setup["peer"], "host": setup["host"], "home": setup["home"]}
   here, there = pair_link(pair)
   # Also here: systemd's restarts after a failure don't pass admission.
+  pair_limits(pair["peer"])
   peer_models = os.path.join(pair["home"], ".local", "share", "omarchy", "agent-local", "models", rid)
   pair_python(pair["peer"], f"drop_cache({peer_models!r}, '.rank')", timeout=60)
   peer_headroom(pair["peer"], variant)
@@ -2375,7 +2561,8 @@ def cmd_link_setup(argv):
   profile = machine_profile()
   if NVIDIA_UNIFIED_FAMILIES.get(profile["platform"]) not in PAIR_FAMILIES:
     raise LocalError("Pairs are supported between DGX Sparks (GB10) only")
-  peer = args.peer or (cached_pair(profile) or {}).get("peer")
+  available = link_probe(profile) if not args.peer and not cached_pair(profile) else {}
+  peer = args.peer or (cached_pair(profile) or {}).get("peer") or available.get("address")
   if not peer or not PEER_RE.match(peer):
     raise LocalError("Name the other Spark as SSH reaches it, e.g.: omarchy agent local link setup spark-1234.local")
   if not local_ports():
@@ -2425,13 +2612,20 @@ def cmd_link_setup(argv):
 def cmd_link(argv):
   if argv[:1] == ["setup"]:
     return cmd_link_setup(argv[1:])
+  if argv[:1] == ["notify"]:
+    link_notify(machine_profile())
+    return 0
   parser = argparse.ArgumentParser(prog="omarchy agent local link")
   parser.add_argument("--json", action="store_true")
   args = parser.parse_args(argv)
   profile = machine_profile()
   pair = profile.get("pair")
+  state = link_probe(profile)
   if args.json:
-    print(json.dumps(pair, indent=2))
+    print(json.dumps(pair or state, indent=2))
+    return 0
+  if state["state"] == "available":
+    say(f"Another Spark is on the cable: {state['host'] or state['address']}. Set both up with: omarchy agent local link setup")
     return 0
   if not pair:
     say("No Spark is linked to this one yet: cable them, then run omarchy agent local link setup <the other Spark>")
@@ -2441,6 +2635,116 @@ def cmd_link(argv):
   say(f"  here  {here['addr']} on {here['dev']}, RoCE {','.join(here['hcas'])} (GID {here['gid']})")
   say(f"  there {there['addr']} on {there['dev']}, RoCE {','.join(there['hcas'])} (GID {there['gid']})")
   return 0
+
+
+# ---------------------------------------------------------------- noticing a newly cabled Spark
+#
+# Before link setup there is no IPv4 on the cable and no key, but IPv6 link-local always works:
+# every host on a cable port answers the all-nodes address. Answers from addresses that aren't
+# this machine's are the other end. The agents panel offers setup when status.json's `link`
+# says one is available.
+
+def link_path():
+  return os.path.join(state_dir(), "link.json")
+
+
+def _output(argv):
+  try:
+    return subprocess.run(argv, capture_output=True, text=True, timeout=5).stdout
+  except (OSError, subprocess.SubprocessError):
+    return ""
+
+
+def own_link_local(ip_json):
+  """This machine's own link-local addresses, from `ip -6 -j addr`."""
+  try:
+    return {a["local"] for link in json.loads(ip_json or "[]") for a in link.get("addr_info", []) if a.get("scope") == "link"}
+  except (ValueError, TypeError, KeyError, AttributeError):
+    return set()
+
+
+def ping_answers(ping_output, own):
+  """The link-local addresses answering an all-nodes ping, other than this machine's own."""
+  return [address for address in dict.fromkeys(re.findall(r"from (fe80:[0-9a-f:]+)%", ping_output)) if address not in own]
+
+
+def mdns_ssh_hosts(avahi_output):
+  """Host names by link-local address, from `avahi-browse -rpt _ssh._tcp`."""
+  names = {}
+  for line in avahi_output.splitlines():
+    fields = line.split(";")
+    if len(fields) > 7 and fields[0] == "=" and fields[2] == "IPv6" and fields[7].startswith("fe80:"):
+      names[fields[7]] = fields[6].removesuffix(".local")
+  return names
+
+
+def cable_neighbors():
+  """Link-local addresses answering on this machine's cable ports, other than its own, as
+  address%port, in the order they answered."""
+  own = own_link_local(_output(["ip", "-6", "-j", "addr"]))
+  if not own:
+    return []
+  return [f"{address}%{dev}" for dev in local_ports() for address in ping_answers(_output(["ping", "-6", "-n", "-w", "1", f"ff02::1%{dev}"]), own)]
+
+
+def mdns_names():
+  return mdns_ssh_hosts(_output(["avahi-browse", "-rpt", "_ssh._tcp"]))
+
+
+def link_probe(profile):
+  """What the cable shows now: a linked peer, another Spark waiting to be set up, or none.
+  Recorded in link.json for status.json."""
+  if NVIDIA_UNIFIED_FAMILIES.get(profile["platform"]) not in PAIR_FAMILIES:
+    state = {"state": "none"}
+  elif profile.get("pair"):
+    state = {"state": "linked", "host": profile["pair"]["host"]}
+  else:
+    neighbors = cable_neighbors()
+    if neighbors:
+      names = mdns_names()
+      # One machine answers from each of its cable addresses; the one mDNS names reads best.
+      address = next((n for n in neighbors if n.split("%")[0] in names), neighbors[0])
+      state = {"state": "available", "address": address, "host": names.get(address.split("%")[0])}
+    else:
+      state = {"state": "none"}
+  write_atomic(link_path(), json.dumps(state, indent=2) + "\n")
+  return state
+
+
+def link_notify(profile):
+  """Probes the cable and, the first time another Spark shows up waiting for setup, says so on
+  the desktop with an action that opens link setup in a terminal. From the NetworkManager
+  dispatcher hook (system/90-omarchy-local-ai-link) when a cable port comes up."""
+  ensure_dir(state_dir())
+  # Both cable ports come up together, each running this: one at a time, against its own record
+  # of what it announced, whichever probe found the Spark first.
+  with open(os.path.join(state_dir(), "link-notified"), "a+") as record:
+    fcntl.flock(record, fcntl.LOCK_EX)
+    record.seek(0)
+    announced = record.read().strip()
+    state = link_probe(profile)
+    if state["state"] != "available" or announced == state["address"]:
+      return state
+    name = state["host"] or "another DGX Spark"
+    sent = subprocess.run(["omarchy-notification-send", "-g", "󰌘", "--app-name", "Local AI", f"{name} is connected to this Spark",
+                           "Set both up to run models across them",
+                           "--exec", "omarchy-launch-floating-terminal-with-presentation", "omarchy-agent-local link setup"],
+                          capture_output=True)
+    # Only what reached the desktop counts as announced; a failed send is tried again next time.
+    if sent.returncode != 0:
+      return state
+    record.seek(0)
+    record.truncate()
+    record.write(state["address"] + "\n")
+  return state
+
+
+def link_state():
+  try:
+    with open(link_path()) as handle:
+      return json.load(handle)
+  except (OSError, ValueError):
+    return {"state": "none"}
 
 
 # ---------------------------------------------------------------- current manifests
@@ -2604,11 +2908,12 @@ def activate(manifest, recipe, runtime, gpu, key, catalog, profile):
   if was_running:
     say(f"Restarting {rid} with the new setup (its in-flight requests are interrupted)")
     write_status(catalog, profile, {rid: "deactivating"})
-    systemctl("stop", unit_name(rid))
+    stop_unit(rid)
   clear_error(rid)
   try:
     evict_idle_weights(keep=[rid])
     before_ram, before_gpu = check_headroom(manifest["variant"], gpu)
+    before_peer = peer_free_gib(manifest)
     write_unit_files(rid, container_text)
     write_pair_setup(manifest)
     systemctl("reset-failed", unit_name(rid))
@@ -2616,7 +2921,7 @@ def activate(manifest, recipe, runtime, gpu, key, catalog, profile):
     load_seconds = start_unit(rid)
     post_start_checks(rid, key)
   except (LocalError, subprocess.CalledProcessError) as error:
-    systemctl("stop", unit_name(rid))
+    stop_unit(rid)
     write_unit_files(rid, previous_text)
     if os.path.exists(pair_setup_path(rid)):
       os.unlink(pair_setup_path(rid))
@@ -2631,7 +2936,7 @@ def activate(manifest, recipe, runtime, gpu, key, catalog, profile):
   after_ram, after_gpu = free_memory(gpu)
   manifest["observed"] = {
     "load_seconds": round(load_seconds, 1),
-    "ram_used_gib": round(before_ram - after_ram, 1),
+    "ram_used_gib": ram_used_gib(manifest, before_ram, after_ram, before_peer, peer_free_gib(manifest)),
     "gpu_used_gib": round(before_gpu - after_gpu, 1),
   }
 
@@ -2642,7 +2947,7 @@ def activate(manifest, recipe, runtime, gpu, key, catalog, profile):
 def _lookup_recipe(catalog, target):
   if target not in catalog.recipes:
     known = ", ".join(sorted(catalog.recipes)) or "none"
-    raise LocalError(f"No recipe '{target}' in catalog {catalog.version} (known: {known})")
+    raise LocalError(f"No recipe '{target}' (known: {known})")
   return catalog.recipes[target]
 
 
@@ -2676,6 +2981,8 @@ def cmd_use(argv):
         raise LocalError(f"{rid} doesn't fit: {fit_reason}")
       say(f"Warning: {reason}")
   measured_load = load_measurement(catalog, catalog.recipes[rid], profile, gpu).get("load_seconds")
+  # Before a detached setup leaves this process, so polkit can still ask in the user's session.
+  raise_gpu_memory(variant, gpu, args.detach)
   if args.detach:
     return detach_use(rid, args, catalog.recipes[rid], measured_load)
   # A first setup shows in the panel from now on: waiting for the lock, then
@@ -2756,7 +3063,6 @@ def detach_use(rid, args, recipe, measured_load=None):
 def _use_setup(rid, variant, args, catalog, profile, gpu, fresh, measured_load=None):
   recipe = catalog.recipes[rid]
   runtime = catalog.runtimes[recipe["runtime"]]
-  catalog_info = {"version": catalog.version}
   if runtime.get("tier") == "third-party":
     review = load_review(catalog, runtime)
     say(f"Runtime {recipe['runtime']} is third-party: {review.get('publisher', 'unknown publisher')}, license {review.get('license_url', 'unknown')}")
@@ -2782,7 +3088,6 @@ def _use_setup(rid, variant, args, catalog, profile, gpu, fresh, measured_load=N
     "schema": SCHEMA,
     "recipe_id": rid,
     "runtime_id": recipe["runtime"],
-    "catalog": catalog_info,
     "profile": profile,
     "gpu": gpu["family"],
     "variant": variant,
@@ -2818,7 +3123,12 @@ def _use_setup(rid, variant, args, catalog, profile, gpu, fresh, measured_load=N
       write_status(catalog, profile)
       say("")
       say(f"Installed {rid}, but it can't start now: {error}")
-      first = "Stop another model, then press" if error.short.startswith(NOT_ENOUGH_MEMORY) else "Then press"
+      if error.short == REBOOT_FOR_GPU_MEMORY:
+        first = "Reboot, then press"
+      elif error.short.startswith(NOT_ENOUGH_MEMORY):
+        first = "Stop another model, then press"
+      else:
+        first = "Then press"
       say(f"{first} play in the agents panel or run: omarchy agent local start {rid}")
       say(f"Manifest: {path}")
       return 0
@@ -2859,12 +3169,12 @@ def cmd_list(argv):
     return 0
   gpu = profile["gpus"][0]["family"] if profile["gpus"] else "no GPU"
   paired = f" · linked to {profile['pair']['host']}" if profile.get("pair") else ""
-  say(f"Catalog {catalog.version} · this machine: {gpu}, {profile['ram_class']} GB, {profile['platform']}{paired}")
+  say(f"This machine: {gpu}, {profile['ram_class']} GB, {profile['platform']}{paired}")
   for row in rows:
     marks = [mark for mark, on in (("best", row["best"]), ("running", row["active"]), ("installed", row["installed"])) if on]
     tier = f" · third-party ({row['publisher']})" if row["tier"] == "third-party" else ""
     say(f"{'●' if row['available'] else '○'} {row['id']}{' [' + ', '.join(marks) + ']' if marks else ''}")
-    say(f"    {row['name']} on {row['runtime']}{tier} — {row['summary']}")
+    say(f"    {row['name']} on {row['runtime']}{tier}")
     if not row["available"]:
       say(f"    unavailable: {row['reason']}")
   return 0
@@ -2883,14 +3193,16 @@ def start_fit(manifest, profile):
     gpu = choose_gpu(profile, manifest.get("gpu"))
   except LocalError as error:
     return False, error.short
+  if variant["peak_gpu_gib"] > gpu["memory_gib"]:
+    return False, gpu_short_error(variant, gpu).short
   available, gpu_free = free_memory(gpu)
-  if available >= variant["peak_ram_gib"] + RESERVE_GIB and gpu_free >= variant["peak_gpu_gib"]:
+  if available >= start_needs_gib(variant) and gpu_free >= variant["peak_gpu_gib"]:
     return True, ""
   return False, "Not enough memory"
 
 
 def model_record(rid, manifest, profile):
-  props = unit_props(rid, "ActiveState", "SubState", "Result", "InactiveExitTimestamp", "ActiveExitTimestamp")
+  props = unit_props(rid, "ActiveState", "SubState", "Result", "InactiveExitTimestamp", "ActiveExitTimestamp", "StateChangeTimestamp")
   unit = props.get("ActiveState", "inactive") or "inactive"
   # A removal in progress outranks the unit's own state, which passes
   # through stopping and stopped on the way.
@@ -2914,6 +3226,8 @@ def model_record(rid, manifest, profile):
     # Whether play can start it now; the panel greys play out when it can't.
     "fits": fits,
     "fit_reason": fit_reason,
+    # Whether the other machines on the tailnet can use it.
+    "shared": rid in shared_recipes(),
     "recipe": rid,
     "name": recipe.get("name", rid),
     "vendor": vendor,
@@ -2925,11 +3239,12 @@ def model_record(rid, manifest, profile):
     "result": props.get("Result", ""),
     "port": port_for(rid),
     "endpoint": endpoint(rid),
-    "catalog_version": manifest.get("catalog", {}).get("version"),
     "observed": observed or None,
+    # What the panel's memory bar is a share of: a paired model's machines together.
+    "ram_total_gib": nodes_ram_gib(manifest, profile),
     # When the current start or stop began, and how long the last load took:
     # the panel's progress bar measures the one against the other.
-    "since_ms": int(os.path.getmtime(removing_path(rid)) * 1000) if removing else _unix_ms(props.get("InactiveExitTimestamp") if unit == "activating" else props.get("ActiveExitTimestamp") if unit == "deactivating" else ""),
+    "since_ms": int(os.path.getmtime(removing_path(rid)) * 1000) if removing else _unix_ms(props.get("InactiveExitTimestamp") if unit == "activating" else (props.get("ActiveExitTimestamp") or props.get("StateChangeTimestamp")) if unit == "deactivating" else ""),
     "expected_load_seconds": expected_load_seconds(rid, manifest),
     "expected_stop_seconds": expected_stop_seconds(rid),
     "expected_remove_seconds": float(removing) if removing else None,
@@ -2944,10 +3259,13 @@ def status_record(catalog, profile):
       models[rid] = install_row(rid, record)
   record = {
     "models": models,
+    # Why sharing on the tailnet isn't working, for the panel to show.
+    "share_error": _read(share_error_path()),
     "last": last_model_id(),
     "ram_total_gib": round(gib(meminfo().get("MemTotal", 0)), 1),
-    "catalog_version": catalog.version,
     "best": None,
+    # A Spark on the cable: none, available (not set up yet: address, host) or linked (host).
+    "link": {"state": "linked", "host": profile["pair"]["host"]} if profile.get("pair") else link_state(),
   }
   try:
     record["best"] = resolve_best(catalog, profile)[0]
@@ -2956,7 +3274,7 @@ def status_record(catalog, profile):
   return record
 
 
-def write_status(catalog, profile, transitions=None, pending=None):
+def write_status(catalog, profile, transitions=None, pending=None, publish=True):
   """Rewrite status.json, which the agents panel watches. `transitions` reports
   a start or stop before systemd reaches it, so a click shows at once;
   `pending` describes a model being set up before its manifest is saved.
@@ -2978,6 +3296,21 @@ def write_status(catalog, profile, transitions=None, pending=None):
         if unit == "active":
           record["models"][rid]["error"] = ""
     write_atomic(os.path.join(state_dir(), "status.json"), json.dumps(record, indent=2) + "\n")
+    # The tailnet sees the same transitions: a shared model's listing is
+    # republished with every status write that changes it.
+    if publish:
+      publish_shares(record, catalog, profile)
+      error = _read(share_error_path())
+      if error != record["share_error"]:
+        record["share_error"] = error
+        write_atomic(os.path.join(state_dir(), "status.json"), json.dumps(record, indent=2) + "\n")
+    # Every setup, removal, start and refresh passes through here, so pi's
+    # extension follows them, under the same lock so an older writer can't put
+    # back a model a newer one removed. A failure to write it never fails theirs.
+    try:
+      sync_pi_extension()
+    except OSError:
+      pass
     return record
 
 
@@ -2999,10 +3332,11 @@ def cmd_status(argv):
       transitions[args.started] = "active"
     if args.stopped and ID_RE.match(args.stopped):
       result = os.environ.get("SERVICE_RESULT", "success")
-      if result == "success":
+      started = _unix_ms(unit_props(args.stopped, "InactiveExitTimestamp").get("InactiveExitTimestamp"))
+      if result == "success" or stop_requested(args.stopped, started):
         transitions[args.stopped] = "inactive"
       else:
-        record_error(args.stopped, f"Stopped unexpectedly ({result})")
+        record_error(args.stopped, failure_reason(args.stopped, result))
         transitions[args.stopped] = "failed"
     write_status(catalog, profile, transitions)
     return 0
@@ -3022,7 +3356,6 @@ def cmd_status(argv):
       tail = journal_tail(rid, 5)
       if tail:
         say("  " + tail.replace("\n", "\n  "))
-  say(f"Catalog {record['catalog_version']}")
   if record["best"] and record["best"] not in record["models"]:
     say(f"The recommendation for this machine is {record['best']}: omarchy agent local use best")
   return 0
@@ -3042,7 +3375,7 @@ def cmd_stop(argv):
   write_status(catalog, profile, {rid: "deactivating" for rid in targets})
   for rid in targets:
     started = time.time()
-    systemctl("stop", unit_name(rid))
+    stop_unit(rid)
     # How long this model takes to let go; the panel's stopping bar measures
     # the next stop against it.
     write_atomic(stop_seconds_path(rid), f"{time.time() - started:.1f}\n")
@@ -3084,9 +3417,14 @@ def _start(args, catalog, profile):
     record_error(rid, error.short)
     write_status(catalog, profile)
     raise
+  before_peer = peer_free_gib(manifest)
   systemctl("reset-failed", unit_name(rid))
   result = systemctl("start", unit_name(rid))
   write_atomic(os.path.join(state_dir(), "last"), rid + "\n")
+  if result.returncode != 0 and stop_requested(rid, int(started * 1000)):
+    write_status(catalog, profile)
+    say(f"{rid} was stopped before it finished loading")
+    return 1
   if result.returncode != 0:
     record_error(rid, "Didn't start: omarchy agent local status shows why")
   else:
@@ -3099,7 +3437,7 @@ def _start(args, catalog, profile):
     try:
       post_start_checks(rid, ensure_key())
     except LocalError as error:
-      systemctl("stop", unit_name(rid))
+      stop_unit(rid)
       record_error(rid, error.short)
       write_status(catalog, profile)
       raise
@@ -3110,7 +3448,7 @@ def _start(args, catalog, profile):
   after_ram, after_gpu = free_memory(gpu)
   manifest["observed"] = {
     "load_seconds": round(time.time() - started, 1),
-    "ram_used_gib": round(before_ram - after_ram, 1),
+    "ram_used_gib": ram_used_gib(manifest, before_ram, after_ram, before_peer, peer_free_gib(manifest)),
     "gpu_used_gib": round(before_gpu - after_gpu, 1),
   }
   write_atomic(model_manifest_path(rid), json.dumps(manifest, indent=2) + "\n")
@@ -3139,7 +3477,7 @@ def cmd_remove(argv):
     if manifest is None and setting_up is not None:
       # Cancelled while its model loaded: activation starts the unit before
       # the manifest exists, so stop it before its files go.
-      systemctl("stop", unit_name(rid))
+      stop_unit(rid)
       # Read again: the setup may have reached its image since the first look.
       setting_up = load_installing(rid) or setting_up
       if setting_up.get("pair"):
@@ -3169,7 +3507,7 @@ def cmd_remove(argv):
     try:
       if running:
         say(f"Stopping {rid}")
-        systemctl("stop", unit_name(rid))
+        stop_unit(rid)
       deleting = time.time()
       if manifest:
         pair_remove(manifest, args.local_only)
@@ -3180,6 +3518,9 @@ def cmd_remove(argv):
       # model that status still lists and remove can finish.
       if os.path.exists(model_manifest_path(rid)):
         os.unlink(model_manifest_path(rid))
+      # A model set up again later starts out private.
+      if rid in shared_recipes():
+        save_shares(set(shared_recipes()) - {rid})
     finally:
       if os.path.exists(removing_path(rid)):
         os.unlink(removing_path(rid))
@@ -3309,7 +3650,6 @@ def install_row(rid, record):
     "result": "",
     "port": None,
     "endpoint": "",
-    "catalog_version": None,
     "observed": None,
     "since_ms": record.get("since_ms"),
     "expected_load_seconds": record.get("expected_load_seconds"),
@@ -3332,7 +3672,7 @@ def publish_installing(rid, record):
     except (OSError, ValueError):
       status = None
     if not isinstance(status, dict) or not isinstance(status.get("models"), dict):
-      status = {"models": {}, "last": None, "ram_total_gib": round(gib(meminfo().get("MemTotal", 0)), 1), "catalog_version": None, "best": None}
+      status = {"models": {}, "last": None, "ram_total_gib": round(gib(meminfo().get("MemTotal", 0)), 1), "best": None}
     # An installed model's own row wins: setting up a recipe again leaves it listed as it is.
     if status["models"].get(rid, {}).get("unit", "installing") != "installing":
       return
@@ -3402,10 +3742,11 @@ def cmd_refresh(argv):
   args = parser.parse_args(argv)
   catalog = load_catalog()
   profile = machine_profile()
+  link_probe(profile)
   refresh_list_cache(catalog, profile)
   write_status(catalog, profile)
   if not args.quiet:
-    say(f"Catalog {catalog.version}")
+    say("Refreshed what fits this machine")
   return 0
 
 
@@ -3436,40 +3777,1071 @@ def cmd_validate(argv):
   return 0
 
 
-OVERLAY_PROVIDER = "llamacpp"
+# ---------------------------------------------------------------- tailnet sharing
+#
+# A machine shares a model by putting its loopback endpoint behind
+# `tailscale serve` at /local-ai/<recipe>, reachable only on the tailnet with
+# Tailscale's own HTTPS certificate. The container, its loopback port and its
+# key check stay exactly as they are; the model still refuses a request
+# without the key. Beside the models, /local-ai/models.json lists what this
+# machine shares and whether each is running. It never contains the key, which
+# a client only gets by pairing over SSH.
+#
+# Every other machine finds those listings by asking its own tailscaled which
+# peers are online and fetching each one's models.json. Hosts it has seen stay
+# in network.json while they're away, marked offline, so a model that drops
+# off the tailnet keeps its line in the panel instead of vanishing.
+
+SHARE_ROOT = "/local-ai"
+LISTING_ROUTE = SHARE_ROOT + "/models.json"
+NETWORK_SCHEMA = 1
+# How long an unpaired host that stopped answering stays listed as offline.
+# A paired host stays until it's forgotten.
+FORGET_UNPAIRED_MS = 7 * 24 * 3600 * 1000
+LISTING_TIMEOUT = 4
+HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+DNS_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
+SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.@-]{0,252}$")
+REMOTE_UNITS = ("installing", "active", "activating", "inactive", "failed", "deactivating", "removing")
+OPERATOR_HINT = "Let this user change Tailscale Serve: sudo tailscale set --operator=$USER"
+
+
+def shares_path():
+  return os.path.join(config_dir(), "shares.json")
+
+
+def shared_recipes():
+  try:
+    with open(shares_path()) as handle:
+      recipes = json.load(handle).get("recipes", [])
+  except (OSError, ValueError, AttributeError):
+    return []
+  return sorted({rid for rid in recipes if isinstance(rid, str) and ID_RE.match(rid)})
+
+
+@contextlib.contextmanager
+def share_lock():
+  """Held while shares.json changes and while it's published, so overlapping commands can't
+  lose each other's changes, and an older publisher can't bring back an unshared route."""
+  ensure_dir(state_dir())
+  with open(os.path.join(state_dir(), "shares.lock"), "w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    yield
+
+
+def save_shares(recipes):
+  write_atomic(shares_path(), json.dumps({"recipes": sorted(set(recipes))}, indent=2) + "\n")
+
+
+def share_error_path():
+  return os.path.join(state_dir(), "share_error")
+
+
+def published_path():
+  return os.path.join(state_dir(), "shared.json")
+
+
+def tailscale(*args, timeout=10):
+  if not shutil.which("tailscale"):
+    raise LocalError("Tailscale isn't installed")
+  try:
+    return subprocess.run(["tailscale", *args], capture_output=True, text=True, timeout=timeout)
+  except subprocess.TimeoutExpired:
+    raise LocalError(f"tailscale {args[0]} didn't answer")
+
+
+def tailscale_status():
+  """tailscaled's own view of the tailnet, or None without one."""
+  try:
+    result = tailscale("status", "--json", timeout=5)
+  except LocalError:
+    return None
+  if result.returncode != 0:
+    return None
+  try:
+    status = json.loads(result.stdout)
+  except ValueError:
+    return None
+  return status if isinstance(status, dict) and status.get("BackendState") == "Running" else None
+
+
+def node_dns(node):
+  dns = str((node or {}).get("DNSName") or "").rstrip(".").lower()
+  return dns if DNS_RE.match(dns) else ""
+
+
+def self_dns(status=None):
+  dns = node_dns((status or tailscale_status() or {}).get("Self"))
+  if not dns:
+    raise LocalError("This machine isn't on a tailnet with MagicDNS. Run: tailscale up")
+  return dns
+
+
+def serve_handlers(dns):
+  """Our routes in the current serve config: path -> handler."""
+  result = tailscale("serve", "status", "--json")
+  if result.returncode != 0:
+    raise LocalError(result.stderr.strip() or "Can't read the Tailscale Serve config")
+  try:
+    config = json.loads(result.stdout or "{}") or {}
+  except ValueError:
+    config = {}
+  handlers = ((config.get("Web") or {}).get(f"{dns}:443") or {}).get("Handlers") or {}
+  return {path: handler for path, handler in handlers.items() if path == SHARE_ROOT or path.startswith(SHARE_ROOT + "/")}
+
+
+def serve_set(path, target):
+  result = tailscale("serve", "--bg", "--yes", "--set-path", path, target)
+  if result.returncode != 0:
+    message = result.stderr.strip() or result.stdout.strip()
+    if "operator" in message or "Unauthorized" in message or "Access denied" in message:
+      raise LocalError(OPERATOR_HINT)
+    raise LocalError(f"tailscale serve {path}: {message}")
+
+
+def serve_off(path):
+  result = tailscale("serve", "--yes", "--set-path", path, "off")
+  if result.returncode != 0 and "not found" not in (result.stderr + result.stdout).lower():
+    raise LocalError(f"tailscale serve {path} off: {(result.stderr or result.stdout).strip()}")
+
+
+def shared_listing(record, catalog, profile, dns):
+  """What other machines on the tailnet see: the shared models and their state."""
+  try:
+    gpu = choose_gpu(profile)
+  except LocalError:
+    gpu = None
+  models = []
+  for rid in shared_recipes():
+    model = record["models"].get(rid)
+    if not model:
+      continue
+    recipe = catalog.recipes.get(rid) or (load_model(rid) or {}).get("recipe") or {}
+    measured = load_measurement(catalog, recipe, profile, gpu).get("long", {}) if gpu and recipe else {}
+    manifest = load_model(rid) or {}
+    models.append({
+      "recipe": rid,
+      "name": model["name"],
+      "vendor": model["vendor"],
+      # Dense or mixture of experts, which a peer's panel shows beside the
+      # speeds instead of this machine's memory.
+      "architecture": recipe.get("architecture", ""),
+      "ctx": model["ctx"],
+      "max_tokens": max_output_tokens(manifest) if manifest else DEFAULT_MAX_OUTPUT_TOKENS,
+      "input": model_inputs(manifest) if manifest else ["text"],
+      "unit": model["unit"],
+      "error": model["error"],
+      "fits": model["fits"],
+      "since_ms": model["since_ms"],
+      "expected_load_seconds": model["expected_load_seconds"],
+      "expected_stop_seconds": model["expected_stop_seconds"],
+      "observed": model["observed"],
+      "decode_tok_s": measured.get("decode_tok_s"),
+      "prefill_tok_s": measured.get("prefill_tok_s"),
+    })
+  return {
+    "schema": NETWORK_SCHEMA,
+    "host": dns.split(".")[0],
+    "dns": dns,
+    "ram_total_gib": record["ram_total_gib"],
+    "models": models,
+  }
+
+
+def publish_shares(record, catalog, profile, force=False):
+  """Bring the serve routes in line with shares.json and republish the
+  listing when it changed. Errors land in share_error for the panel."""
+  with share_lock():
+    shares = shared_recipes()
+    published = _read(published_path())
+    if not shares and not published and not force:
+      return
+    # Without tailscaled running, as for a while after boot, there is nothing
+    # to publish to, and the survey already says the tailnet is missing. The
+    # serve routes outlast a restart, so the next refresh brings them in line.
+    status = tailscale_status()
+    if not status and not force:
+      return
+    try:
+      dns = self_dns(status)
+      have = serve_handlers(dns)
+      want = {f"{SHARE_ROOT}/{rid}": f"http://127.0.0.1:{SHARE_PROXY_PORT}/{rid}" for rid in shares if rid in record["models"]}
+      if want:
+        ensure_share_proxy()
+      for path, target in want.items():
+        if (have.get(path) or {}).get("Proxy") != target:
+          serve_set(path, target)
+      for path in have:
+        if path != LISTING_ROUTE and path not in want:
+          serve_off(path)
+      if want:
+        text = json.dumps(shared_listing(record, catalog, profile, dns), sort_keys=True, separators=(",", ":"))
+        if (have.get(LISTING_ROUTE) or {}).get("Text") != text:
+          serve_set(LISTING_ROUTE, "text:" + text)
+        write_atomic(published_path(), text + "\n")
+      else:
+        if LISTING_ROUTE in have:
+          serve_off(LISTING_ROUTE)
+        if os.path.exists(published_path()):
+          os.unlink(published_path())
+        stop_share_proxy()
+      if os.path.exists(share_error_path()):
+        os.unlink(share_error_path())
+    except LocalError as error:
+      write_atomic(share_error_path(), str(error) + "\n")
+      if force:
+        raise
+
+
+def cmd_share(argv):
+  parser = argparse.ArgumentParser(prog="omarchy agent local share", description="Share a model with the other machines on your tailnet")
+  parser.add_argument("recipe", nargs="?")
+  parser.add_argument("--off", action="store_true", help="stop sharing it")
+  parser.add_argument("--export", action="store_true", help=argparse.SUPPRESS)
+  args = parser.parse_args(argv)
+  if args.export:
+    # Read by `pair` on the other end of an SSH connection: the only way the
+    # key leaves this machine.
+    status = tailscale_status()
+    dns = self_dns(status)
+    print(json.dumps({"schema": NETWORK_SCHEMA, "host": dns.split(".")[0], "dns": dns, "key": ensure_key(), "shared": shared_recipes()}))
+    return 0
+  catalog = load_catalog()
+  profile = machine_profile()
+  if not args.recipe:
+    shares = shared_recipes()
+    if not shares:
+      say("Nothing is shared. Share a model with: omarchy agent local share <recipe>")
+    for rid in shares:
+      say(f"{rid}: https://{self_dns()}{SHARE_ROOT}/{rid}/v1")
+    return 0
+  rid = args.recipe
+  if not ID_RE.match(rid):
+    raise LocalError("Not a recipe id")
+  if not args.off:
+    if not load_model(rid):
+      raise LocalError(f"{rid} isn't set up. Run: omarchy agent local use {rid}")
+    self_dns()
+  with share_lock():
+    shares = set(shared_recipes())
+    if args.off:
+      shares.discard(rid)
+    else:
+      shares.add(rid)
+    save_shares(shares)
+  try:
+    record = write_status(catalog, profile, publish=False)
+    publish_shares(record, catalog, profile, force=True)
+  finally:
+    write_status(catalog, profile, publish=False)
+  if args.off:
+    say(f"{rid} is no longer shared")
+  else:
+    say(f"Sharing {rid} on your tailnet at https://{self_dns()}{SHARE_ROOT}/{rid}/v1")
+  return 0
+
+
+# ---------------------------------------------------------------- share proxy
+#
+# `tailscale serve` hands a shared model's requests to one loopback proxy at
+# /<recipe> instead of to the model's own port, so this machine can tell who
+# is using it: serve puts the caller's tailnet address in X-Forwarded-For. The
+# proxy forwards every request untouched, key check included, and streams the
+# answer back as it comes. A machine whose request the model accepted counts
+# as using it for ACTIVE_CLIENT_MS after its last one; clients.json holds the
+# count per shared model, rewritten only when a count changes.
+
+SHARE_PROXY_PORT = 11430
+SHARE_PROXY_UNIT = "omarchy-agent-local-share.service"
+ACTIVE_CLIENT_MS = 5 * 60 * 1000
+HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade"}
+
+
+def clients_path():
+  return os.path.join(state_dir(), "clients.json")
+
+
+def share_proxy_unit_path():
+  return os.path.join(home(), ".config", "systemd", "user", SHARE_PROXY_UNIT)
+
+
+def ensure_share_proxy():
+  """The proxy runs while anything is shared: written, reloaded and started on first need."""
+  text = "\n".join([
+    "[Unit]",
+    "Description=Omarchy local AI: count who uses the shared models",
+    "",
+    "[Service]",
+    "ExecStart=/usr/bin/env omarchy-agent-local share-proxy",
+    "Restart=on-failure",
+    "",
+  ])
+  path = share_proxy_unit_path()
+  if _read(path) != text.strip():
+    write_atomic(path, text)
+    systemctl("daemon-reload")
+  result = systemctl("start", SHARE_PROXY_UNIT)
+  if result.returncode != 0:
+    raise LocalError(f"Can't start the share proxy: {result.stderr.strip()}")
+
+
+def stop_share_proxy():
+  if os.path.exists(share_proxy_unit_path()):
+    systemctl("stop", SHARE_PROXY_UNIT)
+
+
+class ClientTracker:
+  """The machines using each shared model, by the time of their last accepted request."""
+
+  def __init__(self, path, window_ms=ACTIVE_CLIENT_MS, clock=lambda: int(time.time() * 1000)):
+    self.path = path
+    self.window_ms = window_ms
+    self.clock = clock
+    self.seen = {}
+    self.written = None
+    self.lock = threading.Condition()
+
+  def _prune(self, now):
+    for rid in list(self.seen):
+      self.seen[rid] = {client: at for client, at in self.seen[rid].items() if now - at < self.window_ms}
+      if not self.seen[rid]:
+        del self.seen[rid]
+
+  def _write(self):
+    counts = {rid: len(clients) for rid, clients in sorted(self.seen.items())}
+    if counts != self.written:
+      write_atomic(self.path, json.dumps({"models": counts}, sort_keys=True) + "\n")
+      self.written = counts
+
+  def saw(self, rid, client):
+    with self.lock:
+      now = self.clock()
+      self.seen.setdefault(rid, {})[client] = now
+      self._prune(now)
+      self._write()
+      self.lock.notify()
+
+  def expire(self):
+    """Drop machines past the window, and say how long until the next one lapses."""
+    with self.lock:
+      now = self.clock()
+      self._prune(now)
+      self._write()
+      times = [at for clients in self.seen.values() for at in clients.values()]
+      return (min(times) + self.window_ms - now) / 1000 if times else None
+
+  def run_expiry(self):
+    # Held across the deadline check and the wait, so a machine saw() adds in
+    # between can't slip past its notify. The condition's lock is reentrant.
+    with self.lock:
+      while True:
+        wait = self.expire()
+        self.lock.wait(timeout=None if wait is None else max(wait, 0.05))
+
+
+def proxy_client(headers, address):
+  forwarded = str(headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+  try:
+    return str(ipaddress.ip_address(forwarded))
+  except ValueError:
+    return address
+
+
+def make_share_proxy(tracker, ports=None, shares=None):
+  import http.client
+  import http.server
+  ports = ports or load_ports
+  shares = shares or shared_recipes
+
+  class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+      pass
+
+    def _body(self):
+      """The request body as the model gets it: passed through in bounded
+      blocks as it arrives, never held whole, so a caller without the key
+      can't fill the proxy's memory before the model refuses it."""
+      if "chunked" in str(self.headers.get("Transfer-Encoding") or "").lower():
+        def chunks():
+          while True:
+            size = int(self.rfile.readline(1024).split(b";")[0].strip() or b"0", 16)
+            if size == 0:
+              while self.rfile.readline(1024).strip():
+                pass
+              return
+            while size > 0:
+              block = self.rfile.read(min(size, 65536))
+              if not block:
+                return
+              size -= len(block)
+              yield block
+            self.rfile.readline(1024)
+        return chunks(), True
+      length = int(self.headers.get("Content-Length") or 0)
+      if length <= 0:
+        return None, False
+      rfile = self.rfile
+
+      class Remaining:
+        def read(self, size=65536):
+          nonlocal length
+          block = rfile.read(min(size, length)) if length > 0 else b""
+          length -= len(block)
+          return block
+
+      return Remaining(), False
+
+    def _refuse(self, status):
+      # The body is left unread, so the connection can't be reused for another request.
+      self.close_connection = True
+      self.send_response(status)
+      self.send_header("Content-Length", "0")
+      self.send_header("Connection", "close")
+      self.end_headers()
+
+    def _forward(self):
+      rid, _, rest = self.path.lstrip("/").partition("/")
+      port = ports().get(rid)
+      if not ID_RE.match(rid) or rid not in shares() or not port:
+        return self._refuse(404)
+      body, chunked = self._body()
+      headers = {name: value for name, value in self.headers.items() if name.lower() not in HOP_HEADERS and name.lower() != "host"}
+      upstream = http.client.HTTPConnection("127.0.0.1", port, timeout=600)
+      try:
+        upstream.request(self.command, "/" + rest, body=body, headers=headers, encode_chunked=chunked)
+        answer = upstream.getresponse()
+      except OSError:
+        upstream.close()
+        return self._refuse(502)
+      # Only a request the model accepted counts: a wrong key or a bad path doesn't.
+      if answer.status < 400:
+        tracker.saw(rid, proxy_client(self.headers, self.client_address[0]))
+      try:
+        self.send_response(answer.status, answer.reason)
+        for name, value in answer.getheaders():
+          if name.lower() not in HOP_HEADERS and name.lower() != "content-length":
+            self.send_header(name, value)
+        length = answer.getheader("Content-Length")
+        if self.command == "HEAD":
+          self.send_header("Content-Length", length or "0")
+          self.end_headers()
+        elif length is not None:
+          self.send_header("Content-Length", length)
+          self.end_headers()
+          while chunk := answer.read1(65536):
+            self.wfile.write(chunk)
+        else:
+          # A streamed reply (server-sent events) goes out chunk by chunk as it arrives.
+          self.send_header("Transfer-Encoding", "chunked")
+          self.end_headers()
+          while chunk := answer.read1(65536):
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+            self.wfile.flush()
+          self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+      finally:
+        upstream.close()
+
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = _forward
+
+  return Handler
+
+
+def cmd_share_proxy(argv):
+  import http.server
+  argparse.ArgumentParser(prog="omarchy agent local share-proxy").parse_args(argv)
+  tracker = ClientTracker(clients_path())
+  tracker.expire()
+  server = http.server.ThreadingHTTPServer(("127.0.0.1", SHARE_PROXY_PORT), make_share_proxy(tracker))
+  server.daemon_threads = True
+  threading.Thread(target=tracker.run_expiry, daemon=True).start()
+
+  def stop(*_):
+    raise SystemExit(0)
+
+  signal.signal(signal.SIGTERM, stop)
+  try:
+    server.serve_forever()
+  finally:
+    # Nobody counts as using a model once nothing is listening.
+    if os.path.exists(clients_path()):
+      os.unlink(clients_path())
+  return 0
+
+
+# ---------------------------------------------------------------- tailnet clients
+
+
+def remotes_dir():
+  return os.path.join(config_dir(), "remotes")
+
+
+def remote_key_path(host):
+  return os.path.join(remotes_dir(), f"{host}.key")
+
+
+def load_remotes():
+  """Paired hosts: short host name -> {host, dns, ssh, paired_ms}."""
+  remotes = {}
+  if not os.path.isdir(remotes_dir()):
+    return remotes
+  for name in sorted(os.listdir(remotes_dir())):
+    if not name.endswith(".json") or not HOST_RE.match(name[:-5]):
+      continue
+    try:
+      with open(os.path.join(remotes_dir(), name)) as handle:
+        remote = json.load(handle)
+    except (OSError, ValueError):
+      continue
+    if isinstance(remote, dict) and remote.get("host") == name[:-5] and DNS_RE.match(str(remote.get("dns", ""))) and os.path.isfile(remote_key_path(name[:-5])):
+      remotes[name[:-5]] = remote
+  return remotes
+
+
+def connected(remote, rid):
+  """Whether this machine uses a paired host's model. A pairing made for one
+  model at a time lists the models it connects; one made whole (`pair <host>`)
+  connects all it shares but those it lists as disconnected."""
+  if not remote:
+    return False
+  if isinstance(remote.get("models"), list):
+    return rid in remote["models"]
+  return rid not in (remote.get("disconnected") or [])
+
+
+@contextlib.contextmanager
+def remotes_lock():
+  """Held across reading, changing and saving a pairing, so two pair or forget
+  commands at once can't undo each other."""
+  ensure_dir(remotes_dir(), 0o700)
+  with open(os.path.join(remotes_dir(), ".lock"), "w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    yield
+
+
+def save_remote(remote):
+  write_atomic(os.path.join(remotes_dir(), f"{remote['host']}.json"), json.dumps(remote, indent=2) + "\n", mode=0o600)
+
+
+def unpair(host):
+  for path in (os.path.join(remotes_dir(), f"{host}.json"), remote_key_path(host)):
+    if os.path.exists(path):
+      os.unlink(path)
+
+
+def set_connected(remote, rid, on):
+  """Connect or disconnect one model of a pairing, in place. Returns False
+  when that leaves a one-at-a-time pairing with no model, which unpairs it."""
+  if isinstance(remote.get("models"), list):
+    remote["models"] = [m for m in remote["models"] if m != rid] + ([rid] if on else [])
+    return bool(remote["models"])
+  remote["disconnected"] = [m for m in remote.get("disconnected") or [] if m != rid] + ([] if on else [rid])
+  return True
+
+
+def network_path():
+  return os.path.join(state_dir(), "network.json")
+
+
+def load_network():
+  try:
+    with open(network_path()) as handle:
+      network = json.load(handle)
+  except (OSError, ValueError):
+    return {"hosts": {}, "models": {}}
+  if not isinstance(network, dict) or not isinstance(network.get("hosts"), dict) or not isinstance(network.get("models"), dict):
+    return {"hosts": {}, "models": {}}
+  return network
+
+
+def _clean(value, limit=120):
+  return CONTROL_RE.sub("", str(value or ""))[:limit]
+
+
+def _number(value):
+  try:
+    number = float(value)
+  except (TypeError, ValueError, OverflowError):
+    return None
+  return number if number == number and abs(number) < 1e15 else None
+
+
+def clean_listing(listing, dns):
+  """A peer's models.json as this machine will trust it: known shapes only,
+  IDs it can put in a path, and text without control characters."""
+  if not isinstance(listing, dict) or listing.get("schema") != NETWORK_SCHEMA or not isinstance(listing.get("models"), list):
+    raise LocalError("Not an Omarchy model listing")
+  models = []
+  for model in listing["models"][:64]:
+    if not isinstance(model, dict) or not ID_RE.match(str(model.get("recipe", ""))):
+      continue
+    observed = model.get("observed") if isinstance(model.get("observed"), dict) else {}
+    inputs = [value for value in model.get("input") or ["text"] if value in INPUTS] if isinstance(model.get("input"), list) else ["text"]
+    ctx = _number(model.get("ctx"))
+    tokens = _number(model.get("max_tokens"))
+    models.append({
+      "recipe": model["recipe"],
+      "name": _clean(model.get("name") or model["recipe"]),
+      "vendor": model.get("vendor") if ID_RE.match(str(model.get("vendor", ""))) else "",
+      "architecture": model.get("architecture") if model.get("architecture") in ARCHITECTURES else "",
+      "ctx": int(ctx) if ctx and ctx > 0 else 0,
+      "max_tokens": int(min(tokens, ctx or tokens)) if tokens and tokens > 0 else DEFAULT_MAX_OUTPUT_TOKENS,
+      "input": inputs or ["text"],
+      "unit": model.get("unit") if model.get("unit") in REMOTE_UNITS else "inactive",
+      "error": _clean(model.get("error"), 300),
+      "fits": model.get("fits") is not False,
+      "since_ms": _number(model.get("since_ms")),
+      "expected_load_seconds": _number(model.get("expected_load_seconds")),
+      "expected_stop_seconds": _number(model.get("expected_stop_seconds")),
+      "observed": {key: _number(observed.get(key)) for key in ("load_seconds", "ram_used_gib", "gpu_used_gib")} if observed else None,
+      "decode_tok_s": _number(model.get("decode_tok_s")),
+      "prefill_tok_s": _number(model.get("prefill_tok_s")),
+    })
+  return {"ram_total_gib": _number(listing.get("ram_total_gib")), "models": models}
+
+
+def fetch_listing(dns):
+  """(state, listing, error): online with its models, not_sharing, or unreachable.
+  A peer's answer is untrusted: whatever it makes fetching, parsing or cleaning raise (a
+  malformed response, nesting deep enough to recurse out) leaves that one peer
+  unreachable, never the whole survey."""
+  try:
+    status, body = http_status(f"https://{dns}{LISTING_ROUTE}", timeout=LISTING_TIMEOUT)
+    # Tailscale stops listening on 443 once a host's last serve route goes, so
+    # an online host refusing the connection simply shares nothing.
+    if status == 404 or (status == 0 and b"Connection refused" in body):
+      return "not_sharing", None, ""
+    if status != 200:
+      return "unreachable", None, f"HTTP {status}" if status else body.decode(errors="replace")[:200]
+    return "online", clean_listing(json.loads(body), dns), ""
+  except Exception as error:
+    return "unreachable", None, str(error)[:200]
+
+
+def remote_record(host, dns, model, paired, ram_total_gib, last_seen_ms):
+  rid = model["recipe"]
+  return {
+    **model,
+    "id": f"{host}/{rid}",
+    "host": host,
+    "dns": dns,
+    "paired": paired,
+    "endpoint": f"https://{dns}{SHARE_ROOT}/{rid}/v1",
+    "ram_total_gib": ram_total_gib,
+    "last_seen_ms": last_seen_ms,
+    # Set while the host can't be reached: why, for the line that says so.
+    "offline": "",
+  }
+
+
+def survey_network(previous, now=None):
+  """Every model shared on the tailnet, plus the ones seen before whose host
+  is away now. `previous` is the last network.json."""
+  now = now or int(time.time() * 1000)
+  status = tailscale_status()
+  remotes = load_remotes()
+  hosts, models = {}, {}
+  me = node_dns((status or {}).get("Self"))
+  peers = {}
+  for node in ((status or {}).get("Peer") or {}).values():
+    dns = node_dns(node)
+    if dns and dns != me and node.get("OS") == "linux":
+      peers[dns.split(".")[0]] = (dns, node.get("Online") is True)
+  for host, remote in remotes.items():
+    peers.setdefault(host, (remote["dns"], False))
+  for host, before in (previous.get("hosts") or {}).items():
+    if isinstance(before, dict) and before.get("dns"):
+      peers.setdefault(host, (before["dns"], False))
+  online = {host: dns for host, (dns, up) in peers.items() if up}
+  with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    answers = dict(zip(online, pool.map(fetch_listing, online.values())))
+  for host, (dns, up) in sorted(peers.items()):
+    paired = host in remotes
+    before = previous.get("hosts", {}).get(host) or {}
+    state, listing, error = answers.get(host, ("offline", None, ""))
+    if state == "online":
+      hosts[host] = {"host": host, "dns": dns, "paired": paired, "state": "online", "error": "", "last_seen_ms": now, "ram_total_gib": listing["ram_total_gib"]}
+      # Only what its host runs, or is loading, is on offer: a model it stops
+      # leaves the list until it starts again.
+      for model in listing["models"]:
+        if model["unit"] not in ("active", "activating"):
+          continue
+        record = remote_record(host, dns, model, connected(remotes.get(host), model["recipe"]), listing["ram_total_gib"], now)
+        models[record["id"]] = record
+      continue
+    if state == "not_sharing" and not paired:
+      continue
+    last_seen = before.get("last_seen_ms")
+    if not paired and not (isinstance(last_seen, (int, float)) and now - last_seen < FORGET_UNPAIRED_MS):
+      continue
+    hosts[host] = {"host": host, "dns": dns, "paired": paired, "state": "not_sharing" if state == "not_sharing" else "offline" if state == "offline" else "unreachable",
+                   "error": error, "last_seen_ms": last_seen, "ram_total_gib": before.get("ram_total_gib")}
+    if state == "not_sharing":
+      continue
+    # Away: its models keep their lines, marked offline, as last seen.
+    reason = "offline" if state == "offline" else "unreachable"
+    for mid, model in previous.get("models", {}).items():
+      if isinstance(model, dict) and model.get("host") == host and isinstance(model.get("recipe"), str) and ID_RE.match(model["recipe"]):
+        models[mid] = {**model, "paired": connected(remotes.get(host), model["recipe"]), "offline": reason, "unit": "inactive", "since_ms": None}
+  return {
+    "schema": NETWORK_SCHEMA, "updated_ms": now, "tailnet": status is not None,
+    # Whether `share` can work here: tailscale serve needs MagicDNS and HTTPS
+    # certificates. The panel only offers sharing when it can.
+    "can_share": bool(me) and bool((status or {}).get("CertDomains")),
+    "self": me.split(".")[0] if me else "", "hosts": hosts, "models": models,
+  }
+
+
+def write_network(forget=None):
+  """Survey the tailnet and rewrite network.json, which the panel watches."""
+  ensure_dir(state_dir())
+  with open(os.path.join(state_dir(), "network.lock"), "w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    previous = load_network()
+    if forget:
+      previous["hosts"].pop(forget, None)
+      previous["models"] = {mid: m for mid, m in previous["models"].items() if not (isinstance(m, dict) and m.get("host") == forget)}
+    network = survey_network(previous)
+    write_atomic(network_path(), json.dumps(network, indent=2) + "\n")
+  # Pairing, forgetting and every survey pass through here, so pi's extension
+  # follows paired hosts' models as status writes make it follow local ones.
+  try:
+    sync_pi_extension()
+  except OSError:
+    pass
+  return network
+
+
+def split_remote_id(value):
+  host, _, rid = str(value or "").partition("/")
+  if not HOST_RE.match(host) or not ID_RE.match(rid):
+    raise LocalError("A network model is named host/recipe")
+  return host, rid
+
+
+def resolve_remote(mid, running_only=True):
+  """A paired host's model, as its host lists it right now."""
+  host, rid = split_remote_id(mid)
+  remote = load_remotes().get(host)
+  if not connected(remote, rid):
+    raise LocalError(f"{host}/{rid} isn't paired. Run: omarchy agent local pair {host} {rid}")
+  state, listing, error = fetch_listing(remote["dns"])
+  if state != "online":
+    raise LocalError(f"{host} doesn't share models right now" if state == "not_sharing" else f"{host} isn't reachable{': ' + error if error else ''}")
+  for model in listing["models"]:
+    if model["recipe"] == rid:
+      if running_only and model["unit"] != "active":
+        raise LocalError(f"{rid} isn't running on {host}")
+      return remote_record(host, remote["dns"], model, True, listing["ram_total_gib"], int(time.time() * 1000))
+  raise LocalError(f"{host} doesn't share {rid}")
+
+
+def short_host(target):
+  """An SSH target as people call the machine: no user, no tailnet domain.
+  An address stays whole."""
+  host = target.rsplit("@", 1)[-1]
+  try:
+    ipaddress.ip_address(host)
+    return host
+  except ValueError:
+    return host.split(".")[0]
+
+
+def ssh_command(remote, *argv, interactive=False):
+  target = remote.get("ssh") or remote["dns"]
+  if not SSH_TARGET_RE.match(target):
+    raise LocalError("Not an SSH target")
+  # A host met for the first time is trusted on sight, as the tailnet vouches
+  # for who it is; one whose key has changed since is still refused.
+  options = ["-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"] + ([] if interactive else ["-o", "BatchMode=yes"])
+  return ["ssh", *options, "--", target, shlex.join(["omarchy-agent-local", *argv])]
+
+
+def cmd_pair(argv):
+  parser = argparse.ArgumentParser(prog="omarchy agent local pair", description="Use the models another machine on your tailnet shares")
+  parser.add_argument("host", help="its tailnet name, or an SSH host that reaches it")
+  parser.add_argument("recipe", nargs="?", help="connect just this model; without one, every model it shares")
+  args = parser.parse_args(argv)
+  target = args.host
+  if not SSH_TARGET_RE.match(target):
+    raise LocalError("Not a host name")
+  if args.recipe is not None and not ID_RE.match(args.recipe):
+    raise LocalError("Not a recipe name")
+  # A host already paired has given its key: connecting another of its models
+  # needs no SSH.
+  if args.recipe:
+    with remotes_lock():
+      remote = next((r for r in load_remotes().values() if target in (r["host"], r["dns"], r.get("ssh"))), None)
+      if remote:
+        set_connected(remote, args.recipe, True)
+        save_remote(remote)
+    if remote:
+      write_network()
+      say(f"Paired with {remote['host']}/{args.recipe}")
+      return 0
+  say(f"Pairing with {target} over SSH")
+  # ssh exits 255 both when nothing answers and when sshd turns down every key
+  # offered, so its stderr tells the two apart. On a terminal a key's
+  # passphrase can be asked for there; without one (the agents panel pairs this
+  # way) nothing can answer a prompt, so ssh asks none.
+  result = subprocess.run(ssh_command({"ssh": target, "dns": ""}, "share", "--export", interactive=sys.stdin.isatty()), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+  sys.stderr.write(result.stderr)
+  # The agents panel shows an error's first line on the model's line, so that
+  # line names the machine short and fits there; the next says what to do.
+  name = short_host(target)
+  if result.returncode == 255 and "Permission denied" in result.stderr:
+    raise LocalError(f"{name} refused this machine's SSH keys\nStart the SSH agent that holds your key (like 1Password's), or authorize a key on {target} in Setup > Security")
+  if result.returncode == 255 and "Host key verification failed" in result.stderr:
+    # known_hosts keys a host by its name or address, never the login.
+    raise LocalError(f"{name}'s SSH host key has changed\nIf it was reinstalled, forget its old key with: ssh-keygen -R {target.rsplit('@', 1)[-1]}")
+  if result.returncode == 255:
+    raise LocalError(f"Can't reach {name} over SSH\nTurn on SSHD on {target} in Setup > Security")
+  if result.returncode != 0:
+    raise LocalError(f"Can't run omarchy-agent-local on {name}")
+  try:
+    export = json.loads(result.stdout.strip().splitlines()[-1])
+    host, dns, key = export["host"], export["dns"], export["key"]
+  except (ValueError, KeyError, IndexError, TypeError):
+    raise LocalError(f"{name} didn't send its sharing details")
+  if not HOST_RE.match(str(host)) or not DNS_RE.match(str(dns)) or not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", key):
+    raise LocalError(f"{name} sent an invalid host name or key")
+  with remotes_lock():
+    write_atomic(remote_key_path(host), key, mode=0o600)
+    # The same host reached by another name keeps the models it connects.
+    remote = load_remotes().get(host) or {"models": []}
+    remote.update(host=host, dns=dns, ssh=target, paired_ms=int(time.time() * 1000))
+    if args.recipe:
+      set_connected(remote, args.recipe, True)
+    else:
+      remote.pop("models", None)
+      remote.pop("disconnected", None)
+    save_remote(remote)
+  network = write_network()
+  shared = [m for m in network["models"].values() if m["host"] == host and m["paired"]]
+  if shared:
+    say(f"Paired with {host}: " + ", ".join(m["recipe"] + ("" if m["offline"] else f" ({m['unit']})") for m in shared))
+  else:
+    say(f"Paired with {host}. It shares no models yet; on {host}, run: omarchy agent local share <recipe>")
+  return 0
+
+
+def cmd_forget(argv):
+  parser = argparse.ArgumentParser(prog="omarchy agent local forget", description="Unpair a host, or disconnect one of its models with host/recipe")
+  parser.add_argument("host", help="host, or host/recipe for just that model")
+  args = parser.parse_args(argv)
+  host = args.host
+  if "/" in host:
+    host, rid = split_remote_id(host)
+    with remotes_lock():
+      remote = load_remotes().get(host)
+      if not connected(remote, rid):
+        say(f"{host}/{rid} isn't paired")
+        return 0
+      # The last model disconnected unpairs the host, dropping its key.
+      if set_connected(remote, rid, False):
+        save_remote(remote)
+      else:
+        unpair(host)
+    write_network()
+    say(f"Disconnected {host}/{rid}")
+    return 0
+  if not HOST_RE.match(host):
+    raise LocalError("Not a host name")
+  with remotes_lock():
+    unpair(host)
+  write_network(forget=host)
+  say(f"Forgot {host}")
+  return 0
+
+
+def cmd_network(argv):
+  parser = argparse.ArgumentParser(prog="omarchy agent local network", description="List the models shared on your tailnet")
+  parser.add_argument("--json", action="store_true")
+  parser.add_argument("--write", action="store_true", help=argparse.SUPPRESS)
+  args = parser.parse_args(argv)
+  network = write_network()
+  if args.write:
+    return 0
+  if args.json:
+    print(json.dumps(network, indent=2))
+    return 0
+  if not network["tailnet"]:
+    say("This machine isn't on a tailnet. Run: tailscale up")
+    return 0
+  if not network["models"]:
+    say("No machine on your tailnet shares a model. On one that runs a model: omarchy agent local share <recipe>")
+  for mid, model in sorted(network["models"].items()):
+    state = model["offline"] or {"active": "running", "activating": "loading", "deactivating": "stopping"}.get(model["unit"], model["unit"])
+    pairing = "" if model["paired"] else f" · pair with: omarchy agent local pair {model['host']} {model['recipe']}"
+    say(f"{mid} ({model['name']}): {state} · context {model['ctx']}{pairing}")
+  return 0
+
+
+# The provider local models are listed under, in pi's own extension and in the
+# launch overlays, so the two are one provider rather than two to pick from. A
+# paired host's models get their own, suffixed with the host.
+OVERLAY_PROVIDER = "omarchy-local"
+
+
+def overlay_target(rid=None):
+  """The running model an overlay points at: a local recipe, or host/recipe
+  on a paired machine of the tailnet."""
+  if rid and "/" in rid:
+    return remote_target(resolve_remote(rid))
+  return local_target(resolve_model(rid, running_only=True))
+
+
+def remote_target(model):
+  """A paired host's model, from its listing or network.json, as an overlay target."""
+  return {
+    "provider": f"{OVERLAY_PROVIDER}-{model['host']}",
+    "provider_name": f"Omarchy model on {model['host']}",
+    "base_url": model["endpoint"],
+    "key_path": remote_key_path(model["host"]),
+    "model": model["recipe"],
+    "name": model["name"],
+    "ctx": model["ctx"],
+    # A host that doesn't publish its cap yet gets the old default.
+    "max_tokens": model.get("max_tokens") or DEFAULT_MAX_OUTPUT_TOKENS,
+    "input": model["input"],
+    "file": f"{model['host']}--{model['recipe']}",
+  }
+
+
+def local_target(manifest):
+  rid = manifest["recipe_id"]
+  return {
+    "provider": OVERLAY_PROVIDER,
+    "provider_name": "Omarchy local model",
+    "base_url": endpoint(rid),
+    "key_path": key_path(),
+    "model": rid,
+    "name": manifest["recipe"].get("name", rid),
+    "ctx": manifest["variant"]["ctx"],
+    "max_tokens": max_output_tokens(manifest),
+    "input": model_inputs(manifest),
+    "file": rid,
+  }
+
+
+def pi_model(target):
+  return {
+    "type": "chat",
+    "id": target["model"],
+    "name": target["name"],
+    "baseUrl": target["base_url"],
+    "reasoning": True,
+    "input": target["input"],
+    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+    "contextWindow": target["ctx"],
+    "maxTokens": target["max_tokens"],
+  }
+
+
+def pi_provider_source(header, targets):
+  """A pi extension registering these models, each at its own endpoint, under
+  their providers: this machine's, and one per paired host with its key."""
+  providers = {}
+  for target in targets:
+    providers.setdefault(target["provider"], {
+      "name": target["provider_name"],
+      "apiKey": "!cat -- " + shlex.quote(target["key_path"]),
+      "api": "openai-completions",
+      "models": [],
+    })["models"].append(pi_model(target))
+  registrations = "".join(f"  pi.registerProvider({json.dumps(name)}, {json.dumps(provider, indent=2)});\n" for name, provider in providers.items())
+  return f"// {header}\nexport default function (pi) {{\n{registrations}}}\n"
+
+
+def local_targets():
+  """Every model set up here as an overlay target. A manifest that can't be
+  read as one is left out rather than costing the others their line."""
+  targets = []
+  for rid in known_models():
+    try:
+      targets.append(local_target(load_model(rid)))
+    except (KeyError, TypeError, AttributeError):
+      pass
+  return targets
+
+
+def remote_targets():
+  """Every paired host's connected model this machine has seen, as overlay
+  targets, whether or not its host answers right now: like a stopped local
+  model, it keeps its place in the picker."""
+  remotes = load_remotes()
+  targets = []
+  for model in load_network()["models"].values():
+    try:
+      if model.get("paired") and model["host"] in remotes:
+        targets.append(remote_target(model))
+    except (KeyError, TypeError, AttributeError):
+      pass
+  return sorted(targets, key=lambda target: (target["provider"], target["model"]))
+
+
+def pi_extension_path():
+  return os.path.join(home(), ".pi", "agent", "extensions", "omarchy-local.ts")
+
+
+def sync_pi_extension():
+  """Keep pi's own extension listing every model set up here and every paired
+  host's, so plain `pi`, its /model picker and a default of
+  omarchy-local/<recipe> or omarchy-local-<host>/<recipe> reach each one at
+  its current endpoint with the current key, with nothing written by hand.
+  Only where pi has made its folder; it goes when the last model does."""
+  if not os.path.isdir(os.path.join(home(), ".pi", "agent")):
+    return
+  # Status and network writes both sync, so collecting and writing hold a
+  # lock of their own: an older list can't land over a newer one.
+  ensure_dir(state_dir())
+  with open(os.path.join(state_dir(), "pi.lock"), "w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    path = pi_extension_path()
+    targets = local_targets() + remote_targets()
+    if not targets:
+      if os.path.exists(path):
+        os.unlink(path)
+      return
+    source = pi_provider_source("Generated by omarchy-agent-local for every model set up here or paired on the tailnet; rewritten as they change.", targets)
+    if _read(path) != source.strip():
+      write_atomic(path, source)
 
 
 def pi_overlay(rid=None):
-  """A pi extension registering a running model, loaded only by local launches."""
-  manifest = resolve_model(rid, running_only=True)
-  rid = manifest["recipe_id"]
-  provider = {
-    "name": "Omarchy local model",
-    "baseUrl": endpoint(rid),
-    "apiKey": "!cat -- " + shlex.quote(key_path()),
-    "api": "openai-completions",
-    "models": [{
-      "type": "chat",
-      "id": rid,
-      "name": manifest["recipe"].get("name", rid),
-      "reasoning": True,
-      "input": model_inputs(manifest),
-      "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-      "contextWindow": manifest["variant"]["ctx"],
-      "maxTokens": 16384,
-    }],
-  }
-  source = (
-    "// Generated by omarchy-agent-local overlay for `omarchy agent --local`; rewritten on every launch.\n"
-    "export default function (pi) {\n"
-    f"  pi.registerProvider({json.dumps(OVERLAY_PROVIDER)}, {json.dumps(provider, indent=2)});\n"
-    "}\n"
-  )
-  # One file per recipe: launches of two models close together must not
+  """A pi extension for a launch on a running model. It lists the rest of its
+  provider's models too, as pi's own extension does, so loading it over that
+  one leaves the /model picker whole; the launch picks this one with --model."""
+  target = overlay_target(rid)
+  siblings = local_targets() if target["provider"] == OVERLAY_PROVIDER else remote_targets()
+  targets = [target] + [other for other in siblings if other["provider"] == target["provider"] and other["model"] != target["model"]]
+  source = pi_provider_source("Generated by omarchy-agent-local overlay for `omarchy agent --local`; rewritten on every launch.", targets)
+  # One file per model: launches of two models close together must not
   # swap each other's overlay before their agents read it.
-  path = os.path.join(config_dir(), "overlays", f"pi-{rid}.ts")
+  path = os.path.join(config_dir(), "overlays", f"pi-{target['file']}.ts")
   write_atomic(path, source)
-  return path, OVERLAY_PROVIDER, rid
+  return path, target["provider"], target["model"]
+
+
+DEFAULT_MAX_OUTPUT_TOKENS = 16384
+
+
+def max_output_tokens(manifest):
+  """The reply cap the server enforces, so agents never ask for less (or more) than it allows."""
+  args = manifest["recipe"].get("server", {}).get("args", []) + manifest["variant"].get("args", [])
+  value = None
+  for index, arg in enumerate(args):
+    if arg == "--max-tokens" and index + 1 < len(args):
+      value = args[index + 1]
+    elif arg.startswith("--max-tokens="):
+      value = arg.split("=", 1)[1]
+  try:
+    tokens = int(value)
+  except (TypeError, ValueError):
+    return DEFAULT_MAX_OUTPUT_TOKENS
+  return min(tokens, manifest["variant"]["ctx"]) if tokens > 0 else DEFAULT_MAX_OUTPUT_TOKENS
 
 
 def model_inputs(manifest):
@@ -3477,36 +4849,88 @@ def model_inputs(manifest):
 
 
 def opencode_overlay(rid=None):
-  manifest = resolve_model(rid, running_only=True)
-  rid = manifest["recipe_id"]
+  target = overlay_target(rid)
   overlay = {
     "$schema": "https://opencode.ai/config.json",
     "provider": {
-      OVERLAY_PROVIDER: {
+      target["provider"]: {
         "npm": "@ai-sdk/openai-compatible",
-        "name": "Omarchy local model",
-        "options": {"baseURL": endpoint(rid), "apiKey": "{file:" + key_path() + "}"},
-        "models": {rid: {
-          "name": manifest["recipe"].get("name", rid),
-          "limit": {"context": manifest["variant"]["ctx"], "output": 16384},
-          "attachment": "image" in model_inputs(manifest),
-          "modalities": {"input": model_inputs(manifest), "output": ["text"]},
+        "name": target["provider_name"],
+        "options": {"baseURL": target["base_url"], "apiKey": "{file:" + target["key_path"] + "}"},
+        "models": {target["model"]: {
+          "name": target["name"],
+          "limit": {"context": target["ctx"], "output": target["max_tokens"]},
+          "attachment": "image" in target["input"],
+          "modalities": {"input": target["input"], "output": ["text"]},
         }},
       }
     },
   }
-  path = os.path.join(config_dir(), "overlays", f"opencode-{rid}.json")
+  path = os.path.join(config_dir(), "overlays", f"opencode-{target['file']}.json")
   write_atomic(path, json.dumps(overlay, indent=2) + "\n")
-  return path, OVERLAY_PROVIDER, rid
+  return path, target["provider"], target["model"]
+
+
+def qwen_overlay(rid=None):
+  """What Qwen Code is launched with: it takes an OpenAI-compatible endpoint
+  from flags and its key from the environment, so this is the endpoint, the
+  model and where the key is, for the launcher to read. No key in it."""
+  target = overlay_target(rid)
+  overlay = {
+    "baseUrl": target["base_url"],
+    "model": target["model"],
+    "name": target["name"],
+    "keyFile": target["key_path"],
+    "contextWindow": target["ctx"],
+    "maxTokens": target["max_tokens"],
+  }
+  path = os.path.join(config_dir(), "overlays", f"qwen-{target['file']}.json")
+  write_atomic(path, json.dumps(overlay, indent=2) + "\n")
+  return path, target["provider"], target["model"]
+
+
+OVERLAYS = {"pi": lambda rid: pi_overlay(rid), "opencode": lambda rid: opencode_overlay(rid), "qwen": lambda rid: qwen_overlay(rid)}
 
 
 def cmd_overlay(argv):
   parser = argparse.ArgumentParser(prog="omarchy agent local overlay")
-  parser.add_argument("agent", choices=("opencode", "pi"))
-  parser.add_argument("recipe", nargs="?", help="the running model (default: the last one started)")
+  parser.add_argument("agent", choices=tuple(OVERLAYS))
+  parser.add_argument("recipe", nargs="?", help="the running model, or host/recipe on a paired machine (default: the last one started here)")
   args = parser.parse_args(argv)
-  for line in (pi_overlay if args.agent == "pi" else opencode_overlay)(args.recipe):
+  for line in OVERLAYS[args.agent](args.recipe):
     print(line)
+  return 0
+
+
+def cmd_logs(argv):
+  parser = argparse.ArgumentParser(prog="omarchy agent local logs")
+  parser.add_argument("recipe", nargs="?", help="the model (default: the last one started)")
+  parser.add_argument("-n", "--lines", type=int, default=200)
+  args = parser.parse_args(argv)
+  rid = args.recipe or last_model_id()
+  if not rid or not ID_RE.match(rid):
+    raise LocalError("Name the model: omarchy agent local logs <recipe>")
+  # A first setup or start that failed keeps its reason, and its peer, in its installing record.
+  installing = load_installing(rid) or {}
+  error = _read(error_path(rid)) or installing.get("error", "")
+  if error:
+    say(f"Last error: {error}")
+    say("")
+  # Its setup's log while it's being set up or failed to be, then the model's own.
+  for unit, what in ((install_unit(rid), "setup"), (unit_name(rid), "model")):
+    out = subprocess.run(["journalctl", "--user", "-q", "-u", unit, "-n", str(args.lines), "--no-pager"], capture_output=True, text=True).stdout.strip()
+    if out:
+      say(f"== {rid}: {what} log on this machine ({unit})")
+      say(out)
+      say("")
+  try:
+    setup = pair_manifest(rid).get("pair")
+  except LocalError:
+    setup = installing.get("pair")
+  if setup:
+    say(f"== {rid}: rank 1 on {setup['host']}")
+    result = pair_ssh(setup["peer"], f"podman logs --tail {int(args.lines)} {shlex.quote(worker_name(rid))} 2>&1", check=False, timeout=30)
+    say((result.stdout or result.stderr).strip() or "(no log there)")
   return 0
 
 
@@ -3517,6 +4941,11 @@ COMMANDS = {
   "start": cmd_start,
   "stop": cmd_stop,
   "remove": cmd_remove,
+  "share": cmd_share,
+  "network": cmd_network,
+  "pair": cmd_pair,
+  "forget": cmd_forget,
+  "logs": cmd_logs,
   # Plumbing for the panel, omarchy agent, omarchy update and catalog
   # maintainers; they run but aren't listed.
   "profile": cmd_profile,
@@ -3525,6 +4954,7 @@ COMMANDS = {
   "overlay": cmd_overlay,
   "link": cmd_link,
   "link-worker": cmd_link_worker,
+  "share-proxy": cmd_share_proxy,
 }
 
 SUMMARIES = {
@@ -3534,6 +4964,11 @@ SUMMARIES = {
   "start": "Start a model that's set up, the last one started by default",
   "stop": "Stop a model, or every running one",
   "remove": "Remove a model's weights, manifests and unused image",
+  "share": "Share a model with the other machines on your tailnet, or stop with --off",
+  "network": "List the models shared on your tailnet, including hosts that are offline",
+  "pair": "Pair with a machine over SSH to use the models it shares",
+  "forget": "Unpair a machine and drop its models",
+  "logs": "Show a model's logs, and its other half's on a paired Spark",
   "link": "Show the Spark cabled to this one; 'link setup <peer>' prepares both",
 }
 
@@ -3556,7 +4991,12 @@ def main(argv):
   try:
     return COMMANDS[command](argv)
   except LocalError as error:
-    print(f"Error: {error}", file=sys.stderr)
+    # On a terminal the error ends output from ssh, podman and the like, so it
+    # gets a line of space and a red label to stand apart from it.
+    if sys.stderr.isatty():
+      print(f"\n\033[1;31mError:\033[0m {error}", file=sys.stderr)
+    else:
+      print(f"Error: {error}", file=sys.stderr)
     return 1
   except KeyboardInterrupt:
     return 130

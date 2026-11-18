@@ -61,7 +61,7 @@ runtime = {
 variant = {"ctx": 4096, "peak_ram_gib": 16, "peak_gpu_gib": 16}
 artifact = {"repo": "test/model", "revision": "b" * 40, "license": "mit",
             "files": ["model.gguf", "tokenizer/*.json"], "model": "model.gguf"}
-recipe = {"name": "Test model", "summary": "Fixture", "runtime": "server",
+recipe = {"name": "Test model", "runtime": "server",
           "hardware": [{"gpu": "amd-strix-halo", "ram_class": 64, "measured": "measurements/model.toml"}],
           "artifacts": [artifact], "variant": [variant]}
 gpu = {"vendor": "amd", "family": "amd-strix-halo", "memory_gib": 48}
@@ -157,6 +157,43 @@ check("GPU peak exceeding capacity does not fit", not a.fits(dict(variant, peak_
 check("RAM fit preserves desktop reserve", not a.fits(dict(variant, peak_ram_gib=57), profile, gpu)[0])
 with patch.object(a, "free_memory", return_value=(1, 1)), patch.object(a, "top_memory_users", return_value="browser (12 GiB), editor (4 GiB)"), patch.object(a.time, "sleep"):
   raises("headroom failure lists largest memory users", lambda: a.check_headroom(variant, gpu), "browser (12 GiB), editor (4 GiB)")
+
+# A 64 GB Strix Halo whose desktop holds 13 GiB: fit kept its reserve, so start needs only the peak.
+long_ctx = {"ctx": 262144, "peak_ram_gib": 42, "peak_gpu_gib": 40}
+with patch.object(a, "free_memory", return_value=(48.6, 54)), patch.object(a, "choose_gpu", return_value=dict(gpu, memory_gib=54)):
+  check("start counts the desktop's reserve once", a.check_headroom(long_ctx, dict(gpu, memory_gib=54)) == (48.6, 54)
+        and a.start_fit({"variant": long_ctx}, profile) == (True, ""))
+
+# A 64 GB Strix Halo on a stock kernel: the GPU maps half of RAM until use raises the cap.
+halo = {"vendor": "amd", "family": "amd-strix-halo", "memory_gib": 31.6, "unified": True}
+with patch.object(a, "platform_name", return_value="x86"), patch.object(a, "amd_gpus", return_value=[dict(halo)]), patch.object(a, "meminfo", return_value={"MemTotal": 62 * 2**30}):
+  halo = a.machine_profile()["gpus"][0]
+needs_more = dict(variant, peak_gpu_gib=38, peak_ram_gib=38)
+check("a unified AMD GPU fits by the cap use can raise it to", halo["max_memory_gib"] == 54 and a.fits(needs_more, profile, halo)[0])
+check("a GPU with VRAM of its own fits only by what it has", not a.fits(needs_more, profile, dict(halo, max_memory_gib=a.gpu_memory_ceiling_gib(dict(halo, unified=False), 62)))[0])
+page = os.sysconf("SC_PAGE_SIZE")
+with patch.object(a, "pending_pages_limit", return_value=54 * 2**30 // page), patch.object(a, "_read", return_value=str(31 * 2**30 // page)), patch.object(a, "choose_gpu", return_value=halo):
+  raises("a model past the current cap waits for the reboot that raises it", lambda: a.check_headroom(needs_more, halo), "until a reboot")
+  check("the panel is told to reboot, not that memory is short", a.start_fit({"variant": needs_more}, profile) == (False, a.REBOOT_FOR_GPU_MEMORY))
+with patch.object(a, "pending_pages_limit", return_value=0), patch.object(a, "_read", return_value=str(31 * 2**30 // page)), patch.object(a, "choose_gpu", return_value=halo):
+  raises("with no raise waiting, use is named instead of a reboot", lambda: a.check_headroom(needs_more, halo), "use raises its memory limit")
+  check("and the panel isn't told a reboot would help", a.start_fit({"variant": needs_more}, profile) == (False, a.GPU_TOO_SMALL))
+
+# The root script against a limine-mkinitcpio that fails a kernel and still exits 0, as it does.
+fake = Path(os.environ["HOME"]) / "fake-limine"
+fake.mkdir()
+(fake / "limine-mkinitcpio").write_text("#!/bin/bash\necho 'mkinitcpio failed for kernel linux'\n")
+(fake / "limine-mkinitcpio").chmod(0o755)
+drop_in = fake / "limine-entry-tool.d" / "amd-gpu-memory.conf"
+run_script = lambda: subprocess.run(["bash", "-c", a.GPU_MEMORY_SCRIPT, "test", str(drop_in), "14185506"], capture_output=True, env=dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}")).returncode
+check("a failed rebuild fails and leaves no drop-in to skip the retry", run_script() == 1 and not drop_in.exists())
+drop_in.write_text("# Omarchy's\n")
+check("a failed rebuild puts the earlier drop-in back", run_script() == 1 and drop_in.read_text() == "# Omarchy's\n")
+(fake / "limine-mkinitcpio").write_text("#!/bin/bash\necho rebuilt\n")
+(fake / "not-a-dir").write_text("")
+unwritable = subprocess.run(["bash", "-c", a.GPU_MEMORY_SCRIPT, "test", str(fake / "not-a-dir" / "amd-gpu-memory.conf"), "14185506"], capture_output=True, env=dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}"))
+check("a drop-in that can't be written fails before the rebuild", unwritable.returncode == 1 and b"rebuilt" not in unwritable.stdout + unwritable.stderr)
+check("a rebuild that succeeds keeps the raised cap", run_script() == 0 and drop_in.read_text() == 'KERNEL_CMDLINE[default]+=" ttm.pages_limit=14185506"\n')
 
 payload = b'{"ok":true}'
 oid = hashlib.sha1(f"blob {len(payload)}\0".encode() + payload).hexdigest()
@@ -361,7 +398,7 @@ setup = {"schema": 1, "recipe_id": "paired", "runtime": same_rt, "recipe": paire
 a.write_pair_setup(setup)
 here = {"addr": "10.99.1.1", "dev": "enp1", "hcas": ["rocep1", "roceP2"], "gid": "5"}
 there = {"addr": "10.99.1.2", "dev": "enp1", "hcas": ["rocep1", "roceP2"], "gid": "3"}
-with patch.object(a, "pair_link", return_value=(here, there)), patch.object(a, "peer_headroom") as headroom, patch.object(a, "pair_ssh") as ssh, patch.object(a, "pair_python"):
+with patch.object(a, "pair_link", return_value=(here, there)), patch.object(a, "peer_headroom") as headroom, patch.object(a, "pair_ssh") as ssh, patch.object(a, "pair_limits") as limits, patch.object(a, "pair_python"):
   a.pair_worker_start("paired")
 head_env = dict(line.split("=", 1) for line in Path(a.pair_env_path("paired")).read_text().splitlines())
 worker = shlex.split(ssh.call_args.args[1])
@@ -370,7 +407,7 @@ check("rank 0's environment is rank 0's side of the link", head_env == {"NCCL_CO
 check("rank 1's environment is rank 1's side, same rendezvous", worker_env["TF_RANK"] == "1" and worker_env["NCCL_COMM_ID"] == "10.99.1.1:29620" and worker_env["NCCL_IB_GID_INDEX"] == "3" and "API_KEY" not in worker_env, repr(worker_env))
 check("rank 1 starts on the peer as its user, with the head's command and the same restrictions",
       ssh.call_args.args[0] == "bob@10.99.1.2" and headroom.called
-      and all(flag in worker for flag in ("--read-only", "no-new-privileges", "/dev/infiniband", "f" * 64))
+      and limits.called and all(flag in worker for flag in ("--read-only", "no-new-privileges", "/dev/infiniband", "f" * 64))
       and worker[worker.index("--cap-drop") + 1] == "all"
       and f"/home/bob/.local/share/omarchy/agent-local/models/paired/{'e' * 16}:/models:ro" in worker
       and f"/home/bob/.local/share/omarchy/agent-local/models/paired/{'e' * 16}.rank1:/state" in worker
@@ -484,6 +521,98 @@ with patch.object(a, "pair_ssh", side_effect=a.LocalError("unreachable")), patch
 compile(a.CDI_COMPAT, "nvidia-cdi-podman-compat", "exec")
 check("the CDI compatibility script compiles", True)
 
+# A Spark on the cable before setup is offered by the address mDNS names; a linked one by its host.
+with patch.object(a, "cable_neighbors", return_value=["fe80::1%enp1", "fe80::2%enp1"]), patch.object(a, "mdns_names", return_value={"fe80::2": "spark-760a"}):
+  offered = a.link_probe(pair_profile)
+check("a Spark on the cable waiting for setup is offered by its mDNS name", offered == {"state": "available", "address": "fe80::2%enp1", "host": "spark-760a"} and a.link_state() == offered, repr(offered))
+check("a linked Spark is shown as linked", a.link_probe(dict(pair_profile, pair={"host": "spark2"})) == {"state": "linked", "host": "spark2"})
+with patch.object(a, "cable_neighbors", return_value=[]):
+  check("an empty cable offers nothing", a.link_probe(pair_profile) == {"state": "none"})
+check("machines that can't pair offer nothing", a.link_probe(dict(pair_profile, platform="x86")) == {"state": "none"})
+with patch.object(a, "cable_neighbors", return_value=["fe80::2%enp1"]), patch.object(a, "mdns_names", return_value={}), \
+     patch.object(a.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as sent:
+  a.link_notify(pair_profile)
+  a.link_notify(pair_profile)
+notices = [call.args[0] for call in sent.call_args_list if call.args and call.args[0][:1] == ["omarchy-notification-send"]]
+check("a newly cabled Spark is announced once, with link setup as its action", len(notices) == 1 and notices[0][-1] == "omarchy-agent-local link setup", repr(notices))
+os.unlink(os.path.join(a.state_dir(), "link-notified"))
+# A refresh that found the Spark first doesn't stop the announcement.
+with patch.object(a, "cable_neighbors", return_value=["fe80::3%enp1"]), patch.object(a, "mdns_names", return_value={}):
+  a.link_probe(pair_profile)
+  with patch.object(a.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as sent:
+    a.link_notify(pair_profile)
+check("a Spark a refresh found first is still announced", any(c.args and c.args[0][:1] == ["omarchy-notification-send"] for c in sent.call_args_list))
+os.unlink(os.path.join(a.state_dir(), "link-notified"))
+# A send that failed (no notification daemon yet, say) is tried again next time.
+with patch.object(a, "cable_neighbors", return_value=["fe80::4%enp1"]), patch.object(a, "mdns_names", return_value={}):
+  with patch.object(a.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr="")):
+    a.link_notify(pair_profile)
+  with patch.object(a.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as sent:
+    a.link_notify(pair_profile)
+check("a failed announcement is tried again", any(c.args and c.args[0][:1] == ["omarchy-notification-send"] for c in sent.call_args_list))
+os.unlink(os.path.join(a.state_dir(), "link-notified"))
+os.unlink(a.link_path())
+# The parsers read what the tools print.
+ping = """PING ff02::1%enp1 (ff02::1%enp1) 56 data bytes
+64 bytes from fe80::adfd:1ade:3de8:d49b%enp1: icmp_seq=1 ttl=64 time=0.067 ms
+64 bytes from fe80::aba5:f382:c378:65aa%enp1: icmp_seq=1 ttl=64 time=0.133 ms
+64 bytes from fe80::5a6b:10b2:a79:3111%enp1: icmp_seq=1 ttl=64 time=0.472 ms
+64 bytes from fe80::5a6b:10b2:a79:3111%enp1: icmp_seq=2 ttl=64 time=0.401 ms (DUP!)
+"""
+own = a.own_link_local(json.dumps([{"ifname": "enp1", "addr_info": [{"family": "inet6", "local": "fe80::adfd:1ade:3de8:d49b", "scope": "link"}]},
+                                   {"ifname": "enp2", "addr_info": [{"family": "inet6", "local": "fe80::aba5:f382:c378:65aa", "scope": "link"},
+                                                                    {"family": "inet6", "local": "fd00::1", "scope": "global"}]}]))
+check("own link-local addresses are read from ip -j", own == {"fe80::adfd:1ade:3de8:d49b", "fe80::aba5:f382:c378:65aa"}, repr(own))
+check("a ping's answers drop this machine's own addresses and repeats", a.ping_answers(ping, own) == ["fe80::5a6b:10b2:a79:3111"])
+check("a failed ping or ip read gives nothing", a.ping_answers("", own) == [] and a.own_link_local("not json") == set())
+avahi = "+;enp1;IPv6;spark-760a;SSH Remote Terminal;local\n=;enp1;IPv6;spark-760a;SSH Remote Terminal;local;spark-760a.local;fe80::9514:4be5:80e5:7b8b;22;\n=;enP7s7;IPv4;spark-760a;SSH Remote Terminal;local;spark-760a.local;192.168.1.162;22;\n"
+check("mDNS names come from avahi-browse's resolved IPv6 lines", a.mdns_ssh_hosts(avahi) == {"fe80::9514:4be5:80e5:7b8b": "spark-760a"})
+# Once a pair is recorded, status says linked whatever the last probe saw.
+a.write_atomic(a.link_path(), json.dumps({"state": "available", "address": "fe80::2%enp1", "host": "x"}))
+with patch.object(a, "known_models", return_value=[]), patch.object(a, "installing_models", return_value=[]), patch.object(a, "resolve_best", side_effect=a.LocalError("none")):
+  linked = a.status_record(SimpleNamespace(version="test", best={}, recipes={}), dict(pair_profile, pair={"host": "spark2"}))["link"]
+check("status shows a recorded pair as linked, not a stale offer", linked == {"state": "linked", "host": "spark2"}, repr(linked))
+os.unlink(a.link_path())
+check("the cable hook parses", subprocess.run(["bash", "-n", os.path.join(os.environ["ENGINE_ROOT"], "system/90-omarchy-local-ai-link")]).returncode == 0)
+
+# A model that stopped unexpectedly says why: this start's own recorded reason, else the
+# server's last error line, else systemd's result.
+journal = "info: weights read\nerror: ncclCommInitRank: unhandled system error (run with NCCL_DEBUG=INFO for details) (2)\nsome trailing line"
+started = int(__import__("time").time() - 60)
+with patch.object(a, "unit_props", return_value={"InactiveExitTimestamp": "@%d" % started}), patch.object(a, "journal_tail", return_value=journal) as tail:
+  a.clear_error("crashy")
+  check("a crash shows the server's own last error", a.failure_reason("crashy", "exit-code").startswith("ncclCommInitRank: unhandled system error"))
+  check("only this start's log is searched, not an earlier run's", tail.call_args.args[2] == started * 1000, repr(tail.call_args))
+  a.record_error("crashy", "Locked memory limited: run link setup")
+  check("a reason the start already recorded isn't overwritten", a.failure_reason("crashy", "exit-code") == "Locked memory limited: run link setup")
+with patch.object(a, "unit_props", return_value={"InactiveExitTimestamp": "@%d" % int(__import__("time").time() + 60)}), patch.object(a, "journal_tail", return_value="nothing useful"):
+  check("an older reason gives way, and with no server error systemd's result is shown", a.failure_reason("crashy", "exit-code") == "Stopped unexpectedly (exit-code)")
+a.clear_error("crashy")
+# logs prints the last error, the model's journal and, for a pair, rank 1's log from the peer.
+a.record_error("crashy", "Locked memory limited: run link setup")
+a.write_atomic(a.model_manifest_path("crashy"), json.dumps({"recipe_id": "crashy", "pair": {"peer": "10.99.1.2", "host": "spark2", "home": "/home/u"}}))
+printed = []
+with patch.object(a, "say", side_effect=printed.append), \
+     patch.object(a.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="Nov 10 rank0 line", stderr="")), \
+     patch.object(a, "pair_ssh", return_value=SimpleNamespace(returncode=0, stdout="rank1 line", stderr="")) as peer_logs:
+  a.cmd_logs(["crashy", "-n", "50"])
+check("logs shows the last error, this machine's log and rank 1's from the peer",
+      printed[0] == "Last error: Locked memory limited: run link setup" and "Nov 10 rank0 line" in printed and "rank1 line" in printed
+      and "podman logs --tail 50" in peer_logs.call_args.args[1], repr(printed))
+os.unlink(a.model_manifest_path("crashy"))
+a.clear_error("crashy")
+# A failed first setup's reason lives in its installing record.
+a.write_atomic(a.installing_path("crashy"), json.dumps({"recipe_id": "crashy", "phase": "failed", "error": "Download failed",
+                                                       "pair": {"peer": "10.99.1.2", "host": "spark2", "home": "/home/u"}}))
+printed = []
+with patch.object(a, "say", side_effect=printed.append), \
+     patch.object(a.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
+     patch.object(a, "pair_ssh", return_value=SimpleNamespace(returncode=0, stdout="rank1 failed", stderr="")):
+  a.cmd_logs(["crashy"])
+check("logs shows a failed setup's saved reason", printed[:1] == ["Last error: Download failed"], repr(printed))
+check("a failed first paired start still shows rank 1's log", "rank1 failed" in printed, repr(printed))
+os.unlink(a.installing_path("crashy"))
+
 # The default root must work without an Omarchy checkout or a catalog override.
 check("installed catalog loads and validates from the engine directory", not a.load_catalog().errors() and a.load_catalog().root == os.environ["ENGINE_ROOT"])
 root = Path(os.environ["HOME"])
@@ -492,7 +621,7 @@ repo.mkdir()
 def write_toml(path, value):
   path.parent.mkdir(parents=True, exist_ok=True)
   path.write_text(bench.toml_dumps(value))
-write_toml(repo / "catalog.toml", {"schema": 1, "version": "0.1.0"})
+write_toml(repo / "catalog.toml", {"schema": 1})
 write_toml(repo / "best.toml", {"class": [entry]})
 write_toml(repo / "runtimes/server.toml", runtime)
 write_toml(repo / "recipes/model.toml", recipe)
@@ -502,7 +631,7 @@ os.environ["OMARCHY_LOCAL_AI_CATALOG"] = str(repo)
 check("catalog root can be overridden", a.load_catalog().root == str(repo))
 write_toml(repo / "catalog.toml", {"schema": 999})
 raises("invalid installed catalog is rejected", a.load_catalog, "failed validation")
-write_toml(repo / "catalog.toml", {"schema": 1, "version": "0.1.0"})
+write_toml(repo / "catalog.toml", {"schema": 1})
 # The package command follows /usr/bin-style symlinks to find its engine.
 link = root / "bin/omarchy-local-ai"
 link.parent.mkdir()
@@ -556,7 +685,7 @@ check("unit injects key through Podman secrets", f"Secret={a.SECRET},type=env,ta
 manifest = {"schema": 1, "recipe_id": "current", "recipe": recipe, "runtime": runtime,
             "runtime_id": "server", "image": runtime["image"], "variant": variant,
             "files": [], "roles": {"model": "model.gguf"}, "fileset": "a" * 16,
-            "gpu": gpu["family"], "profile": profile, "catalog": {"version": "0.1.0"},
+            "gpu": gpu["family"], "profile": profile,
             "observed": {"load_seconds": 12, "ram_used_gib": 16, "gpu_used_gib": 16}}
 path = a.save_model(manifest, started=False)
 check("a current manifest alone means installed", a.recipe_installed("current"))
@@ -581,6 +710,64 @@ with patch.object(a, "resolve_model", return_value={"recipe_id": "model", "recip
   overlay = json.loads(open(a.opencode_overlay("model")[0]).read())["provider"][a.OVERLAY_PROVIDER]["models"]["model"]
   check("the OpenCode overlay declares image input", overlay["attachment"] and overlay["modalities"]["input"] == ["text", "image"])
 
+# pi's own extension lists every model set up, each at its own port, and
+# follows them: none without pi's folder, gone with the last model.
+def pi_registered(path):
+  text = open(path).read()
+  name, _, rest = text.split("pi.registerProvider(", 1)[1].partition(", ")
+  return json.loads(name), json.loads(rest.rsplit(");", 1)[0])
+pi_set_up = {"alpha": {"recipe_id": "alpha", "recipe": image_recipe, "variant": {"ctx": 4096}},
+             "beta": {"recipe_id": "beta", "recipe": {**copy.deepcopy(recipe), "name": "Beta"}, "variant": {"ctx": 8192}}}
+pi_ext = Path(a.pi_extension_path())
+with patch.object(a, "known_models", return_value=["alpha", "beta"]), patch.object(a, "load_model", side_effect=pi_set_up.get):
+  a.sync_pi_extension()
+  check("no pi folder, no pi extension", not pi_ext.exists() and not pi_ext.parent.parent.exists())
+  pi_ext.parent.parent.mkdir(parents=True)
+  a.sync_pi_extension()
+  name, provider = pi_registered(pi_ext)
+  urls = {m["id"]: m["baseUrl"] for m in provider["models"]}
+  check("pi's extension registers the omarchy-local provider", name == "omarchy-local" == a.OVERLAY_PROVIDER)
+  check("pi's extension lists every model set up at its own port", urls == {"alpha": a.endpoint("alpha"), "beta": a.endpoint("beta")} and urls["alpha"] != urls["beta"], repr(urls))
+  check("pi's extension reads the key from its file", provider["apiKey"] == "!cat -- " + shlex.quote(a.key_path()))
+  check("pi's extension carries each model's context and input", [(m["contextWindow"], m["input"]) for m in provider["models"]] == [(4096, ["text", "image"]), (8192, ["text"])])
+  with patch.object(a, "resolve_model", return_value=pi_set_up["beta"]):
+    path, overlay_name, overlay_model = a.pi_overlay("beta")
+  name, provider = pi_registered(path)
+  check("a local launch overlay is the same provider, the launched model first and the rest after", (name, overlay_name, overlay_model) == ("omarchy-local", "omarchy-local", "beta") and [m["id"] for m in provider["models"]] == ["beta", "alpha"])
+  mtime = pi_ext.stat().st_mtime_ns
+  a.sync_pi_extension()
+  check("an unchanged list leaves pi's extension alone", pi_ext.stat().st_mtime_ns == mtime)
+with patch.object(a, "known_models", return_value=[]):
+  a.sync_pi_extension()
+  check("pi's extension goes with the last model", not pi_ext.exists())
+import fcntl
+def sync_while_locked():
+  # Another writer can't take the status lock while pi's extension is written.
+  with open(os.path.join(a.state_dir(), "status.lock"), "w") as probe:
+    try:
+      fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      raise AssertionError("pi's extension was written outside the status lock")
+    except BlockingIOError:
+      pass
+  raise OSError("read-only")
+with patch.object(a, "status_record", return_value={"models": {}, "share_error": ""}), patch.object(a, "publish_shares"), patch.object(a, "sync_pi_extension", side_effect=sync_while_locked) as sync:
+  check("a status write syncs pi's extension under its lock and survives it failing", "models" in a.write_status(a.load_catalog(), profile) and sync.called)
+check("agents default to a 16k reply cap", a.max_output_tokens({"recipe": recipe, "variant": {"ctx": 131072}}) == 16384)
+capped = {**copy.deepcopy(recipe), "server": {"args": ["--max-tokens", "32768", "--vision"]}}
+check("agents get the server's reply cap", a.max_output_tokens({"recipe": capped, "variant": {"ctx": 131072}}) == 32768)
+check("a variant's reply cap counts too", a.max_output_tokens({"recipe": recipe, "variant": {"ctx": 131072, "args": ["--max-tokens=65536"]}}) == 65536)
+shipped = tomllib.load(open(os.path.join(os.environ["ENGINE_ROOT"], "recipes", "qwen3.8-27b-tensorfold.toml"), "rb"))
+check("shipped recipes give agents a 64k reply cap", all(a.max_output_tokens({"recipe": shipped, "variant": v}) == 65536 for v in shipped["variant"]))
+# Agents re-send every screenshot they have read, and tensorfold takes only 4 images per request by default.
+recipe_dir = os.path.join(os.environ["ENGINE_ROOT"], "recipes")
+seeing = [tomllib.load(open(os.path.join(recipe_dir, name), "rb"))["server"]["args"] for name in sorted(os.listdir(recipe_dir)) if "tensorfold" in name]
+seeing = [args for args in seeing if "--vision" in args]
+check("tensorfold recipes that take images allow 50 per request", seeing and all("--vision-max-images" in args and args[args.index("--vision-max-images") + 1] == "50" for args in seeing))
+check("the reply cap never exceeds the context", a.max_output_tokens({"recipe": capped, "variant": {"ctx": 8192}}) == 8192)
+with patch.object(a, "resolve_model", return_value={"recipe_id": "model", "recipe": capped, "variant": {"ctx": 131072}}):
+  check("the pi overlay carries the server's reply cap", '"maxTokens": 32768' in open(a.pi_overlay("model")[0]).read())
+  check("the OpenCode overlay carries the server's reply cap", json.loads(open(a.opencode_overlay("model")[0]).read())["provider"][a.OVERLAY_PROVIDER]["models"]["model"]["limit"]["output"] == 32768)
+
 # Setups saved while memory is busy still owe authentication/model-ID checks.
 cat = a.load_catalog()
 rid = next(iter(cat.recipes))
@@ -591,7 +778,7 @@ with patch.object(a, "load_catalog", return_value=cat), patch.object(a, "machine
 for response, succeeds in (([(200, b"")], False),
                            ([(401, b""), (200, b'{"data":[{"id":"other"}]}')], False),
                            ([(401, b""), (200, json.dumps({"data": [{"id": rid}]}).encode())], True)):
-  with patch.object(a, "unit_active", return_value=False), patch.object(a, "write_status"), patch.object(a, "evict_idle_weights"), patch.object(a, "check_headroom", return_value=(100.0, 90.0)), patch.object(a, "free_memory", return_value=(52.0, 64.0)), patch.object(a, "ensure_key", return_value="test-key"), patch.object(a, "http_status", side_effect=response) as http, patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0)) as systemctl:
+  with patch.object(a, "unit_active", return_value=False), patch.object(a, "write_status"), patch.object(a, "evict_idle_weights"), patch.object(a, "check_headroom", return_value=(100.0, 90.0)), patch.object(a, "free_memory", return_value=(52.0, 64.0)), patch.object(a, "ensure_key", return_value="test-key"), patch.object(a, "http_status", side_effect=response) as http, patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0, stdout="")) as systemctl:
     if succeeds:
       a._start(SimpleNamespace(recipe=rid), cat, profile)
       check("first checked start clears the unchecked flag", not a.load_model(rid).get("unchecked") and http.call_count == 2)
@@ -599,6 +786,9 @@ for response, succeeds in (([(200, b"")], False),
     else:
       raises("first start refuses failed authentication or wrong model ID", lambda: a._start(SimpleNamespace(recipe=rid), cat, profile))
       check("failed first check stops the model and retains its check obligation", ("stop", a.unit_name(rid)) in [call.args for call in systemctl.call_args_list] and a.load_model(rid)["unchecked"])
+check("a pair's memory is both ranks'", a.ram_used_gib({"pair": {"peer": "10.99.1.2"}}, 100.0, 10.0, 120.0, 29.0) == 181.0 and a.ram_used_gib({"pair": {"peer": "10.99.1.2"}}, 100.0, 10.0, None, 29.0) == 180.0 and a.ram_used_gib({}, 100.0, 10.0, None, None) == 90.0)
+check("a pair's memory is shown against both machines", a.nodes_ram_gib({"pair": {"peer": "10.99.1.2"}}, {"ram_gib": 121.9, "pair": {"peer": "10.99.1.2", "ram_gib": 121.7}}) == 243.6 and a.nodes_ram_gib({}, {"ram_gib": 121.9, "pair": {"peer": "10.99.1.2", "ram_gib": 121.7}}) == 121.9)
+check("a pair's memory total is its own peer's, not a later link's", a.nodes_ram_gib({"pair": {"peer": "10.99.1.2"}, "profile": {"pair": {"peer": "10.99.1.2", "ram_gib": 121.7}}}, {"ram_gib": 121.9, "pair": {"peer": "10.99.1.3", "ram_gib": 60.0}}) == 243.6)
 
 # A first setup is listed while it fetches: bytes so far, total and speed, in
 # the panel's status, until its manifest exists or remove dismisses it.
@@ -641,9 +831,24 @@ a.clear_installing(rid)
 Path(a.model_manifest_path("dismissed")).unlink(missing_ok=True)
 a.begin_installing("dismissed", {"name": "Dismissed"})
 a.fail_installing("dismissed", "Download failed")
-with patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0)) as stop, patch.object(a, "known_models", return_value=[]), patch.object(a, "write_unit_files"), patch.object(a, "refresh_list_cache"), patch.object(a, "write_status"):
+with patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0, stdout="")) as stop, patch.object(a, "known_models", return_value=[]), patch.object(a, "write_unit_files"), patch.object(a, "refresh_list_cache"), patch.object(a, "write_status"):
   check("remove dismisses a failed setup", a.cmd_remove(["dismissed"]) == 0 and a.load_installing("dismissed") is None)
   check("remove stops the setup's unit first", ("stop", a.install_unit("dismissed")) in [call.args for call in stop.call_args_list])
+
+# Stopped mid-load, systemd skips ExecStop and conmon ignores SIGTERM: the container goes first.
+for state, removed in (("activating", True), ("active", False)):
+  calls = []
+  with patch.object(a, "unit_props", return_value={"ActiveState": state}), \
+       patch.object(a, "systemctl", side_effect=lambda *args, **_: calls.append(args)), \
+       patch.object(a.subprocess, "run", side_effect=lambda argv, **_: calls.append(tuple(argv))):
+    a.stop_unit("loading")
+  unit, container = a.unit_name("loading"), a.unit_base("loading")
+  expected = [("stop", "--no-block", unit), ("podman", "rm", "-v", "-f", "-i", "-t", "0", container), ("stop", unit), ("reset-failed", unit)] if removed else [("stop", unit)]
+  check(f"stopping a model that is {state} {'removes its container' if removed else 'leaves it to ExecStop'}", calls == expected, repr(calls))
+a.clear_error("loading")
+with patch.dict(os.environ, {"SERVICE_RESULT": "exit-code"}), patch.object(a, "unit_props", return_value={"InactiveExitTimestamp": "@1"}), patch.object(a, "write_status") as written:
+  a.cmd_status(["--write", "--stopped", "loading"])
+check("a model stopped mid-load ends stopped, not failed", written.call_args.args[2] == {"loading": "inactive"} and not os.path.exists(a.error_path("loading")), repr(written.call_args))
 
 # A setup waiting for another's lock is already cancellable, and stops if its
 # record was removed while it waited.
@@ -679,7 +884,7 @@ with patch.object(a, "load_catalog", return_value=cat), patch.object(a, "machine
     pass
 check("interrupting a use still waiting leaves the active setup's record", (a.load_installing(rid) or {}).get("pid") == os.getppid())
 a.update_installing(rid, image=runtime["image"])
-with patch.object(a, "load_catalog", return_value=cat), patch.object(a, "machine_profile", return_value=profile), patch.object(a, "Lock", return_value=Waiting()), patch.object(a, "load_model", return_value=None), patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0)), patch.object(a, "stop_setup_process"), patch.object(a, "write_status"), patch.object(a, "refresh_list_cache"), patch.object(a, "_remove_files", return_value=(0, [])) as removed:
+with patch.object(a, "load_catalog", return_value=cat), patch.object(a, "machine_profile", return_value=profile), patch.object(a, "Lock", return_value=Waiting()), patch.object(a, "load_model", return_value=None), patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0, stdout="")), patch.object(a, "stop_setup_process"), patch.object(a, "write_status"), patch.object(a, "refresh_list_cache"), patch.object(a, "_remove_files", return_value=(0, [])) as removed:
   a.cmd_remove([rid])
 check("cancelling a setup removes the image it pulled", removed.call_args.args == (rid, runtime["image"]))
 with patch.object(a, "known_models", return_value=[]), patch.object(a, "write_unit_files"), patch.object(a.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as rmi:
@@ -715,7 +920,7 @@ mine, other = "a" * 64 + ".part", "b" * 64 + ".part"
 (staging / other).write_bytes(b"y" * 10)
 a.begin_installing("cancelled", {"name": "Cancelled"})
 a.update_installing("cancelled", partials=[mine, "../escape.part"])
-with patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0)) as stop, patch.object(a, "known_models", return_value=[]), patch.object(a, "write_unit_files"), patch.object(a, "refresh_list_cache"), patch.object(a, "write_status"):
+with patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0, stdout="")) as stop, patch.object(a, "known_models", return_value=[]), patch.object(a, "write_unit_files"), patch.object(a, "refresh_list_cache"), patch.object(a, "write_status"):
   a.cmd_remove(["cancelled"])
 check("cancelling a setup stops its model service", ("stop", a.unit_name("cancelled")) in [call.args for call in stop.call_args_list])
 check("cancelling a setup drops only its own partial downloads", not (staging / mine).exists() and (staging / other).exists())
@@ -739,5 +944,343 @@ a.clear_installing(rid)
 with patch.object(a, "load_catalog", return_value=cat) as load, patch.object(a, "machine_profile", return_value=profile) as machine, patch.object(a, "known_models", return_value=[]), patch.object(a, "running_models", return_value=set()):
   a.cmd_refresh(["--quiet"])
   check("refresh loads catalog and machine profile once", load.call_count == machine.call_count == 1)
+
+# ---- tailnet sharing
+
+ts_status = {
+  "BackendState": "Running",
+  "Self": {"DNSName": "me.tail.ts.net.", "OS": "linux", "Online": True},
+  "Peer": {
+    "a": {"DNSName": "box.tail.ts.net.", "OS": "linux", "Online": True},
+    "b": {"DNSName": "away.tail.ts.net.", "OS": "linux", "Online": False},
+    "c": {"DNSName": "phone.tail.ts.net.", "OS": "android", "Online": True},
+    "d": {"DNSName": "plain.tail.ts.net.", "OS": "linux", "Online": True},
+    "e": {"DNSName": "flaky.tail.ts.net.", "OS": "linux", "Online": True},
+  },
+}
+listing = {"schema": 1, "host": "box", "dns": "box.tail.ts.net", "ram_total_gib": 121.9, "models": [
+  {"recipe": "big-model", "name": "Big\x1b[31m Model", "vendor": "qwen", "architecture": "moe", "ctx": 262144, "max_tokens": 10 ** 9, "input": ["text", "image", "audio"], "unit": "active",
+   "observed": {"ram_used_gib": 80, "evil": "x"}, "since_ms": None, "decode_tok_s": 40},
+  {"recipe": "../escape", "name": "bad"},
+  {"recipe": "odd-state", "unit": "rebooting", "architecture": "<b>moe</b>"},
+]}
+clean = a.clean_listing(listing, "box.tail.ts.net")
+check("a peer's listing keeps only recipe ids it can put in a path", [m["recipe"] for m in clean["models"]] == ["big-model", "odd-state"])
+check("a peer's listing loses control characters and unknown inputs", clean["models"][0]["name"] == "Big[31m Model" and clean["models"][0]["input"] == ["text", "image"])
+check("a peer's listing keeps only known states and measurements", clean["models"][1]["unit"] == "inactive" and "evil" not in clean["models"][0]["observed"])
+check("a peer's listing keeps a known architecture and drops any other", clean["models"][0]["architecture"] == "moe" and clean["models"][1]["architecture"] == "")
+check("a peer's reply cap is kept within its context, and a missing one is the default",
+      clean["models"][0]["max_tokens"] == 262144 and clean["models"][1]["max_tokens"] == a.DEFAULT_MAX_OUTPUT_TOKENS)
+raises("a listing of another schema is refused", lambda: a.clean_listing({"schema": 2, "models": []}, "box"), "Not an Omarchy")
+check("a number too big for a float is no number", a._number(10 ** 400) is None)
+class Huge:
+  status = 200
+  def __enter__(self): return self
+  def __exit__(self, *args): return False
+  def read(self, size=-1):
+    return (b'{"schema": 1, "models": [' + b" " * (2 * a.HTTP_MAX_BYTES))[:size if size >= 0 else None]
+with patch.object(a.urllib.request, "urlopen", return_value=Huge()):
+  state, huge, _ = a.fetch_listing("big.tail.ts.net")
+check("a peer's oversized listing is read only up to the cap and left unreachable", state == "unreachable" and huge is None)
+with patch.object(a, "http_status", return_value=(200, b"[" * 100000 + b"]" * 100000)):
+  state, deep, _ = a.fetch_listing("deep.tail.ts.net")
+check("a peer's deeply nested listing leaves only that peer unreachable", state == "unreachable" and deep is None)
+with patch.object(a.urllib.request, "urlopen", side_effect=__import__("http.client").client.BadStatusLine("garbage")):
+  state, bad, _ = a.fetch_listing("bad.tail.ts.net")
+check("a peer's malformed HTTP answer leaves only that peer unreachable", state == "unreachable" and bad is None)
+
+answers = {
+  "box.tail.ts.net": ("online", clean, ""),
+  "plain.tail.ts.net": ("not_sharing", None, ""),
+  "flaky.tail.ts.net": ("unreachable", None, "HTTP 502"),
+}
+previous = {"hosts": {
+  "away": {"host": "away", "dns": "away.tail.ts.net", "last_seen_ms": 1_000_000, "ram_total_gib": 64},
+  "flaky": {"host": "flaky", "dns": "flaky.tail.ts.net", "last_seen_ms": 900_000},
+  "gone": {"host": "gone", "dns": "gone.tail.ts.net", "last_seen_ms": 2_000_000 - a.FORGET_UNPAIRED_MS},
+}, "models": {
+  "away/small-model": {"id": "away/small-model", "host": "away", "recipe": "small-model", "name": "Small", "unit": "active", "since_ms": 5},
+  "flaky/mid-model": {"id": "flaky/mid-model", "host": "flaky", "recipe": "mid-model", "name": "Mid", "unit": "active"},
+  "gone/old-model": {"id": "gone/old-model", "host": "gone", "recipe": "old-model", "unit": "active"},
+}}
+now = 2_000_000
+with patch.object(a, "tailscale_status", return_value=ts_status), patch.object(a, "fetch_listing", side_effect=lambda dns: answers[dns]):
+  net = a.survey_network(previous, now=now)
+check("the survey lists a sharing peer's models by host/recipe", net["models"]["box/big-model"]["endpoint"] == "https://box.tail.ts.net/local-ai/big-model/v1" and net["models"]["box/big-model"]["offline"] == "")
+check("a model its host has stopped is left off the list", "box/odd-state" not in net["models"])
+check("the survey skips this machine, phones and peers sharing nothing", set(net["hosts"]) == {"box", "away", "flaky"})
+check("sharing needs HTTPS certificates on the tailnet", net["can_share"] is False)
+with patch.object(a, "tailscale_status", return_value={**ts_status, "CertDomains": ["me.tail.ts.net"]}), patch.object(a, "fetch_listing", side_effect=lambda dns: answers[dns]):
+  check("a tailnet with MagicDNS and HTTPS can share", a.survey_network(previous, now=now)["can_share"] is True)
+check("a host that went offline keeps its models, marked offline", net["models"]["away/small-model"]["offline"] == "offline" and net["models"]["away/small-model"]["unit"] == "inactive" and net["hosts"]["away"]["state"] == "offline")
+check("an online host that stopped answering is marked unreachable", net["models"]["flaky/mid-model"]["offline"] == "unreachable" and net["hosts"]["flaky"]["error"] == "HTTP 502")
+check("offline hosts keep their last-seen time", net["hosts"]["away"]["last_seen_ms"] == 1_000_000 and net["hosts"]["box"]["last_seen_ms"] == now)
+check("an unpaired host unseen for a week is dropped", "gone/old-model" not in net["models"])
+with patch.object(a, "tailscale_status", return_value=ts_status), patch.object(a, "fetch_listing", side_effect=lambda dns: answers[dns]):
+  later = a.survey_network(net, now=now + a.FORGET_UNPAIRED_MS)
+check("an unpaired offline host is forgotten after a week", "away/small-model" not in later["models"] and "box/big-model" in later["models"])
+
+# Pairing records survive; a paired host stays listed however long it's away.
+a.ensure_dir(a.remotes_dir(), 0o700)
+a.write_atomic(a.remote_key_path("away"), "k" * 32, mode=0o600)
+a.write_atomic(os.path.join(a.remotes_dir(), "away.json"), json.dumps({"host": "away", "dns": "away.tail.ts.net", "ssh": "away"}))
+with patch.object(a, "tailscale_status", return_value=ts_status), patch.object(a, "fetch_listing", side_effect=lambda dns: answers[dns]):
+  later = a.survey_network(net, now=now + 10 * a.FORGET_UNPAIRED_MS)
+check("a paired offline host keeps its models however long it's away", later["models"]["away/small-model"]["paired"] and later["models"]["away/small-model"]["offline"] == "offline")
+with patch.object(a, "tailscale_status", return_value=None), patch.object(a, "fetch_listing") as fetch:
+  alone = a.survey_network(net, now=now)
+check("without tailscaled, paired hosts show offline and nothing is fetched", not fetch.called and alone["models"]["away/small-model"]["offline"] == "offline" and not alone["tailnet"])
+with patch.object(a, "tailscale_status", return_value=None), patch.object(a, "fetch_listing") as fetch:
+  blind = a.survey_network(previous, now=now)
+check("without tailscaled, an unpaired host seen this week stays, offline", blind["models"].get("flaky/mid-model", {}).get("offline") == "offline" and "gone/old-model" not in blind["models"], repr(sorted(blind["models"])))
+a.write_atomic(a.network_path(), json.dumps(later))
+with patch.object(a, "tailscale_status", return_value=ts_status), patch.object(a, "fetch_listing", side_effect=lambda dns: answers[dns]):
+  a.cmd_forget(["away"])
+forgotten = a.load_network()
+check("forgetting a host drops its key and its models at once", not os.path.exists(a.remote_key_path("away")) and "away/small-model" not in forgotten["models"] and "box/big-model" in forgotten["models"])
+
+# Pairing is per model: a host's key connects only the models it names.
+def pair_away(**record):
+  a.write_atomic(a.remote_key_path("away"), "k" * 32, mode=0o600)
+  a.write_atomic(os.path.join(a.remotes_dir(), "away.json"), json.dumps({"host": "away", "dns": "away.tail.ts.net", "ssh": "away", **record}))
+def away_paired():
+  with patch.object(a, "tailscale_status", return_value=ts_status), patch.object(a, "fetch_listing", side_effect=lambda dns: answers[dns]):
+    return {mid: m["paired"] for mid, m in a.survey_network(later, now=now)["models"].items() if m["host"] == "away"}
+pair_away()
+check("a host paired whole connects every model it shares", away_paired() == {"away/small-model": True})
+pair_away(models=["other-model"])
+check("a host paired for one model leaves its others unpaired", away_paired() == {"away/small-model": False})
+raises("a model that isn't connected can't be used", lambda: a.resolve_remote("away/small-model"), "isn't paired")
+a.write_atomic(a.network_path(), json.dumps(later))
+with patch.object(a.subprocess, "run", side_effect=AssertionError("no SSH")), patch.object(a, "tailscale_status", return_value=ts_status), patch.object(a, "fetch_listing", side_effect=lambda dns: answers[dns]):
+  a.cmd_pair(["away.tail.ts.net", "small-model"])
+check("pairing another model of a paired host needs no SSH", a.load_remotes()["away"]["models"] == ["other-model", "small-model"] and away_paired() == {"away/small-model": True})
+with patch.object(a, "tailscale_status", return_value=ts_status), patch.object(a, "fetch_listing", side_effect=lambda dns: answers[dns]):
+  a.cmd_forget(["away/small-model"])
+check("disconnecting a model keeps the host's others and its key", a.load_remotes()["away"]["models"] == ["other-model"] and os.path.exists(a.remote_key_path("away")) and a.load_network()["models"]["away/small-model"]["paired"] is False)
+with patch.object(a, "tailscale_status", return_value=ts_status), patch.object(a, "fetch_listing", side_effect=lambda dns: answers[dns]):
+  a.cmd_forget(["away/small-model"])
+check("disconnecting a model that isn't connected leaves the host paired", a.load_remotes()["away"]["models"] == ["other-model"])
+# A host paired whole: disconnecting one model needs no list of the others,
+# so a model it shares later, or an empty survey, can't disconnect more.
+pair_away()
+a.write_atomic(a.network_path(), json.dumps({"hosts": {}, "models": {}}))
+with patch.object(a, "tailscale_status", return_value=None), patch.object(a, "fetch_listing"):
+  a.cmd_forget(["away/small-model"])
+whole = a.load_remotes()["away"]
+check("disconnecting a model of a host paired whole keeps the key and every other model, even with no survey",
+      os.path.exists(a.remote_key_path("away")) and not a.connected(whole, "small-model") and a.connected(whole, "new-model"))
+a.write_atomic(a.network_path(), json.dumps(later))
+with patch.object(a.subprocess, "run", side_effect=AssertionError("no SSH")), patch.object(a, "tailscale_status", return_value=ts_status), patch.object(a, "fetch_listing", side_effect=lambda dns: answers[dns]):
+  a.cmd_pair(["away", "small-model"])
+check("pairing it again reconnects it", a.connected(a.load_remotes()["away"], "small-model"))
+pair_away(models=["small-model"])
+with patch.object(a, "tailscale_status", return_value=ts_status), patch.object(a, "fetch_listing", side_effect=lambda dns: answers[dns]):
+  a.cmd_forget(["away/small-model"])
+check("disconnecting the only model of a one-at-a-time pairing unpairs the host", "away" not in a.load_remotes() and not os.path.exists(a.remote_key_path("away")))
+
+# The same host reached by another SSH name keeps what it connects.
+pair_away(models=["other-model"])
+export = json.dumps({"host": "away", "dns": "away.tail.ts.net", "key": "n" * 32})
+with patch.object(a.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, export + "\n", "")), patch.object(a, "tailscale_status", return_value=ts_status), patch.object(a, "fetch_listing", side_effect=lambda dns: answers[dns]):
+  a.cmd_pair(["alice@away", "small-model"])
+again = a.load_remotes()["away"]
+check("pairing a host again under another name adds to its models", again["models"] == ["other-model", "small-model"] and again["ssh"] == "alice@away")
+# sshd answering but refusing every key isn't sshd being off: an agent left
+# unstarted offers no key at all.
+with patch.object(a.subprocess, "run", return_value=subprocess.CompletedProcess([], 255, "", "alice@new: Permission denied (publickey).\n")):
+  raises("pairing with a host that refuses this machine's keys points at the SSH agent", lambda: a.cmd_pair(["alice@new"]), "SSH agent")
+  # The panel shows the first line alone, so it names the machine short.
+  raises("a pairing error's first line names the machine without user or domain", lambda: a.cmd_pair(["alice@new.tail1234.ts.net"]), "new refused this machine's SSH keys\n")
+check("an address stays whole as a machine's name", a.short_host("dhh@100.90.162.80") == "100.90.162.80")
+# The agents panel pairs with no terminal (stdin here is the test script), so
+# ssh must ask nothing: a prompt would wait forever. A new host's key is taken.
+with patch.object(a.subprocess, "run", return_value=subprocess.CompletedProcess([], 255, "", "Host key verification failed.\n")) as run:
+  raises("pairing with a host whose key changed says how to forget the old one, by host alone", lambda: a.cmd_pair(["alice@new.tail1234.ts.net"]), "ssh-keygen -R new.tail1234.ts.net")
+check("pairing without a terminal asks ssh for no prompts and takes a new host's key", {"BatchMode=yes", "StrictHostKeyChecking=accept-new"} <= set(run.call_args[0][0]), repr(run.call_args[0][0]))
+a.write_atomic(a.remote_key_path("away"), "k" * 32, mode=0o600)
+a.write_atomic(os.path.join(a.remotes_dir(), "away.json"), json.dumps({"host": "away", "dns": "away.tail.ts.net", "ssh": "away"}))
+raises("a network model is named host/recipe", lambda: a.split_remote_id("box/../x"), "host/recipe")
+raises("an SSH target can't smuggle options", lambda: a.ssh_command({"ssh": "-oProxyCommand=x", "dns": ""}, "share", "--export"), "Not an SSH target")
+check("remote commands quote their arguments", a.ssh_command({"ssh": "box", "dns": "box.tail.ts.net"}, "share", "--export")[-2:] == ["box", "omarchy-agent-local share --export"])
+
+# A paired, running remote model becomes an overlay with its own provider.
+a.write_atomic(a.remote_key_path("box"), "b" * 32, mode=0o600)
+a.write_atomic(os.path.join(a.remotes_dir(), "box.json"), json.dumps({"host": "box", "dns": "box.tail.ts.net", "ssh": "box"}))
+with patch.object(a, "fetch_listing", return_value=("online", clean, "")):
+  path, provider, model = a.pi_overlay("box/big-model")
+  source = open(path).read()
+  check("a remote pi overlay points at the host's tailnet endpoint and key", provider == "omarchy-local-box" and model == "big-model" and "https://box.tail.ts.net/local-ai/big-model/v1" in source and a.remote_key_path("box") in source and "b" * 32 not in source)
+  oc = json.loads(open(a.opencode_overlay("box/big-model")[0]).read())["provider"]["omarchy-local-box"]
+  check("a remote OpenCode overlay keeps the model's context and inputs", oc["models"]["big-model"]["limit"]["context"] == 262144 and oc["models"]["big-model"]["attachment"])
+  raises("a remote model that isn't running can't be launched", lambda: a.pi_overlay("box/odd-state"), "isn't running")
+raises("an unpaired host's model can't be launched", lambda: a.pi_overlay("plain/x"), "isn't paired")
+
+# Paired hosts' models join pi's extension, one provider per host with its
+# key, whether or not the host answers right now; unpaired ones don't.
+seen = {"box/big-model": a.remote_record("box", "box.tail.ts.net", clean["models"][0], True, 128, 1),
+        "box/odd-state": {**a.remote_record("box", "box.tail.ts.net", clean["models"][1], True, 128, 1), "offline": "offline"},
+        "plain/x": a.remote_record("plain", "plain.tail.ts.net", {**clean["models"][0], "recipe": "x"}, False, 64, 1)}
+a.write_atomic(a.network_path(), json.dumps({"hosts": {}, "models": seen}))
+Path(a.pi_extension_path()).parent.parent.mkdir(parents=True, exist_ok=True)
+with patch.object(a, "known_models", return_value=[]):
+  a.sync_pi_extension()
+  registered = open(a.pi_extension_path()).read()
+  check("pi's extension lists a paired host's models under its own provider and key, offline ones too",
+        registered.count("pi.registerProvider(") == 1 and '"omarchy-local-box"' in registered and '"big-model"' in registered and '"odd-state"' in registered
+        and "https://box.tail.ts.net/local-ai/big-model/v1" in registered and a.remote_key_path("box") in registered and "b" * 32 not in registered)
+  check("pi's extension leaves out an unpaired host's models", "plain" not in registered)
+  with patch.object(a, "fetch_listing", return_value=("online", clean, "")):
+    source = open(a.pi_overlay("box/big-model")[0]).read()
+  check("a remote pi overlay keeps the rest of its host's models, the launched one first",
+        source.index('"big-model"') < source.index('"odd-state"') and "omarchy-local\"," not in source)
+  # Qwen Code is launched with the endpoint and model, and reads the key itself.
+  with patch.object(a, "fetch_listing", return_value=("online", clean, "")):
+    path, provider, model = a.qwen_overlay("box/big-model")
+  qwen = json.loads(open(path).read())
+  check("a Qwen Code overlay carries the endpoint, model, limits and key file, never the key",
+        (provider, model) == ("omarchy-local-box", "big-model") and qwen["baseUrl"] == "https://box.tail.ts.net/local-ai/big-model/v1"
+        and qwen["model"] == "big-model" and qwen["maxTokens"] == 262144
+        and qwen["keyFile"] == a.remote_key_path("box") and qwen["contextWindow"] == 262144 and "b" * 32 not in open(path).read())
+  with patch.object(a, "survey_network", return_value={"hosts": {}, "models": {}}):
+    a.write_network()
+  check("a network write syncs pi's extension, dropping models it no longer sees", not os.path.exists(a.pi_extension_path()))
+check("the overlay command offers Qwen Code", "qwen" in a.OVERLAYS)
+
+# Sharing: routes follow shares.json, the listing never carries the key.
+handlers = {}
+def fake_tailscale(*args, timeout=10):
+  if args[:2] == ("serve", "status"):
+    return SimpleNamespace(returncode=0, stdout=json.dumps({"Web": {"me.tail.ts.net:443": {"Handlers": dict(handlers)}}}), stderr="")
+  path, target = args[-2], args[-1]
+  if target == "off":
+    handlers.pop(path, None)
+  else:
+    handlers[path] = {"Text": target[5:]} if target.startswith("text:") else {"Proxy": target}
+  return SimpleNamespace(returncode=0, stdout="", stderr="")
+share_model = dict(manifest, recipe_id="current")
+a.save_model(share_model, started=False)
+with patch.object(a, "known_models", return_value=["current"]), patch.object(a, "unit_props", return_value={"ActiveState": "active"}), patch.object(a, "free_memory", return_value=(64, 48)), \
+     patch.object(a, "tailscale", side_effect=fake_tailscale), patch.object(a, "tailscale_status", return_value=ts_status), \
+     patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0, stderr="")) as proxy_systemctl:
+  record = a.write_status(cat, profile)
+  check("nothing touches Tailscale Serve until a model is shared", handlers == {} and not record["models"]["current"]["shared"])
+  a.save_shares(["current"])
+  record = a.write_status(cat, profile)
+  served = json.loads(handlers["/local-ai/models.json"]["Text"])
+  check("a shared model is served through the share proxy", handlers["/local-ai/current"] == {"Proxy": f"http://127.0.0.1:{a.SHARE_PROXY_PORT}/current"} and record["models"]["current"]["shared"])
+  check("sharing starts the share proxy", ("start", a.SHARE_PROXY_UNIT) in [call.args for call in proxy_systemctl.call_args_list])
+  check("the listing names the model and its state, never the key", served["models"][0]["recipe"] == "current" and served["models"][0]["unit"] == "active" and "key" not in served and "key" not in served["models"][0])
+  handlers["/other"] = {"Proxy": "http://127.0.0.1:9"}
+  a.save_shares([])
+  a.write_status(cat, profile)
+  check("unsharing removes only our routes", handlers == {"/other": {"Proxy": "http://127.0.0.1:9"}} and not os.path.exists(a.published_path()))
+  check("unsharing the last model stops the share proxy", proxy_systemctl.call_args_list[-1].args == ("stop", a.SHARE_PROXY_UNIT))
+def refuse(*args, timeout=10):
+  if args[:2] == ("serve", "status"):
+    return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+  return SimpleNamespace(returncode=1, stdout="", stderr="sending serve config: 401 Unauthorized: must be root, or be an operator")
+with patch.object(a, "known_models", return_value=["current"]), patch.object(a, "unit_props", return_value={"ActiveState": "active"}), patch.object(a, "free_memory", return_value=(64, 48)), \
+     patch.object(a, "tailscale", side_effect=refuse), patch.object(a, "tailscale_status", return_value=ts_status), \
+     patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=0, stderr="")):
+  a.save_shares(["current"])
+  record = a.write_status(cat, profile)
+  check("a refused share is reported with the fix", record["share_error"] == a.OPERATOR_HINT)
+  os.unlink(a.share_error_path())
+  with patch.object(a, "tailscale_status", return_value=None):
+    record = a.write_status(cat, profile)
+  check("a refresh before tailscaled is up reports nothing to fix", record["share_error"] == "", repr(record["share_error"]))
+a.save_shares([])
+
+# The share proxy: a request the model accepts counts its machine for the
+# window, a refused one doesn't, and a streamed answer arrives as it's sent.
+import http.client
+import http.server
+import threading
+
+release = threading.Event()
+
+class FakeModel(http.server.BaseHTTPRequestHandler):
+  protocol_version = "HTTP/1.1"
+  def log_message(self, *args):
+    pass
+  def do_POST(self):
+    if self.headers.get("Transfer-Encoding") == "chunked":
+      body = b""
+      while size := int(self.rfile.readline().strip(), 16):
+        body += self.rfile.read(size)
+        self.rfile.readline()
+      self.rfile.readline()
+    else:
+      body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+    if self.headers.get("Authorization") != "Bearer k":
+      self.send_response(401)
+      self.send_header("Content-Length", "0")
+      self.end_headers()
+      return
+    self.send_response(200)
+    self.send_header("Content-Type", "text/event-stream")
+    self.send_header("Transfer-Encoding", "chunked")
+    self.end_headers()
+    for index, part in enumerate((b"data: " + body + b"\n\n", b"data: [DONE]\n\n")):
+      # The second part waits until the first has reached the client, so a
+      # proxy that held the answer back until it ended would never finish.
+      if index:
+        release.wait(10)
+      self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
+      self.wfile.flush()
+    self.wfile.write(b"0\r\n\r\n")
+
+def serve(handler):
+  server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+  server.daemon_threads = True
+  threading.Thread(target=server.serve_forever, daemon=True).start()
+  return server
+
+now = [1_000_000]
+tracker = a.ClientTracker(a.clients_path(), window_ms=1000, clock=lambda: now[0])
+model = serve(FakeModel)
+proxy = serve(a.make_share_proxy(tracker, ports=lambda: {"shared": model.server_address[1], "private": model.server_address[1]}, shares=lambda: ["shared"]))
+
+def ask(path, key="k", client="100.64.0.2"):
+  connection = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=10)
+  connection.request("POST", path, body=b"hello", headers={"Authorization": f"Bearer {key}", "X-Forwarded-For": client, "Content-Type": "application/json"})
+  answer = connection.getresponse()
+  body = answer.read()
+  connection.close()
+  return answer.status, body
+
+def counts():
+  return json.loads(open(a.clients_path()).read())["models"]
+
+connection = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=10)
+connection.request("POST", "/shared/v1/chat/completions", body=iter([b"hel", b"lo"]), encode_chunked=True, headers={"Authorization": "Bearer k", "X-Forwarded-For": "100.64.0.2"})
+answer = connection.getresponse()
+first = answer.read1(65536)
+release.set()
+rest = answer.read()
+connection.close()
+check("the proxy streams each part of the answer as the model sends it", answer.status == 200 and first == b"data: hello\n\n" and rest == b"data: [DONE]\n\n", f"{answer.status} {first!r} {rest!r}")
+release.clear()
+release.set()
+status, body = ask("/shared/v1/chat/completions")
+check("a request with a length passes its body through", status == 200 and body == b"data: hello\n\ndata: [DONE]\n\n", f"{status} {body!r}")
+check("an accepted request counts its machine", counts() == {"shared": 1})
+ask("/shared/v1/chat/completions")
+check("the same machine counts once", counts() == {"shared": 1})
+status, _ = ask("/shared/v1/chat/completions", key="wrong", client="100.64.0.3")
+check("a request the model refuses doesn't count", status == 401 and counts() == {"shared": 1})
+ask("/shared/v1/chat/completions", client="100.64.0.3")
+check("a second machine counts as a second user", counts() == {"shared": 2})
+status, _ = ask("/private/v1/chat/completions", client="100.64.0.4")
+check("a model that isn't shared isn't reachable through the proxy", status == 404 and counts() == {"shared": 2})
+now[0] += 600
+ask("/shared/v1/chat/completions", client="100.64.0.3")
+now[0] += 500
+check("a machine idle past the window stops counting", tracker.expire() is not None and counts() == {"shared": 1})
+now[0] += 600
+check("once everyone is idle nothing counts and nothing is pending", tracker.expire() is None and counts() == {})
+proxy.shutdown()
+model.shutdown()
 
 PY

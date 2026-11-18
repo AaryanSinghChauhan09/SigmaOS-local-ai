@@ -7,6 +7,11 @@ gpu = "amd-strix-halo"
 ram_class = 128
 recipes = ["qwen3.8-flash-next-gufo", "qwen3.8-27b-gufo"]
 
+[[class]]
+gpu = "amd-strix-halo"
+ram_class = 64
+recipes = ["qwen3.8-27b-gufo"]
+
 # The N1x and the GB10 share these lists (GPU_CLASSES): only memory sets them apart.
 [[class]]
 gpu = "nvidia-gb10"
