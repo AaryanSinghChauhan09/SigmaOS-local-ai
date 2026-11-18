@@ -2,6 +2,7 @@
 # FLUX.2 autoencoder, on stable-diffusion.cpp's sd-server. It makes new images and changes one by an
 # instruction, given the picture as a reference image ("include Princess Peach", "make it night").
 name = "FLUX.2 Klein 4B"
+vendor = "bfl"
 kind = "image"
 edit = true
 runtime = "sdcpp"
