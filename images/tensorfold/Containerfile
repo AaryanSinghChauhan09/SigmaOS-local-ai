@@ -97,7 +97,6 @@ COPY --from=webp /tmp/libwebp-1.6.0/COPYING /opt/tensorfold/LICENSES/libwebp-COP
 COPY --from=webp /tmp/libwebp-1.6.0/PATENTS /opt/tensorfold/LICENSES/libwebp-PATENTS
 COPY --from=cublas /opt/cuda/lib /opt/cuda/lib
 COPY --from=cublas /opt/cuda/NVIDIA-CUDA-EULA.txt /opt/tensorfold/LICENSES/NVIDIA-CUDA-EULA-cuBLAS.txt
-COPY LICENSE /opt/tensorfold/LICENSES/omacom-tensorfold-image-MIT.txt
 # The root file system is read only under omarchy-local-ai; the server's caches go to the tmpfs /tmp.
 ENV PATH=/opt/tensorfold/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     HOME=/tmp \
