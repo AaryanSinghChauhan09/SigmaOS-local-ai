@@ -147,12 +147,31 @@ rival = dict(gpu, family="amd-other")
 tied = dict(profile, gpus=[gpu, rival])
 raises("different GPU families tied for memory require selection", lambda: a.choose_gpu(tied), "--gpu")
 check("explicit GPU resolves a memory tie", a.choose_gpu(tied, "amd-other") == rival)
-with patch.object(a, "platform_name", return_value="aarch64-n1x"), patch.object(a, "amd_gpus", return_value=[]), patch.object(a, "meminfo", return_value={"MemTotal": 120 * 2**30}):
+with patch.object(a, "platform_name", return_value="aarch64-n1x"), patch.object(a, "amd_gpus", return_value=[]), patch.object(a, "intel_gpus", return_value=[]), patch.object(a, "meminfo", return_value={"MemTotal": 120 * 2**30}):
   n1x = a.machine_profile()
 check("an N1x laptop has a unified NVIDIA GPU of its own family", n1x["ram_class"] == 128 and [(g["vendor"], g["family"], g["memory_gib"]) for g in n1x["gpus"]] == [("nvidia", "nvidia-n1x", 120)])
 spark = dict(recipe, hardware=[{"gpu": "nvidia-gb10", "ram_class": 128, "measured": "measurements/model.toml"}])
 check("an N1x runs what a GB10 with the same memory runs", a.qualified(spark, n1x, n1x["gpus"][0]) and a.match_class({"class": [dict(entry, gpu="nvidia-gb10", ram_class=128)]}, n1x, n1x["gpus"][0]) is not None)
 check("best treats the N1x and GB10 as one class", any("same selectors" in e for e in a.validate_best({"class": [dict(entry, gpu="nvidia-gb10", ram_class=128, recipes=["spark"]), dict(entry, gpu="nvidia-n1x", ram_class=128, recipes=["spark"])]}, {"spark": spark})))
+# An Intel laptop: only integrated graphics a recipe was measured on counts as a GPU.
+drm = Path(os.environ["HOME"]) / "intel-drm"
+for address, render, device in (("0000:00:02.0", "renderD128", "0xb080"), ("0000:03:00.0", "renderD129", "0xb080")):
+  (drm / "devices" / address).mkdir(parents=True)
+  (drm / "devices" / address / "vendor").write_text("0x8086\n")
+  (drm / "devices" / address / "device").write_text(device + "\n")
+  (drm / render).mkdir()
+  (drm / render / "device").symlink_to(drm / "devices" / address)
+with patch.object(a, "TTM_PAGES_LIMIT", str(drm / "no-limit")):
+  arc = a.intel_gpus(64, str(drm))
+check("an Arc B390 is a unified GPU with three quarters of RAM, and a card beside it is not", [(g["family"], g["render_node"], g["memory_gib"]) for g in arc] == [("intel-arc-b390", "/dev/dri/renderD128", 48)])
+(drm / "pages-limit").write_text(str(32 * 2**30 // os.sysconf("SC_PAGE_SIZE")))
+with patch.object(a, "TTM_PAGES_LIMIT", str(drm / "pages-limit")):
+  check("the kernel's page limit caps what an Intel GPU addresses", a.intel_gpus(64, str(drm))[0]["memory_gib"] == 32)
+with patch.object(a, "meminfo", return_value={"MemAvailable": 20 * 2**30, "GPUReclaim": 28 * 2**30, "GPUActive": 2 * 2**30}):
+  check("memory a GPU driver pooled counts as free, and what it holds as used", a.free_memory(arc[0]) == (48, 46))
+(drm / "devices" / "0000:00:02.0" / "device").write_text("0x9a49\n")
+check("integrated graphics nothing was measured on is no GPU", a.intel_gpus(64, str(drm)) == [])
+check("an Intel GPU runs render-node runtimes only", a.runtime_supports({"run": {"devices": ["render"]}}, arc[0]) and not a.runtime_supports({"run": {"devices": ["render", "kfd"]}}, arc[0]) and not a.runtime_supports({"run": {"devices": ["cdi-nvidia"]}}, arc[0]))
 check("GPU peak exceeding capacity does not fit", not a.fits(dict(variant, peak_gpu_gib=49), profile, gpu)[0])
 check("RAM fit preserves desktop reserve", not a.fits(dict(variant, peak_ram_gib=57), profile, gpu)[0])
 with patch.object(a, "free_memory", return_value=(1, 1)), patch.object(a, "top_memory_users", return_value="browser (12 GiB), editor (4 GiB)"), patch.object(a.time, "sleep"):
@@ -166,7 +185,7 @@ with patch.object(a, "free_memory", return_value=(48.6, 54)), patch.object(a, "c
 
 # A 64 GB Strix Halo on a stock kernel: the GPU maps half of RAM until use raises the cap.
 halo = {"vendor": "amd", "family": "amd-strix-halo", "memory_gib": 31.6, "unified": True}
-with patch.object(a, "platform_name", return_value="x86"), patch.object(a, "amd_gpus", return_value=[dict(halo)]), patch.object(a, "meminfo", return_value={"MemTotal": 62 * 2**30}):
+with patch.object(a, "platform_name", return_value="x86"), patch.object(a, "amd_gpus", return_value=[dict(halo)]), patch.object(a, "intel_gpus", return_value=[]), patch.object(a, "meminfo", return_value={"MemTotal": 62 * 2**30}):
   halo = a.machine_profile()["gpus"][0]
 needs_more = dict(variant, peak_gpu_gib=38, peak_ram_gib=38)
 check("a unified AMD GPU fits by the cap use can raise it to", halo["max_memory_gib"] == 54 and a.fits(needs_more, profile, halo)[0])
@@ -487,7 +506,7 @@ for name in ("c" * 16, "c" * 16 + ".rank0", "d" * 16, "d" * 16 + ".rank0"):
   (base / name).mkdir(parents=True)
 a.prune_filesets("keep", "c" * 16)
 check("pruning keeps a file set's rank inputs and drops the others'", sorted(p.name for p in base.iterdir()) == ["c" * 16, "c" * 16 + ".rank0"])
-with patch.object(a, "platform_name", return_value="aarch64-gb10"), patch.object(a, "amd_gpus", side_effect=lambda: []):
+with patch.object(a, "platform_name", return_value="aarch64-gb10"), patch.object(a, "amd_gpus", side_effect=lambda: []), patch.object(a, "intel_gpus", return_value=[]):
   check("no pair without a record of one", "pair" not in a.machine_profile())
   Path(a.pair_path()).parent.mkdir(parents=True, exist_ok=True)
   Path(a.pair_path()).write_text(json.dumps({"peer": "10.99.0.2", "host": "spark2", "home": "/home/u", "ram_gib": 121.9}))
