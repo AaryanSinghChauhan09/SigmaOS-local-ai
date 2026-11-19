@@ -19,6 +19,7 @@ import json
 import os
 import posixpath
 import pty
+import random
 import re
 import shlex
 import shutil
@@ -761,6 +762,14 @@ def validate_runtime(rid, runtime, root=None):
   api = runtime.get("api", "openai")
   if api not in APIS:
     errors.append(f"{where}.api: must be one of {', '.join(APIS)}")
+  warmup = runtime.get("warmup")
+  if warmup is not None:
+    if api != "openai":
+      errors.append(f"{where}.warmup: only an OpenAI API takes warm-up prompts")
+    elif not (isinstance(warmup, dict) and set(warmup) == {"prompts", "pieces"}
+              and all(isinstance(warmup[k], int) and not isinstance(warmup[k], bool) for k in warmup)
+              and 1 <= warmup["prompts"] <= 16 and 256 <= warmup["pieces"] <= 65536):
+      errors.append(f"{where}.warmup: must be {{prompts = 1-16, pieces = 256-65536}}")
   # The OpenAI check finds the recipe by the alias the server is given; sd-server names no model.
   for required in ("model", "key") + (("alias",) if api == "openai" else ()):
     if required not in inputs:
@@ -2111,6 +2120,52 @@ def post_start_checks(rid, key, runtime=None):
     raise LocalError(f"Port {port_for(rid)} is serving {', '.join(map(str, ids)) or 'an unknown model'}, not {rid}")
 
 
+def warmup_vocabulary(rid):
+  """The model's own vocabulary, from the tokenizer.json in its files, as text pieces."""
+  base = os.path.join(data_dir(), "models", rid)
+  for directory, _, names in os.walk(base):
+    if "tokenizer.json" in names and directory.count(os.sep) - base.count(os.sep) <= 3:
+      try:
+        with open(os.path.join(directory, "tokenizer.json"), encoding="utf-8") as handle:
+          vocab = json.load(handle)["model"]["vocab"]
+      except (OSError, ValueError, KeyError, TypeError):
+        return []
+      return [piece.replace("\u0120", " ").replace("\u010a", "\n") for piece in vocab
+              if not piece.startswith("<") and "\ufffd" not in piece]
+  return []
+
+
+def warm_up(rid, key, runtime):
+  """Some servers run their first prompts slowly while they settle in, by what the prompts route
+  through: DeepSeek's pair ran a quarter of its speed until it had met most of its experts. A
+  runtime naming warmup gets that many prompts of its own vocabulary drawn at random (pieces, which
+  tokenize to about four tokens each), each with a fresh start so nothing is cached, before the
+  model is reported running. A failed or impossible warm-up only says so: the model itself is up."""
+  warmup = runtime.get("warmup")
+  if not warmup:
+    return
+  pieces = warmup_vocabulary(rid)
+  if not pieces:
+    say("No tokenizer.json in the model's files to warm it up with")
+    return
+  say("Warming up")
+  started = time.time()
+  for n in range(warmup["prompts"]):
+    rng = random.Random(f"{rid}-{n}-{time.time()}")
+    text = f"Warm-up {n} {rng.random()}.\n" + "".join(rng.choice(pieces) for _ in range(warmup["pieces"]))
+    body = json.dumps({"model": rid, "messages": [{"role": "user", "content": text}], "max_tokens": 1,
+                       "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}).encode()
+    request = urllib.request.Request(f"{endpoint(rid)}/chat/completions", data=body, headers={
+      "Content-Type": "application/json", "Authorization": f"Bearer {key}", "User-Agent": "omarchy-agent-local"})
+    try:
+      with urllib.request.urlopen(request, timeout=600) as response:
+        response.read(HTTP_MAX_BYTES)
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+      say(f"  warm-up stopped after {n} prompts: {error}")
+      return
+  say(f"Warmed up in {time.time() - started:.0f}s")
+
+
 def free_memory(gpu):
   mem = meminfo()
   # Pages a GPU driver has freed wait in its pool (GPUReclaim), which MemAvailable leaves out:
@@ -3106,6 +3161,7 @@ def activate(manifest, recipe, runtime, gpu, key, catalog, profile):
     "ram_used_gib": ram_used_gib(manifest, before_ram, after_ram, before_peer, peer_free_gib(manifest)),
     "gpu_used_gib": round(before_gpu - after_gpu, 1),
   }
+  warm_up(rid, key, runtime)
 
 
 # ---------------------------------------------------------------- commands
@@ -3851,6 +3907,8 @@ def _start(args, catalog, profile):
   else:
     # Timed from the same moment the panel's bar starts from, the click.
     write_atomic(load_seconds_path(rid), f"{time.time() - started:.1f}\n")
+    # Still shown as starting while it warms up.
+    warm_up(rid, ensure_key(), manifest.get("runtime") or {})
   write_status(catalog, profile)
   if result.returncode != 0:
     raise LocalError(f"{rid} didn't start: {result.stderr.strip()}\n{journal_tail(rid)}")

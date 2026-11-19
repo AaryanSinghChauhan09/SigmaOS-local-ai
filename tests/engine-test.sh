@@ -1566,4 +1566,35 @@ for name, answers, message in (("that answers without the key", [(200, found)], 
   with patch.object(a, "http_status", side_effect=answers):
     raises(f"an ace-server {name} is refused", lambda: a.post_start_checks("song", "test-key", ace_rt), message)
 
+
+# A runtime's warm-up: a malformed one is refused; one prompt of the model's own vocabulary goes
+# out with the key, nothing is sent without a tokenizer, and a failure doesn't fail the start.
+for bad in ({"prompts": 0, "pieces": 20000}, {"prompts": 1}, {"prompts": True, "pieces": 20000}):
+  changed = dict(runtime, warmup=bad)
+  check(f"runtime rejects warmup {bad}", any(".warmup" in e for e in a.validate_runtime("server", changed)))
+check("an OpenAI runtime takes a warm-up", not a.validate_runtime("server", dict(runtime, warmup={"prompts": 1, "pieces": 20000})))
+tok = Path(a.data_dir(), "models", "warm", "f" * 16, "model")
+tok.mkdir(parents=True, exist_ok=True)
+(tok / "tokenizer.json").write_text(json.dumps({"model": {"vocab": {"\u0120river": 0, "stone": 1, "<|eos|>": 2}}}))
+sent = []
+class Reply:
+  def __enter__(self): return self
+  def __exit__(self, *exc): return False
+  def read(self, *a): return b"{}"
+def fake_urlopen(request, timeout=None):
+  sent.append(request)
+  return Reply()
+with patch.object(a.urllib.request, "urlopen", side_effect=fake_urlopen):
+  a.warm_up("warm", "test-key", {"warmup": {"prompts": 1, "pieces": 300}})
+body = json.loads(sent[0].data) if sent else {}
+text = body.get("messages", [{}])[0].get("content", "")
+check("the warm-up sends one prompt of the model's vocabulary with the key",
+      len(sent) == 1 and sent[0].get_header("Authorization") == "Bearer test-key" and " river" in text and "<|eos|>" not in text and body.get("max_tokens") == 1)
+sent.clear()
+with patch.object(a.urllib.request, "urlopen", side_effect=fake_urlopen):
+  a.warm_up("missing", "test-key", {"warmup": {"prompts": 1, "pieces": 300}})
+check("no tokenizer, no warm-up prompt", not sent)
+with patch.object(a.urllib.request, "urlopen", side_effect=a.urllib.error.URLError("refused")):
+  a.warm_up("warm", "test-key", {"warmup": {"prompts": 2, "pieces": 300}})
+check("a failed warm-up doesn't fail the start", True)
 PY

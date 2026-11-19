@@ -8,6 +8,10 @@ image = "ghcr.io/omacom/omarchy-local-ai/tensorfold-dsv41@sha256:5692a64c30086d5
 tier = "third-party"
 review = "reviews/tensorfold-dsv41-5692a64c3008.toml"
 port = 8888
+# After every start the pair ran prompts at a quarter of their speed (400-900 tok/s against ~1,950) until
+# it had met most of its experts, which took minutes of real use. One prompt of 20,000 pieces of its own
+# vocabulary drawn at random (about 80K tokens, a minute) does that before the model is reported running.
+warmup = { prompts = 1, pieces = 20000 }
 command = ["tensorfold-native", "serve", "--backend", "cuda", "--no-update-check"]
 listen = { host = "--host", port = "--port" }
 health = { probe = ["curl", "-fsS", "--max-time", "4", "http://127.0.0.1:@PORT@/health"] }
