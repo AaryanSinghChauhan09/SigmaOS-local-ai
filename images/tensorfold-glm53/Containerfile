@@ -6,7 +6,8 @@
 #
 # MiaAI-Lab's GLM-5.3-Flash-DGX-Sparks-1104 docker/Dockerfile for omarchy-local-ai's paired-Spark runtime
 # tensorfold-glm53-pair, with its pins as defaults, building the recipe's engine patches at RECIPE_REF:
-#   podman build -t tensorfold-glm53 images/tensorfold-glm53     (on a DGX Spark: ZIG_CPU defaults to native)
+#   podman build --format docker -t tensorfold-glm53 images/tensorfold-glm53     (on a DGX Spark: ZIG_CPU defaults to native;
+#   --format docker keeps the Bash SHELL in the image config, as the published image has it)
 # Added at the end: curl for the health probe, the recipe's vision chat template with its effort line rewritten
 # (effort-line.patch), and HOME=/state, the writable rank folder the engine keeps its checkpoint digests and kernels in.
 
@@ -214,7 +215,8 @@ COPY --from=video /video/ ${PREFIX}/
 # A wheel's libnccl replaces the base image's; then check that whatever is installed meets the engine's minimum.
 RUN shopt -s nullglob \
  && if [[ -f /opt/nccl/libnccl.so.2 ]]; then \
-      dir=$(dirname "$(find /usr/lib /lib -name 'libnccl.so.2' | head -1)") \
+      found=$(find /usr/lib /lib -name 'libnccl.so.2' | head -1) \
+      && dir=${found:+$(dirname "${found}")} \
       && dir=${dir:-/usr/lib/$(uname -m)-linux-gnu} \
       && rm -f "${dir}"/libnccl.so.2 "${dir}"/libnccl.so.2.[0-9]*.[0-9]* \
       && cp -a /opt/nccl/libnccl.so.2 "${dir}/libnccl.so.2" \
