@@ -6,7 +6,7 @@
 #
 # MiaAI-Lab's GLM-5.3-Flash-DGX-Sparks-1104 docker/Dockerfile for omarchy-local-ai's paired-Spark runtime
 # tensorfold-glm53-pair, with its pins as defaults, building the recipe's engine patches at RECIPE_REF:
-#   podman build --format docker -t tensorfold-glm53 images/tensorfold-glm53     (on a DGX Spark: ZIG_CPU defaults to native;
+#   podman build --format docker -t tensorfold-glm53 images/tensorfold-glm53     (on an aarch64 machine: ZIG_CPU targets the GB10's Cortex-X925 wherever it builds;
 #   --format docker keeps the Bash SHELL in the image config, as the published image has it)
 # Added at the end: curl for the health probe, the recipe's vision chat template with its effort line rewritten
 # (effort-line.patch), and HOME=/state, the writable rank folder the engine keeps its checkpoint digests and kernels in.
@@ -113,7 +113,7 @@ RUN shopt -s nullglob \
 
 ARG ZIG_VERSION=0.17.0
 ARG SM=121
-ARG ZIG_CPU=native
+ARG ZIG_CPU=cortex_x925
 ARG ZIG_JOBS=
 ARG STRIP=false
 # TOOLS=1 adds `zig build install`: the CUDA dev CLI (bin/tensorfold: run, digest, kl, ...), tf-cuda-test (GPU kernel
@@ -161,7 +161,7 @@ RUN shopt -s nullglob \
 # directory and the image is the same as without it.
 FROM build AS video
 ARG WITH_VIDEO=0
-ARG ZIG_CPU=native
+ARG ZIG_CPU=cortex_x925
 RUN --mount=type=cache,id=tensorfold-zig-global,target=/root/.cache/zig \
     mkdir -p /video \
  && if [[ "${WITH_VIDEO}" == 1 ]]; then \
