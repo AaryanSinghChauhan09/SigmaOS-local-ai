@@ -5116,6 +5116,21 @@ def cmd_logs(argv):
   return 0
 
 
+def cmd_dismiss(argv):
+  """Forget why a model last failed, once its logs have been read: the panel drops the error from
+  its line. The journal keeps the log itself."""
+  parser = argparse.ArgumentParser(prog="omarchy agent local dismiss")
+  parser.add_argument("recipe")
+  args = parser.parse_args(argv)
+  rid = resolve_model(args.recipe)["recipe_id"]
+  clear_error(rid)
+  # A unit left failed reads as stopped unexpectedly until it is reset.
+  if not unit_active(rid):
+    systemctl("reset-failed", unit_name(rid))
+  write_status(load_catalog(), machine_profile())
+  return 0
+
+
 COMMANDS = {
   "use": cmd_use,
   "list": cmd_list,
@@ -5132,6 +5147,7 @@ COMMANDS = {
   # maintainers; they run but aren't listed.
   "profile": cmd_profile,
   "refresh": cmd_refresh,
+  "dismiss": cmd_dismiss,
   "validate": cmd_validate,
   "overlay": cmd_overlay,
   "link": cmd_link,

@@ -122,6 +122,10 @@ flag for a retry. Autostart cannot be enabled before that first checked start.
 models. Image models are set up, started and stopped like any other, but never become `last`,
 the agents' default or an overlay, pi provider or tailnet share.
 
+A model that failed to start, or stopped on its own, keeps its reason as its `error` until its
+next start. `dismiss <recipe>` forgets it sooner, and resets the failed unit: the panel runs it
+once the model's logs have been opened, so an error that has been read leaves the model's line.
+
 `remove <recipe>` stops it, removes its unit and file sets, drops blobs unused by
 other recipes and removes its image only if no surviving current manifest uses
 it. The manifest remains until removal completes so interrupted removal can be
