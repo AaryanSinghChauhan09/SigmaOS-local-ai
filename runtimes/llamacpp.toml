@@ -1,5 +1,5 @@
-# llama.cpp's llama-server, for text models on Intel GPUs, built by Omacom (omacom/llamacpp-image)
-# from ggml-org/llama.cpp with no patches. Vulkan on the render node. Upstream's own image is
+# llama.cpp's llama-server, for text models on Intel GPUs, built by Omacom from images/llamacpp
+# (first published from omacom/llamacpp-image) from ggml-org/llama.cpp with no patches. Vulkan on the render node. Upstream's own image is
 # Ubuntu, whose Mesa 26.0 runs an Arc B390 at half the speed of the Mesa 26.2 this one carries.
 # The key comes from LLAMA_API_KEY and covers every route but /health, which says only whether
 # the model has loaded. --offline keeps the server from fetching anything of its own accord.
