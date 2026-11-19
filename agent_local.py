@@ -3370,6 +3370,13 @@ def model_record(rid, manifest, profile):
 
 def status_record(catalog, profile):
   models = {rid: model_record(rid, load_model(rid), profile) for rid in known_models()}
+  # A model runs as the recipe it was set up from, but its maker's mark
+  # follows the catalog, so a recipe that gains a vendor marks the models
+  # already set up from it.
+  for rid, row in models.items():
+    vendor = (catalog.recipes.get(rid) or {}).get("vendor", "")
+    if vendor:
+      row["vendor"] = vendor
   for rid in installing_models():
     record = load_installing(rid)
     if record is not None and rid not in models:

@@ -814,6 +814,12 @@ check("progress reports a download speed", row["install"]["rate_bytes_s"] > 0)
 with patch.object(a, "known_models", return_value=[]), patch.object(a, "unit_props", return_value={}):
   listed = a.status_record(a.load_catalog(), profile)
 check("a full status rewrite keeps the setup's row", listed["models"]["fresh"]["unit"] == "installing")
+# Set up before their recipes named a maker, both models' manifests carry none.
+marked = SimpleNamespace(version="test", best={"class": []}, recipes={"flux": {"vendor": "bfl"}, "plain": {}})
+with patch.object(a, "known_models", return_value=["flux", "plain"]), patch.object(a, "installing_models", return_value=[]), \
+     patch.object(a, "load_model", return_value={}), patch.object(a, "model_record", side_effect=lambda rid, manifest, profile: {"vendor": ""}):
+  vendors = {rid: row["vendor"] for rid, row in a.status_record(marked, profile)["models"].items()}
+check("a model set up before its recipe named a maker shows the catalog's mark", vendors == {"flux": "bfl", "plain": ""}, json.dumps(vendors))
 with patch.object(a, "known_models", return_value=["current"]), patch.object(a, "unit_props", return_value={}), patch.object(a, "free_memory", return_value=(64, 48)):
   a.write_status(a.load_catalog(), profile)
 a.publish_installing("current", {"name": "Current", "phase": "downloading"})
