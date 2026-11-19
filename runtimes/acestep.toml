@@ -12,6 +12,8 @@ command = ["ace-server", "--host", "0.0.0.0", "--port", "8085"]
 health = { probe = ["/bin/sh", "-c", "curl -fsS -H \"Authorization: Bearer $OMARCHY_LOCAL_KEY\" http://127.0.0.1:8085/health"] }
 # It writes nothing; the tmpfs is for the Vulkan driver's caches.
 run = { devices = ["render"], group_add = "keep-groups", tmpfs = "/tmp" }
+# Its image carries Mesa's RADV only, so it runs on AMD GPUs.
+gpus = ["amd"]
 reserved = ["--host", "--port", "--api-key", "--api-key-file", "ACE_API_KEY"]
 
 [inputs]

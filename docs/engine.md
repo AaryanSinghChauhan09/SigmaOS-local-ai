@@ -51,9 +51,9 @@ The real records are the examples and source of values:
 | --- | --- |
 | [catalog.toml](../catalog.toml) | The catalog schema, 1. |
 | [recipes/](../recipes/) | Name, runtime, pinned artifacts, measured hardware, context variants, sampling and optional server arguments. `kind` is `text` (the default: chat models for the agents) `image` (image generation, whose variants may omit `ctx`), `video` (clips) or `music` (songs), which run like image models. Vendor names the panel logo; architecture is `dense` or `moe`; `input` is `["text"]` (the default) or `["text", "image"]`, which the agent overlays declare so agents can send screenshots. |
-| [runtimes/](../runtimes/) | Digest-pinned image, tier, port, command, standard input mappings, reserved options, nonempty `health.probe` argv and `api` (`openai`, the default, `sdcpp` or `acestep`), which selects the post-start check; an `openai` runtime must map `alias`. A paired runtime adds `listen` (its bind flags), `@PORT@` in its probe and a `[pair]` table: `nodes = 2`, `master_port`, optional `prepare` and `worker` commands (without one, rank 1 runs the head's own invocation, for servers that compare the ranks' arguments), an optional served `model` under `/prepared`, an optional `state` path where each rank's folder is mounted writable for the server's caches (else read-only at `/prepared`), and `env`, `head_env` and `worker_env` (any names but the link's `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA` and `NCCL_IB_GID_INDEX`, which the engine sets), whose values may hold `@RANK@`, `@WORLD@`, `@MASTER_ADDR@`, `@MASTER_PORT@`, `@CTX@`, `@RDMA_DEVICES@`, `@GID_INDEX@` and `@SOCKET_IFNAME@`. |
+| [runtimes/](../runtimes/) | Digest-pinned image, `gpus` (the vendors, `amd`, `intel` or `nvidia`, or the GPU classes such as `amd-strix-halo` its image works on, each reachable through its devices), tier, port, command, standard input mappings, reserved options, nonempty `health.probe` argv and `api` (`openai`, the default, `sdcpp` or `acestep`), which selects the post-start check; an `openai` runtime must map `alias`. A paired runtime adds `listen` (its bind flags), `@PORT@` in its probe and a `[pair]` table: `nodes = 2`, `master_port`, optional `prepare` and `worker` commands (without one, rank 1 runs the head's own invocation, for servers that compare the ranks' arguments), an optional served `model` under `/prepared`, an optional `state` path where each rank's folder is mounted writable for the server's caches (else read-only at `/prepared`), and `env`, `head_env` and `worker_env` (any names but the link's `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA` and `NCCL_IB_GID_INDEX`, which the engine sets), whose values may hold `@RANK@`, `@WORLD@`, `@MASTER_ADDR@`, `@MASTER_PORT@`, `@CTX@`, `@RDMA_DEVICES@`, `@GID_INDEX@` and `@SOCKET_IFNAME@`. |
 | [reviews/](../reviews/) | Third-party image digest, publisher, reviewer, date, license URL/hash and checked properties. |
-| [measurements/](../measurements/) | Hardware evidence, artifact identities, context, memory, load time and short, long and code-edit prompt timings; for an image model, seconds per image at a size and step count instead. |
+| [measurements/](../measurements/) | Speed and memory on one machine class, the evidence `best.toml` recommends by, artifact identities, context, memory, load time and short, long and code-edit prompt timings; for an image model, seconds per image at a size and step count instead. |
 | [best.toml](../best.toml) | Unique classes requiring both `gpu` and `ram_class`, with an ordered list of measured text recipes (`recipes`) and optionally of measured image models (`images`), each holding only its kind. |
 
 IDs contain lowercase alphanumeric components separated by single dots or hyphens.
@@ -81,13 +81,17 @@ rejected. `validate <catalog-dir>` checks the records and referenced evidence;
 ## Lifecycle
 
 `use best` matches the GPU class and RAM class, tries the class's text recipes
-in order, checks runtime compatibility and measured hardware qualification, and
+in order, checks that the runtime runs on the GPU and that the recipe fits, and
 chooses the largest fitting context, and at the same context the variant with the larger memory peak that fits.
 A GPU class is its family, except that the N1x (`nvidia-n1x`) shares the GB10's (`nvidia-gb10`): the same
 chip, so what either can run depends only on memory. Measurements keep the family they ran on. `use <recipe>` supports `--ctx`, `--gpu`,
-`--seed` and explicit `--unqualified`; static memory limits still apply. Admission
+`--seed`. Two questions decide which recipes a machine is offered (`list`'s `available`): whether
+the runtime's image works on the GPU (its `gpus`) and whether a variant fits the GPU's memory and
+RAM. A measurement on the machine's class is not needed; it gives the panel speeds to show, and
+`best.toml`, kept by hand and only for measured classes, decides what is recommended. Admission
 also checks current free RAM and GPU memory and reserves 8 GiB for the desktop.
-An Intel GPU is integrated graphics a recipe was measured on (`INTEL_FAMILIES`, by PCI id), addressing
+An Intel GPU is integrated graphics on the `xe` kernel driver (Lunar Lake and newer), named by
+`INTEL_FAMILIES` or else `intel-xe-<device id>`, addressing
 three quarters of RAM up to the kernel's `ttm.pages_limit`. Memory a GPU driver freed and still
 holds in its pool (`GPUReclaim` in `/proc/meminfo`) counts as free RAM: the next model loads into it.
 Use, start and removal are serialized. Several models can run at once on distinct,

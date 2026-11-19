@@ -12,6 +12,8 @@ command = ["tensorfold-native", "serve", "--no-update-check", "--chat-template",
 listen = { host = "--host", port = "--port" }
 health = { probe = ["curl", "-fsS", "--max-time", "4", "http://127.0.0.1:@PORT@/health"] }
 run = { devices = ["cdi-nvidia", "infiniband"], memlock = "unlimited", network = "fabric", shm_size_gib = 16 }
+# Two DGX Sparks cabled together.
+gpus = ["nvidia-gb10-pair"]
 reserved = ["--host", "--port", "--api-key", "--api-key-file", "--allowed-host", "--allowed-origin", "--learn", "--learn-dir", "--learn-conversations", "--recall", "--recall-dir", "--record", "--dashboard", "--metrics-open", "--speed-up", "--vision-urls", "--chat-template", "--drafter", "TENSORFOLD_API_KEY", "TENSORFOLD_NO_UPDATE_CHECK", "TENSORFOLD_MEMORY_RESERVE_GIB", "HF_HUB_OFFLINE", "HF_TOKEN"]
 
 [inputs]
