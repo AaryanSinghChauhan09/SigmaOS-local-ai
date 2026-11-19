@@ -3385,7 +3385,9 @@ def add_clip_lengths(record, catalog, profile):
       gpu = choose_gpu(profile, manifest.get("gpu"))
     except LocalError:
       return None
-    return gpu, (gpu["family"], gpu.get("render_node", ""), gpu.get("sysfs", ""))
+    # A pair's entry is this machine's own GPU, with its memory per node: the same card.
+    family = next((single for single, pair in PAIR_FAMILIES.items() if pair == gpu["family"]), gpu["family"])
+    return gpu, (family, gpu.get("render_node", ""), gpu.get("sysfs", ""))
   holding = {}
   for rid, model in record["models"].items():
     manifest = load_model(rid) if model["unit"] in ("active", "activating", "deactivating", "removing") else None

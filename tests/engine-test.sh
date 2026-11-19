@@ -249,6 +249,12 @@ split = {"h3": {"gpu": "amd-a", "variant": {"peak_gpu_gib": 38}}, "klein": {"gpu
 with patch.object(a, "load_model", side_effect=split.get), patch.object(a, "choose_gpu", side_effect=lambda profile, family=None: cards[family]):
   a.add_clip_lengths(record, catalog_h3, profile)
 check("a model on another GPU leaves the clip's room alone", record["models"]["h3"]["max_seconds"] == 6)
+record = {"models": {"h3": {"kind": "video", "unit": "active"}, "big": {"kind": "text", "unit": "active"}}}
+spark = {"nvidia-gb10": dict(gpu, family="nvidia-gb10", memory_gib=120), "nvidia-gb10-pair": dict(gpu, family="nvidia-gb10-pair", nodes=2, memory_gib=120)}
+paired = {"h3": {"gpu": "nvidia-gb10", "variant": {"peak_gpu_gib": 46}}, "big": {"gpu": "nvidia-gb10-pair", "variant": {"peak_gpu_gib": 70}}}
+with patch.object(a, "load_model", side_effect=paired.get), patch.object(a, "choose_gpu", side_effect=lambda profile, family=None: spark[family]):
+  a.add_clip_lengths(record, catalog_h3, profile)
+check("a paired model on linked Sparks shares the clip's GPU", record["models"]["h3"]["max_seconds"] == 3)
 
 # The root script against a limine-mkinitcpio that fails a kernel and still exits 0, as it does.
 fake = Path(os.environ["HOME"]) / "fake-limine"
