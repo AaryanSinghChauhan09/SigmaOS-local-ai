@@ -89,9 +89,11 @@ KINDS = ("text", "image", "video", "music")
 # acestep.cpp's list of the models it found.
 APIS = ("openai", "sdcpp", "acestep")
 GFX_FAMILIES = {"gfx1151": "amd-strix-halo", "gfx1150": "amd-strix-point"}
-# Intel integrated GPUs by PCI device id. Only one a recipe was measured on is listed: every
-# other Intel laptop stays without a GPU here instead of gaining one nothing runs on.
+# Intel integrated graphics on the xe kernel driver (Lunar Lake and newer) is a GPU here. Those
+# named by PCI device id keep that name; any other is intel-xe-<device id>.
 INTEL_FAMILIES = {"0xb080": "intel-arc-b390"}
+# What a runtime's `gpus` may name besides a GPU class: every GPU of a vendor.
+VENDORS = ("amd", "intel", "nvidia")
 # Mesa lets its Intel driver address three quarters of RAM, and the kernel's ttm.pages_limit
 # (half of RAM unless raised) caps what the driver may map of it.
 INTEL_MEMORY_SHARE = 0.75
@@ -290,10 +292,13 @@ def intel_gpus(ram_gib, drm_root="/sys/class/drm"):
     memory = min(memory, gib(pages_limit * os.sysconf("SC_PAGE_SIZE")))
   for render in renders:
     device = os.path.join(drm_root, render, "device")
-    family = INTEL_FAMILIES.get(_read(os.path.join(device, "device")))
+    pci_id = _read(os.path.join(device, "device"))
     # Integrated graphics is always the device at 00:02.0; an Arc card has memory of its own.
-    if _read(os.path.join(device, "vendor")) != "0x8086" or not family or os.path.basename(os.path.realpath(device)) != "0000:00:02.0":
+    # The older i915 driver's GPUs are left out: too slow for the models to be worth it.
+    if (_read(os.path.join(device, "vendor")) != "0x8086" or not pci_id or os.path.basename(os.path.realpath(device)) != "0000:00:02.0"
+        or os.path.basename(os.path.realpath(os.path.join(device, "driver"))) != "xe"):
       continue
+    family = INTEL_FAMILIES.get(pci_id, f"intel-xe-{pci_id.removeprefix('0x')}")
     gpus.append({
       "vendor": "intel",
       "family": family,
@@ -412,13 +417,16 @@ def choose_gpu(profile, family=None):
   return best
 
 
-def recipe_gpu(profile, recipe, family=None):
-  """The GPU a recipe runs on here: the one named, else the best of this machine's GPUs the
-  recipe was measured on (a pair machine still runs single-node recipes on its own GPU)."""
+def recipe_gpu(profile, recipe, family=None, runtime=None):
+  """The GPU a recipe runs on here: the one named, else the best of this machine's GPUs its
+  runtime runs on (a pair machine still runs single-node recipes on its own GPU)."""
   if family:
     return choose_gpu(profile, family)
-  measured = {hw.get("gpu") for hw in recipe.get("hardware", [])}
-  matches = [gpu for gpu in profile["gpus"] if gpu["family"] in measured]
+  if runtime is not None:
+    matches = [gpu for gpu in profile["gpus"] if runtime_supports(runtime, gpu)]
+  else:
+    measured = {hw.get("gpu") for hw in recipe.get("hardware", [])}
+    matches = [gpu for gpu in profile["gpus"] if gpu["family"] in measured]
   if matches:
     return max(matches, key=lambda gpu: (gpu.get("nodes", 1), gpu["memory_gib"]))
   return choose_gpu(profile)
@@ -660,6 +668,17 @@ def validate_runtime(rid, runtime, root=None):
               errors.append(f"{where}.review: missing {field}")
         except tomllib.TOMLDecodeError as error:
           errors.append(f"{where}.review: {error}")
+  # The GPUs its image works on, each a vendor or a GPU class, and only what its devices reach:
+  # an NVIDIA GPU through CDI, an AMD or Intel one through the render node.
+  gpus = runtime.get("gpus")
+  devices = runtime.get("run", {}).get("devices", []) if isinstance(runtime.get("run"), dict) else []
+  if not isinstance(gpus, list) or not gpus or not all(isinstance(g, str) and (g in VENDORS or any(g.startswith(f"{v}-") for v in VENDORS)) for g in gpus):
+    errors.append(f"{where}.gpus: must list the vendors ({', '.join(VENDORS)}) or GPU classes (such as amd-strix-halo) its image works on")
+  else:
+    for entry in gpus:
+      vendor = entry.split("-")[0]
+      if (vendor == "nvidia") != ("cdi-nvidia" in devices) or (vendor == "intel" and "kfd" in devices):
+        errors.append(f"{where}.gpus: {entry} can't be reached through devices {devices}")
   port = runtime.get("port")
   if not isinstance(port, int) or not 1 <= port <= 65535:
     errors.append(f"{where}.port: must be 1-65535")
@@ -1070,23 +1089,11 @@ def load_catalog():
 
 
 def runtime_supports(runtime, gpu):
+  """Whether the runtime's image works on this GPU: its vendor, or its class, is in `gpus`."""
   if bool(runtime.get("pair")) != (gpu.get("nodes", 1) == 2):
     return False
-  devices = runtime.get("run", {}).get("devices", [])
-  if gpu["vendor"] == "amd":
-    return "cdi-nvidia" not in devices
-  if gpu["vendor"] == "intel":
-    return "cdi-nvidia" not in devices and "kfd" not in devices
-  if gpu["vendor"] == "nvidia":
-    return "kfd" not in devices and "render" not in devices
-  return False
-
-
-def qualified(recipe, profile, gpu):
-  return any(
-    gpu_class(hw.get("gpu")) == gpu_class(gpu["family"]) and hw.get("ram_class") == profile["ram_class"] and hw.get("platform") in (None, profile["platform"])
-    for hw in recipe.get("hardware", [])
-  )
+  gpus = runtime.get("gpus", [])
+  return gpu["vendor"] in gpus or gpu_class(gpu["family"]) in gpus
 
 
 def fits(variant, profile, gpu):
@@ -1121,11 +1128,9 @@ def pick_variant(recipe, profile, gpu, ctx=None):
 def compatibility(catalog, rid, profile, gpu, ctx=None):
   recipe = catalog.recipes[rid]
   runtime = catalog.runtimes.get(recipe.get("runtime"), {})
+  # Whether it works here and whether it fits: measurements decide only what best.toml recommends.
   if not runtime_supports(runtime, gpu):
     return None, f"runtime {recipe.get('runtime')} can't run on {gpu['family']}"
-  if not qualified(recipe, profile, gpu):
-    classes = ", ".join(f"{hw.get('gpu')} {hw.get('ram_class')} GB" for hw in recipe.get("hardware", []))
-    return None, f"not measured on {gpu['family']} {profile['ram_class']} GB (measured: {classes})"
   return pick_variant(recipe, profile, gpu, ctx)
 
 
@@ -1195,7 +1200,7 @@ def recipe_listing(catalog, profile, running=()):
     recipe = catalog.recipes[rid]
     runtime = catalog.runtimes.get(recipe.get("runtime"), {})
     if gpu:
-      own = recipe_gpu(profile, recipe)
+      own = recipe_gpu(profile, recipe, runtime=runtime)
       variant, reason = compatibility(catalog, rid, profile, own)
     else:
       own, variant, reason = None, None, gpu_error
@@ -3107,7 +3112,6 @@ def cmd_use(argv):
   parser.add_argument("--ctx", type=int)
   parser.add_argument("--gpu")
   parser.add_argument("--seed", help="reuse matching files from this directory before downloading")
-  parser.add_argument("--unqualified", action="store_true", help="run a recipe not measured on this machine class")
   parser.add_argument("--detach", action="store_true", help="set it up in the background; the agents panel shows its progress")
   args = parser.parse_args(argv)
   catalog = load_catalog()
@@ -3115,21 +3119,17 @@ def cmd_use(argv):
   gpu = choose_gpu(profile, args.gpu) if args.gpu else None
   if args.target == "best":
     rid, variant, skipped = resolve_best(catalog, profile, gpu, args.ctx)
-    gpu = recipe_gpu(profile, catalog.recipes[rid], args.gpu)
+    gpu = recipe_gpu(profile, catalog.recipes[rid], args.gpu, catalog.runtimes.get(catalog.recipes[rid].get("runtime")))
     for skipped_id, reason in skipped:
       say(f"Skipping {skipped_id}: {reason}")
     say(f"Best for this machine ({gpu['family']}, {profile['ram_class']} GB): {rid}")
   else:
     rid = args.target
-    gpu = recipe_gpu(profile, _lookup_recipe(catalog, rid), args.gpu)
+    recipe = _lookup_recipe(catalog, rid)
+    gpu = recipe_gpu(profile, recipe, args.gpu, catalog.runtimes.get(recipe.get("runtime")))
     variant, reason = compatibility(catalog, rid, profile, gpu, args.ctx)
     if variant is None:
-      if not args.unqualified:
-        raise LocalError(f"{rid} isn't qualified for this machine: {reason}\nRun with --unqualified to try anyway.")
-      variant, fit_reason = pick_variant(catalog.recipes[rid], profile, gpu, args.ctx)
-      if variant is None:
-        raise LocalError(f"{rid} doesn't fit: {fit_reason}")
-      say(f"Warning: {reason}")
+      raise LocalError(f"{rid} can't run on this machine: {reason}")
   measured_load = load_measurement(catalog, catalog.recipes[rid], profile, gpu).get("load_seconds")
   # Before a detached setup leaves this process, so polkit can still ask in the user's session.
   raise_gpu_memory(variant, gpu, args.detach)
@@ -3198,8 +3198,6 @@ def detach_use(rid, args, recipe, measured_load=None):
     command += ["--gpu", args.gpu]
   if args.seed:
     command += ["--seed", os.path.abspath(args.seed)]
-  if args.unqualified:
-    command.append("--unqualified")
   result = subprocess.run(command, capture_output=True, text=True, env=env)
   if result.returncode != 0:
     reason = (result.stderr.strip().splitlines() or ["systemd-run failed"])[-1]

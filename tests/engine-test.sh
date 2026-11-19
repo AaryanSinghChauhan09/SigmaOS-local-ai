@@ -54,7 +54,7 @@ runtime = {
   "image": "registry.example/test/server@sha256:" + "a" * 64,
   "tier": "third-party", "review": "reviews/server.toml", "port": 8080,
   "health": {"probe": ["curl", "http://localhost:8080/health"]},
-  "command": ["server"], "reserved": ["--host", "API_KEY"],
+  "command": ["server"], "reserved": ["--host", "API_KEY"], "gpus": ["amd"],
   "inputs": {"model": {"arg": "--model"}, "draft": {"arg": "--draft"},
              "ctx": {"arg": "--ctx"}, "alias": {"arg": "--alias"}, "key": {"env": "API_KEY"}},
 }
@@ -127,7 +127,8 @@ check("at the same context a larger machine takes the larger setup", a.resolve_b
 _, argv, _, _ = a.server_invocation(runtime, dict(recipe, server={"args": ["--vision"]}), picked, {"model": "w"}, "model")
 check("a variant's args follow the shared server args", argv[-3:] == ["--vision", "--parallel", "1"])
 for reason, bad in (("non-fitting variants", dict(recipe, variant=[dict(variant, peak_gpu_gib=100)])),
-                    ("unmeasured hardware", dict(recipe, hardware=[dict(recipe["hardware"][0], ram_class=128)]))):
+                    ("a runtime that doesn't run on this GPU", dict(recipe, runtime="nvidia-only"))):
+  catalog.runtimes["nvidia-only"] = dict(runtime, run={"devices": ["cdi-nvidia"]}, gpus=["nvidia"])
   catalog.recipes["first"] = bad
   catalog.best = {"class": [dict(entry, recipes=["first", "model"])]}
   result = a.resolve_best(catalog, profile, gpu)
@@ -151,14 +152,17 @@ with patch.object(a, "platform_name", return_value="aarch64-n1x"), patch.object(
   n1x = a.machine_profile()
 check("an N1x laptop has a unified NVIDIA GPU of its own family", n1x["ram_class"] == 128 and [(g["vendor"], g["family"], g["memory_gib"]) for g in n1x["gpus"]] == [("nvidia", "nvidia-n1x", 120)])
 spark = dict(recipe, hardware=[{"gpu": "nvidia-gb10", "ram_class": 128, "measured": "measurements/model.toml"}])
-check("an N1x runs what a GB10 with the same memory runs", a.qualified(spark, n1x, n1x["gpus"][0]) and a.match_class({"class": [dict(entry, gpu="nvidia-gb10", ram_class=128)]}, n1x, n1x["gpus"][0]) is not None)
+check("an N1x runs what a GB10 with the same memory runs", a.runtime_supports(dict(runtime, gpus=["nvidia-gb10"]), n1x["gpus"][0]) and a.match_class({"class": [dict(entry, gpu="nvidia-gb10", ram_class=128)]}, n1x, n1x["gpus"][0]) is not None)
 check("best treats the N1x and GB10 as one class", any("same selectors" in e for e in a.validate_best({"class": [dict(entry, gpu="nvidia-gb10", ram_class=128, recipes=["spark"]), dict(entry, gpu="nvidia-n1x", ram_class=128, recipes=["spark"])]}, {"spark": spark})))
-# An Intel laptop: only integrated graphics a recipe was measured on counts as a GPU.
+# An Intel laptop: integrated graphics on the xe driver counts as a GPU.
 drm = Path(os.environ["HOME"]) / "intel-drm"
+for driver in ("xe", "i915"):
+  (drm / "drivers" / driver).mkdir(parents=True)
 for address, render, device in (("0000:00:02.0", "renderD128", "0xb080"), ("0000:03:00.0", "renderD129", "0xb080")):
   (drm / "devices" / address).mkdir(parents=True)
   (drm / "devices" / address / "vendor").write_text("0x8086\n")
   (drm / "devices" / address / "device").write_text(device + "\n")
+  (drm / "devices" / address / "driver").symlink_to(drm / "drivers" / "xe")
   (drm / render).mkdir()
   (drm / render / "device").symlink_to(drm / "devices" / address)
 with patch.object(a, "TTM_PAGES_LIMIT", str(drm / "no-limit")):
@@ -169,9 +173,23 @@ with patch.object(a, "TTM_PAGES_LIMIT", str(drm / "pages-limit")):
   check("the kernel's page limit caps what an Intel GPU addresses", a.intel_gpus(64, str(drm))[0]["memory_gib"] == 32)
 with patch.object(a, "meminfo", return_value={"MemAvailable": 20 * 2**30, "GPUReclaim": 28 * 2**30, "GPUActive": 2 * 2**30}):
   check("memory a GPU driver pooled counts as free, and what it holds as used", a.free_memory(arc[0]) == (48, 46))
-(drm / "devices" / "0000:00:02.0" / "device").write_text("0x9a49\n")
-check("integrated graphics nothing was measured on is no GPU", a.intel_gpus(64, str(drm)) == [])
-check("an Intel GPU runs render-node runtimes only", a.runtime_supports({"run": {"devices": ["render"]}}, arc[0]) and not a.runtime_supports({"run": {"devices": ["render", "kfd"]}}, arc[0]) and not a.runtime_supports({"run": {"devices": ["cdi-nvidia"]}}, arc[0]))
+(drm / "devices" / "0000:00:02.0" / "device").write_text("0x6420\n")
+with patch.object(a, "TTM_PAGES_LIMIT", str(drm / "no-limit")):
+  lunar = a.intel_gpus(64, str(drm))
+check("integrated graphics on xe with no name of its own is named by its device id", [g["family"] for g in lunar] == ["intel-xe-6420"])
+(drm / "devices" / "0000:00:02.0" / "driver").unlink()
+(drm / "devices" / "0000:00:02.0" / "driver").symlink_to(drm / "drivers" / "i915")
+check("integrated graphics on the older i915 driver is no GPU", a.intel_gpus(64, str(drm)) == [])
+check("a runtime runs on the vendors and classes it lists, and no other",
+      a.runtime_supports(dict(runtime, gpus=["intel"]), lunar[0]) and a.runtime_supports(dict(runtime, gpus=["intel-arc-b390"]), arc[0])
+      and not a.runtime_supports(dict(runtime, gpus=["intel-arc-b390"]), lunar[0]) and not a.runtime_supports(dict(runtime, gpus=["amd"]), arc[0]))
+check("a recipe nobody measured on this machine is available when its runtime runs here and it fits",
+      a.compatibility(SimpleNamespace(recipes={"model": recipe}, runtimes={"server": dict(runtime, gpus=["intel"])}), "model", profile, arc[0])[0] is not None)
+check("a runtime's gpus must be vendors or GPU classes its devices reach",
+      any("gpus" in e for e in a.validate_runtime("server", dict(runtime, gpus=[])))
+      and any("gpus" in e for e in a.validate_runtime("server", dict(runtime, gpus=["arm"])))
+      and any("can't be reached" in e for e in a.validate_runtime("server", dict(runtime, gpus=["nvidia-gb10"], run={"devices": ["render"]})))
+      and any("can't be reached" in e for e in a.validate_runtime("server", dict(runtime, gpus=["intel"], run={"devices": ["render", "kfd"]}))))
 check("GPU peak exceeding capacity does not fit", not a.fits(dict(variant, peak_gpu_gib=49), profile, gpu)[0])
 check("RAM fit preserves desktop reserve", not a.fits(dict(variant, peak_ram_gib=57), profile, gpu)[0])
 with patch.object(a, "free_memory", return_value=(1, 1)), patch.object(a, "top_memory_users", return_value="browser (12 GiB), editor (4 GiB)"), patch.object(a.time, "sleep"):
@@ -357,7 +375,7 @@ else:
 # binds its API to loopback through flags it reserves, and leaves NCCL settings to the engine.
 pair_rt = copy.deepcopy(runtime)
 pair_rt.update(command=["server", "serve"], listen={"host": "--host", "port": "--port"}, reserved=["--host", "--port", "API_KEY"],
-               run={"devices": ["cdi-nvidia", "infiniband"], "network": "fabric", "memlock": "unlimited"},
+               run={"devices": ["cdi-nvidia", "infiniband"], "network": "fabric", "memlock": "unlimited"}, gpus=["nvidia-gb10-pair"],
                health={"probe": ["curl", "http://127.0.0.1:@PORT@/health"]},
                pair={"nodes": 2, "master_port": 29620, "prepare": ["prep", "@RANK@", "@WORLD@"], "worker": ["lanes", "@RANK@", "@MASTER_ADDR@"],
                      "env": {"TF_GID": "@GID_INDEX@"}, "head_env": {"TF_MASTER": "@MASTER_ADDR@"}})
@@ -386,7 +404,7 @@ single = dict(recipe, hardware=[{"gpu": "nvidia-gb10", "ram_class": 128, "measur
 paired = dict(recipe, hardware=[{"gpu": "nvidia-gb10-pair", "ram_class": 128, "measured": "m.toml"}], runtime="pair",
               variant=[{"ctx": 4096, "peak_ram_gib": 104, "peak_gpu_gib": 104}])
 check("a pair machine runs single-node recipes on its own GPU", a.recipe_gpu(pair_profile, single)["family"] == "nvidia-gb10" and a.recipe_gpu(pair_profile, paired)["family"] == "nvidia-gb10-pair")
-nv_rt = dict(runtime, run={"devices": ["cdi-nvidia"]})
+nv_rt = dict(runtime, run={"devices": ["cdi-nvidia"]}, gpus=["nvidia-gb10"])
 pair_catalog = SimpleNamespace(recipes={"single": single, "paired": paired}, runtimes={"server": nv_rt, "pair": pair_rt},
                                best={"class": [{"gpu": "nvidia-gb10", "ram_class": 128, "recipes": ["single"]},
                                                {"gpu": "nvidia-gb10-pair", "ram_class": 128, "recipes": ["paired"]}]})
@@ -958,13 +976,13 @@ check("cancelling a setup drops only its own partial downloads", not (staging / 
 # --detach hands the setup to a transient user unit and returns.
 a.clear_installing(rid)
 with patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=3)), patch.object(a, "load_model", return_value=None), patch.object(a.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run:
-  check("a detached setup returns at once", a.detach_use(rid, SimpleNamespace(ctx=8192, gpu=None, seed=None, unqualified=False), cat.recipes[rid]) == 0)
+  check("a detached setup returns at once", a.detach_use(rid, SimpleNamespace(ctx=8192, gpu=None, seed=None), cat.recipes[rid]) == 0)
   argv = run.call_args.args[0]
 check("a detached setup runs use in its own user unit", argv[:3] == ["systemd-run", "--user", "--collect"] and f"--unit={a.install_unit(rid)}" in argv and argv[-4:-2] == ["use", rid] and argv[-2:] == ["--ctx", "8192"], " ".join(argv))
 check("a detached setup is listed before its unit starts", a.load_installing(rid)["phase"] == "waiting")
 a.clear_installing(rid)
 with patch.dict(os.environ, {"HF_TOKEN": "hf_secret_value", "OMARCHY_LOCAL_AI_CATALOG": "relative/catalog"}), patch.object(a, "systemctl", return_value=SimpleNamespace(returncode=3)), patch.object(a, "load_model", return_value=None), patch.object(a.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run:
-  a.detach_use(rid, SimpleNamespace(ctx=None, gpu=None, seed=None, unqualified=False), cat.recipes[rid])
+  a.detach_use(rid, SimpleNamespace(ctx=None, gpu=None, seed=None), cat.recipes[rid])
   argv, env = run.call_args.args[0], run.call_args.kwargs["env"]
 check("a detached setup never puts the token on a command line", not any("hf_secret_value" in arg for arg in argv) and "--setenv=HF_TOKEN" in argv and env["HF_TOKEN"] == "hf_secret_value")
 check("a detached setup gets the catalog as an absolute path", env["OMARCHY_LOCAL_AI_CATALOG"] == os.path.abspath("relative/catalog"))
@@ -1319,7 +1337,7 @@ model.shutdown()
 # An image runtime: sd-server names no model, so it maps no alias, and takes a text encoder and a VAE.
 sd_rt = {"image": "registry.example/test/sd@sha256:" + "d" * 64, "tier": "omarchy", "api": "sdcpp", "port": 1234,
          "health": {"probe": ["curl", "http://127.0.0.1:1234/sdcpp/v1/models/status"]}, "command": ["sd-server"],
-         "reserved": ["--listen-port", "SD_API_KEY"], "run": {"devices": ["render"], "tmpfs": "/tmp"},
+         "reserved": ["--listen-port", "SD_API_KEY"], "run": {"devices": ["render"], "tmpfs": "/tmp"}, "gpus": ["amd"],
          "inputs": {"model": {"arg": "--diffusion-model"}, "text_encoder": {"arg": "--llm"}, "vae": {"arg": "--vae"}, "key": {"env": "SD_API_KEY"}}}
 picture_variant = {"peak_ram_gib": 14, "peak_gpu_gib": 14}
 picture = {"name": "Picture", "kind": "image", "runtime": "sd", "hardware": recipe["hardware"],
@@ -1445,7 +1463,7 @@ os.unlink(a.model_manifest_path("picture"))
 # loads one only when asked for a song: it's ready when it has found every model a song takes.
 ace_rt = {"image": "registry.example/test/ace@sha256:" + "e" * 64, "tier": "omarchy", "api": "acestep", "port": 8085,
           "health": {"probe": ["curl", "http://127.0.0.1:8085/health"]}, "command": ["ace-server"],
-          "reserved": ["--port", "ACE_API_KEY"], "run": {"devices": ["render"], "tmpfs": "/tmp"},
+          "reserved": ["--port", "ACE_API_KEY"], "run": {"devices": ["render"], "tmpfs": "/tmp"}, "gpus": ["amd"],
           "inputs": {"model": {"arg": "--models"}, "key": {"env": "ACE_API_KEY"}}}
 song = {"name": "Song", "kind": "music", "runtime": "ace", "hardware": recipe["hardware"],
         "artifacts": [{"repo": "test/ace", "revision": "a" * 40, "license": "mit", "files": ["lm.gguf", "dit.gguf"], "dest": "acestep", "model": "."}],
