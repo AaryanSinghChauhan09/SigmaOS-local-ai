@@ -37,5 +37,14 @@ text_encoder = "text_encoders/p-h3-image_text_encoder_int8_convrot.safetensors"
 peak_ram_gib = 46
 peak_gpu_gib = 46
 
+# Clips are 24 fps, up to the 15 s H3 is made for. How the peak grows with the clip is measured on
+# the Strix Halo (minimax-h3-sdcpp): about 0.155 GiB a frame, which is the clip's own working
+# memory rather than the backend's.
+[video]
+fps = 24
+max_seconds = 15
+reference_frames = 56
+gib_per_frame = 0.155
+
 [server]
 args = ["--cfg-scale", "1.0", "--steps", "4"]

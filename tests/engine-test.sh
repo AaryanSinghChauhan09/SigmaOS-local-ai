@@ -239,6 +239,16 @@ manifests = {"h3": {"variant": {"peak_gpu_gib": 38}}, "klein": {"variant": {"pea
 with patch.object(a, "load_model", side_effect=manifests.get), patch.object(a, "choose_gpu", return_value=dict(gpu, memory_gib=54)):
   a.add_clip_lengths(record, catalog_h3, profile)
 check("another running model's peak comes off the clip's room", record["models"]["h3"]["max_seconds"] == 3 and "max_seconds" not in record["models"]["klein"])
+record = {"models": {"h3": {"kind": "video", "unit": "active"}, "klein": {"kind": "image", "unit": "deactivating"}}}
+with patch.object(a, "load_model", side_effect=manifests.get), patch.object(a, "choose_gpu", return_value=dict(gpu, memory_gib=54)):
+  a.add_clip_lengths(record, catalog_h3, profile)
+check("a model still stopping keeps its memory", record["models"]["h3"]["max_seconds"] == 3)
+record = {"models": {"h3": {"kind": "video", "unit": "active"}, "klein": {"kind": "image", "unit": "active"}}}
+cards = {"amd-a": dict(gpu, family="amd-a", memory_gib=54), "amd-b": dict(gpu, family="amd-b", memory_gib=24)}
+split = {"h3": {"gpu": "amd-a", "variant": {"peak_gpu_gib": 38}}, "klein": {"gpu": "amd-b", "variant": {"peak_gpu_gib": 12}}}
+with patch.object(a, "load_model", side_effect=split.get), patch.object(a, "choose_gpu", side_effect=lambda profile, family=None: cards[family]):
+  a.add_clip_lengths(record, catalog_h3, profile)
+check("a model on another GPU leaves the clip's room alone", record["models"]["h3"]["max_seconds"] == 6)
 
 # The root script against a limine-mkinitcpio that fails a kernel and still exits 0, as it does.
 fake = Path(os.environ["HOME"]) / "fake-limine"

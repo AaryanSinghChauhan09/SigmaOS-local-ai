@@ -3378,18 +3378,28 @@ def clip_seconds(video, peak_gpu_gib, room_gib):
 
 def add_clip_lengths(record, catalog, profile):
   """Gives each video model the longest clip it can make here now: its GPU's memory less the
-  peaks of the other models running, any of which may be making something at the same time."""
-  running = {rid: load_model(rid) for rid, model in record["models"].items() if model["unit"] in ("active", "activating")}
-  for rid, model in record["models"].items():
-    recipe = catalog.recipes.get(rid) or {}
-    manifest = load_model(rid)
-    if model.get("kind") != "video" or not recipe.get("video") or not manifest:
-      continue
+  peaks of the other models on that GPU, any of which may be making something at the same time.
+  A model on its way down still holds its memory until its unit is gone."""
+  def gpu_of(manifest):
     try:
       gpu = choose_gpu(profile, manifest.get("gpu"))
     except LocalError:
+      return None
+    return gpu, (gpu["family"], gpu.get("render_node", ""), gpu.get("sysfs", ""))
+  holding = {}
+  for rid, model in record["models"].items():
+    manifest = load_model(rid) if model["unit"] in ("active", "activating", "deactivating", "removing") else None
+    found = gpu_of(manifest) if manifest else None
+    if found:
+      holding[rid] = (found[1], manifest["variant"]["peak_gpu_gib"])
+  for rid, model in record["models"].items():
+    recipe = catalog.recipes.get(rid) or {}
+    manifest = load_model(rid)
+    found = gpu_of(manifest) if model.get("kind") == "video" and recipe.get("video") and manifest else None
+    if not found:
       continue
-    others = sum(other["variant"]["peak_gpu_gib"] for other_id, other in running.items() if other_id != rid and other)
+    gpu, card = found
+    others = sum(peak for other_id, (other_card, peak) in holding.items() if other_id != rid and other_card == card)
     model["max_seconds"] = clip_seconds(recipe["video"], manifest["variant"]["peak_gpu_gib"], gpu["memory_gib"] - others)
 
 
