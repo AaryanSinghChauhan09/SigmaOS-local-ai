@@ -133,7 +133,8 @@ model that was stopped is stopped again afterwards, and the agents' default mode
 last started. `update --detach` runs in the setup's transient unit, for the panel. `refresh`,
 which runs after a package update, sizes each update's download for the panel to show: the new
 image's layers the current image lacks, as the registry lists them, and the weights not in the
-store, cached in `update-sizes.json` for the setup and catalog entry it was measured for. Nothing updates on its own: an update restarts the model, which
+store. Each refresh measures again, as that depends on what is stored now, and keeps the last
+answer in `update-sizes.json` for when the registry can't be reached. Nothing updates on its own: an update restarts the model, which
 ends what its agents were doing and drops its prompt cache.
 
 `remove <recipe>` stops it, removes its unit and file sets, drops blobs unused by

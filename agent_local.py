@@ -3531,8 +3531,10 @@ def update_download_bytes(manifest, recipe, runtime):
 
 
 def measure_updates(catalog, profile):
-  """Size the updates that haven't been sized, for the panel to say before one is started. A
-  registry or Hugging Face that can't be reached leaves a size unknown until the next refresh."""
+  """Size every pending update, for the panel to say before one is started. Each refresh measures
+  again, since what an update fetches also depends on what is in the store and among the images
+  now: removing another model can take the weights or layers it would have shared. A registry or
+  Hugging Face that can't be reached keeps the last size measured for the same update, or none."""
   sizes = update_sizes()
   kept = {}
   for rid in known_models():
@@ -3542,13 +3544,11 @@ def measure_updates(catalog, profile):
     recipe = catalog.recipes[rid]
     runtime = catalog.runtimes[recipe["runtime"]]
     key = update_key(manifest, recipe, runtime)
-    if (sizes.get(rid) or {}).get("for") == key:
-      kept[rid] = sizes[rid]
-      continue
     try:
       kept[rid] = {"for": key, "bytes": update_download_bytes(manifest, recipe, runtime)}
     except (LocalError, KeyError, TypeError, ValueError):
-      pass
+      if (sizes.get(rid) or {}).get("for") == key:
+        kept[rid] = sizes[rid]
   if kept != sizes:
     write_atomic(update_sizes_path(), json.dumps(kept, indent=2) + "\n")
 

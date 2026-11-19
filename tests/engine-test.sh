@@ -773,6 +773,15 @@ with patch.object(a, "known_models", return_value=["current"]), patch.object(a, 
      patch.object(a.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
   a.measure_updates(SimpleNamespace(recipes={"current": recipe}, runtimes={"server": newer}), profile)
 check("an update's download is the image layers the current image lacks", update_for(recipe, newer)["download_bytes"] == 40, str(update_for(recipe, newer)))
+# What an update fetches depends on what is stored now, so a refresh measures again rather than
+# trusting the last answer; an unreachable registry keeps it.
+def remeasure(**how):
+  with patch.object(a, "known_models", return_value=["current"]), patch.object(a, "load_model", return_value=manifest), patch.object(a, "choose_gpu", return_value=gpu), \
+       patch.object(a, "compatibility", return_value=(manifest["variant"], "")), patch.object(a, "update_download_bytes", **how):
+    a.measure_updates(SimpleNamespace(recipes={"current": recipe}, runtimes={"server": newer}), profile)
+  return update_for(recipe, newer)["download_bytes"]
+check("a refresh sizes an update again", remeasure(return_value=140) == 140)
+check("an unreachable registry keeps the last size", remeasure(side_effect=a.LocalError("offline")) == 140)
 check("a size measured for another update isn't shown for this one", update_for(recipe, dict(runtime, image=runtime["image"].replace("a" * 64, "c" * 64)))["download_bytes"] is None)
 index = {"manifests": [{"digest": "sha256:x86", "platform": {"architecture": "amd64"}}, {"digest": "sha256:arm", "platform": {"architecture": "arm64"}}]}
 with patch.object(a, "registry_json", side_effect=lambda url, accept: index if url.endswith("a" * 64) else {"layers": [{"digest": "sha256:l", "size": 7}]}) as asked, \
