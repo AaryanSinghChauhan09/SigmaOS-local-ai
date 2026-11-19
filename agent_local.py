@@ -32,6 +32,7 @@ import threading
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 
 SCHEMA = 1
@@ -3026,19 +3027,28 @@ def clear_error(rid):
 
 
 class Lock:
+  # A command that holds the lock can run another that takes it (update runs use): only the
+  # outermost one locks and unlocks the file.
+  held = 0
+
   def __enter__(self):
+    Lock.held += 1
+    if Lock.held > 1:
+      return self
     ensure_dir(state_dir())
-    self.handle = open(os.path.join(state_dir(), "lock"), "w")
+    Lock.handle = open(os.path.join(state_dir(), "lock"), "w")
     try:
-      fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      fcntl.flock(Lock.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
       say("Another omarchy agent local command is running; waiting for it")
-      fcntl.flock(self.handle, fcntl.LOCK_EX)
+      fcntl.flock(Lock.handle, fcntl.LOCK_EX)
     return self
 
   def __exit__(self, *exc):
-    fcntl.flock(self.handle, fcntl.LOCK_UN)
-    self.handle.close()
+    Lock.held -= 1
+    if Lock.held == 0:
+      fcntl.flock(Lock.handle, fcntl.LOCK_UN)
+      Lock.handle.close()
 
 
 def write_unit_files(rid, container_text):
@@ -3462,6 +3472,160 @@ def model_record(rid, manifest, profile):
   }
 
 
+def pending_update(manifest, catalog, profile):
+  """What setting a model up again would change, now that the catalog has moved on from the one
+  it was set up from: its runtime image, its weights, or how its server is run. None when it
+  would change nothing, or when the catalog no longer has the recipe or a variant for it here.
+  Read from the catalog and the manifest alone, so every status write can afford it."""
+  try:
+    rid = manifest["recipe_id"]
+    recipe = catalog.recipes.get(rid)
+    runtime = catalog.runtimes.get((recipe or {}).get("runtime"))
+    if not recipe or not runtime:
+      return None
+    gpu = choose_gpu(profile, manifest["gpu"])
+    # The context it was set up with stays the user's choice.
+    variant, _ = compatibility(catalog, rid, profile, gpu, manifest["variant"].get("ctx"))
+    if variant is None:
+      return None
+    change = {
+      # By digest: an image that only moved to another name is the same image.
+      "image": runtime["image"].rpartition("@")[2] != manifest["image"].rpartition("@")[2],
+      "weights": recipe.get("artifacts") != manifest["recipe"].get("artifacts"),
+      "settings": False,
+    }
+    if not change["weights"]:
+      # The same files in the same roles: the units differ only by how the server is run.
+      setup = (manifest["roles"], gpu, manifest["fileset"])
+      # A pair's workers are started from its manifest's own pair table, not the unit.
+      change["settings"] = (runtime.get("pair") != manifest["runtime"].get("pair")
+                            or render_container(rid, recipe, dict(runtime, image=manifest["image"]), variant, *setup)
+                            != render_container(rid, manifest["recipe"], dict(manifest["runtime"], image=manifest["image"]), manifest["variant"], *setup))
+  except (LocalError, KeyError, TypeError):
+    return None
+  if not any(change.values()):
+    return None
+  # How much it would fetch, once refresh has asked the registry and Hugging Face; null until then.
+  sized = update_sizes().get(rid) or {}
+  change["download_bytes"] = sized.get("bytes") if sized.get("for") == update_key(manifest, recipe, runtime) else None
+  return change
+
+
+def update_key(manifest, recipe, runtime):
+  """What a measured download was measured for: this setup moving to this image and these pins."""
+  return hashlib.sha256(json.dumps([manifest["image"], manifest["fileset"], runtime["image"], recipe.get("artifacts")], sort_keys=True).encode()).hexdigest()[:16]
+
+
+def update_sizes_path():
+  return os.path.join(state_dir(), "update-sizes.json")
+
+
+def update_sizes():
+  try:
+    with open(update_sizes_path()) as handle:
+      sizes = json.load(handle)
+    return sizes if isinstance(sizes, dict) else {}
+  except (OSError, ValueError):
+    return {}
+
+
+def registry_json(url, accept, timeout=15):
+  """A registry's answer, with the anonymous pull token its 401 asks for."""
+  headers = {"User-Agent": "omarchy-agent-local", "Accept": accept}
+  for _ in range(2):
+    try:
+      with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as response:
+        return json.load(response)
+    except urllib.error.HTTPError as error:
+      challenge = dict(re.findall(r'(\w+)="([^"]*)"', error.headers.get("WWW-Authenticate", "")))
+      if error.code != 401 or "Authorization" in headers or not challenge.get("realm", "").startswith("https://"):
+        raise LocalError(f"Can't read {url}: {error}")
+      query = urllib.parse.urlencode({key: challenge[key] for key in ("service", "scope") if key in challenge})
+      token = http_json(f"{challenge['realm']}?{query}", timeout)
+      headers["Authorization"] = f"Bearer {token.get('token') or token.get('access_token')}"
+    except (urllib.error.URLError, TimeoutError, ValueError) as error:
+      raise LocalError(f"Can't read {url}: {error}")
+  raise LocalError(f"Can't read {url}")
+
+
+IMAGE_MANIFESTS = "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json"
+
+
+def image_layers(image):
+  """The compressed layers of a pinned image, by digest, as its registry lists them."""
+  name, _, digest = image.rpartition("@")
+  registry, _, repo = name.partition("/")
+  manifest = registry_json(f"https://{registry}/v2/{repo}/manifests/{digest}", IMAGE_MANIFESTS)
+  if "manifests" in manifest:
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(os.uname().machine, os.uname().machine)
+    entry = next((m for m in manifest["manifests"] if (m.get("platform") or {}).get("architecture") == arch), None)
+    if entry is None:
+      raise LocalError(f"{image} has no build for {arch}")
+    manifest = registry_json(f"https://{registry}/v2/{repo}/manifests/{entry['digest']}", IMAGE_MANIFESTS)
+  return {layer["digest"]: int(layer["size"]) for layer in manifest.get("layers", [])}
+
+
+def update_download_bytes(manifest, recipe, runtime):
+  """What an update would fetch: the new image's layers the current one lacks, and the weights
+  not in the store yet. Asks the registry and Hugging Face, so only refresh runs it."""
+  need = 0
+  if runtime["image"].rpartition("@")[2] != manifest["image"].rpartition("@")[2] and subprocess.run(["podman", "image", "exists", runtime["image"]]).returncode != 0:
+    layers = image_layers(runtime["image"])
+    try:
+      have = image_layers(manifest["image"])
+    except LocalError:
+      have = {}
+    need += sum(size for digest, size in layers.items() if digest not in have)
+  if recipe.get("artifacts") != manifest["recipe"].get("artifacts"):
+    files, _ = build_artifacts(recipe)
+    need += sum(record["size"] for record in files if not os.path.isfile(blob_path(record)))
+  return need
+
+
+def measure_updates(catalog, profile):
+  """Size every pending update, for the panel to say before one is started. Each refresh measures
+  again, since what an update fetches also depends on what is in the store and among the images
+  now: removing another model can take the weights or layers it would have shared. A registry or
+  Hugging Face that can't be reached keeps the last size measured for the same update, or none."""
+  sizes = update_sizes()
+  kept = {}
+  for rid in known_models():
+    manifest = load_model(rid)
+    if not pending_update(manifest, catalog, profile):
+      continue
+    recipe = catalog.recipes[rid]
+    runtime = catalog.runtimes[recipe["runtime"]]
+    key = update_key(manifest, recipe, runtime)
+    try:
+      kept[rid] = {"for": key, "bytes": update_download_bytes(manifest, recipe, runtime)}
+    except (LocalError, KeyError, TypeError, ValueError):
+      if (sizes.get(rid) or {}).get("for") == key:
+        kept[rid] = sizes[rid]
+  if kept != sizes:
+    write_atomic(update_sizes_path(), json.dumps(kept, indent=2) + "\n")
+
+
+def update_fields(rid, manifest, catalog, profile):
+  """What an update would change (image, weights, settings, and its download once sized), or
+  null when the model is current, and whether one is under way."""
+  return {"update": pending_update(manifest, catalog, profile), "updating": updating(rid)}
+
+
+def updating_path(rid):
+  return os.path.join(state_dir(), "updating", rid)
+
+
+def updating(rid):
+  """Whether an update of this model is under way: its marker names the process doing it, or
+  was left by the caller of a detached update whose unit is doing it."""
+  pid = _read(updating_path(rid)).strip()
+  if not pid:
+    return False
+  if pid.isdigit() and os.path.exists(f"/proc/{pid}"):
+    return True
+  return systemctl("is-active", "--quiet", install_unit(rid)).returncode == 0
+
+
 def status_record(catalog, profile):
   models = {rid: model_record(rid, load_model(rid), profile) for rid in known_models()}
   # A model runs as the recipe it was set up from, but its maker's mark
@@ -3471,6 +3635,7 @@ def status_record(catalog, profile):
     vendor = (catalog.recipes.get(rid) or {}).get("vendor", "")
     if vendor:
       row["vendor"] = vendor
+    row.update(update_fields(rid, load_model(rid), catalog, profile))
   for rid in installing_models():
     record = load_installing(rid)
     if record is not None and rid not in models:
@@ -3507,6 +3672,8 @@ def write_status(catalog, profile, transitions=None, pending=None, publish=True)
     for rid, manifest in (pending or {}).items():
       previous = load_model(rid) or {}
       record["models"][rid] = model_record(rid, {**manifest, "observed": previous.get("observed")}, profile)
+      # The setup being started is the catalog's, and an update stays one while it loads.
+      record["models"][rid].update(update_fields(rid, manifest, catalog, profile))
     for rid, unit in (transitions or {}).items():
       if rid in record["models"] and record["models"][rid]["unit"] != "removing":
         record["models"][rid]["unit"] = unit
@@ -3570,6 +3737,9 @@ def cmd_status(argv):
     state = {"active": "running", "activating": "loading", "deactivating": "stopping"}.get(model["unit"], model["unit"])
     say(f"{rid} ({model['name']}) on {model['runtime']}: {state}")
     say(f"  endpoint {model['endpoint']} · model id {rid}" + (f" · context {model['ctx']}" if model["ctx"] else f" · {model['kind']}"))
+    if model.get("update"):
+      size = f", {gib(model['update']['download_bytes']):.1f} GiB to download" if model["update"].get("download_bytes") else ""
+      say(f"  update available ({update_summary(model['update'])}{size}): omarchy agent local update {rid}")
     if model["unit"] == "failed":
       say(f"  last failure: {model['result']}")
       tail = journal_tail(rid, 5)
@@ -3578,6 +3748,91 @@ def cmd_status(argv):
   if record["best"] and record["best"] not in record["models"]:
     say(f"The recommendation for this machine is {record['best']}: omarchy agent local use best")
   return 0
+
+
+def update_summary(change):
+  names = {"image": "a new runtime", "weights": "new weights", "settings": "new settings"}
+  return ", ".join(text for key, text in names.items() if change.get(key))
+
+
+def cmd_update(argv):
+  """Set a model up again from the catalog, when the catalog has moved on from the one it was set
+  up from. The setup is use's: the old one keeps running until the new one has started, files
+  that didn't change aren't fetched again, and a model that was stopped is stopped again after."""
+  parser = argparse.ArgumentParser(prog="omarchy agent local update")
+  parser.add_argument("recipe", nargs="?", help="the model to update (default: every one with an update)")
+  parser.add_argument("--detach", action="store_true", help="update in the background; the agents panel shows it")
+  args = parser.parse_args(argv)
+  catalog = load_catalog()
+  profile = machine_profile()
+  targets = [resolve_model(args.recipe)["recipe_id"]] if args.recipe else sorted(known_models())
+  pending = {rid: change for rid in targets if (change := pending_update(load_model(rid), catalog, profile))}
+  if not pending:
+    say(f"{args.recipe} is up to date" if args.recipe else "Every model is up to date")
+    return 0
+  status = 0
+  for rid, change in pending.items():
+    say(f"Updating {rid}: {update_summary(change)}")
+    if args.detach:
+      detach_update(rid, catalog, profile)
+      continue
+    # Shown as updating from now on, while it waits for another setup too.
+    marker = f"{os.getpid()}\n"
+    write_atomic(updating_path(rid), marker)
+    write_status(catalog, profile)
+    try:
+      # One locked step with use's own: whether it runs and which model is the default are read
+      # once nothing else can start it or set another up, and put back before anything can.
+      with Lock():
+        manifest = load_model(rid)
+        if manifest is None or not pending_update(manifest, catalog, profile):
+          say(f"{rid} is up to date")
+          continue
+        was_running = unit_active(rid)
+        default = _read(os.path.join(state_dir(), "last"))
+        ctx = manifest["variant"].get("ctx")
+        code = cmd_use([rid, "--gpu", manifest["gpu"]] + (["--ctx", str(ctx)] if ctx else []))
+        if code == 0 and not was_running and unit_active(rid):
+          code = cmd_stop([rid])
+        # An update is upkeep: the agents' default stays the model the user last started.
+        if default and _read(os.path.join(state_dir(), "last")) != default:
+          write_atomic(os.path.join(state_dir(), "last"), default + "\n")
+        status = status or code
+    finally:
+      # Another update of the same model that took the marker over keeps it.
+      if _read(updating_path(rid)) == marker.strip():
+        os.unlink(updating_path(rid))
+      write_status(catalog, profile)
+  return status
+
+
+def detach_update(rid, catalog, profile):
+  """Run one model's update as the transient user unit a detached setup uses, so it outlives the
+  panel that asked for it; its output goes to the journal."""
+  unit = install_unit(rid)
+  if systemctl("is-active", "--quiet", unit).returncode == 0:
+    say(f"{rid} is already being set up; follow it with: journalctl --user -u {unit} -f")
+    return
+  systemctl("reset-failed", unit)
+  # The panel shows it from now on; the unit's own process takes the marker over.
+  write_atomic(updating_path(rid), "detached\n")
+  entry = os.path.join(os.path.dirname(os.path.realpath(__file__)), "omarchy-local-ai")
+  command = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}", f"--description=Update local model {rid}"]
+  env = dict(os.environ)
+  if env.get("OMARCHY_LOCAL_AI_CATALOG"):
+    env["OMARCHY_LOCAL_AI_CATALOG"] = os.path.abspath(env["OMARCHY_LOCAL_AI_CATALOG"])
+  for name in ("OMARCHY_LOCAL_AI_CATALOG", "HF_TOKEN"):
+    if env.get(name):
+      command.append(f"--setenv={name}")
+  result = subprocess.run(command + [entry, "update", rid], capture_output=True, text=True, env=env)
+  if result.returncode != 0:
+    try:
+      os.unlink(updating_path(rid))
+    except OSError:
+      pass
+    raise LocalError(f"Can't start the update of {rid}: {(result.stderr.strip().splitlines() or ['systemd-run failed'])[-1]}")
+  write_status(catalog, profile)
+  say(f"Updating {rid} in the background; the agents panel shows it, or follow it with: journalctl --user -u {unit} -f")
 
 
 def cmd_stop(argv):
@@ -3967,7 +4222,12 @@ def cmd_refresh(argv):
   profile = machine_profile()
   link_probe(profile)
   refresh_list_cache(catalog, profile)
+  # The updates show first, their download sizes once the registry and Hugging Face have answered.
   write_status(catalog, profile)
+  before = _read(update_sizes_path())
+  measure_updates(catalog, profile)
+  if _read(update_sizes_path()) != before:
+    write_status(catalog, profile)
   if not args.quiet:
     say("Refreshed what fits this machine")
   return 0
@@ -5178,6 +5438,7 @@ COMMANDS = {
   "status": cmd_status,
   "start": cmd_start,
   "stop": cmd_stop,
+  "update": cmd_update,
   "remove": cmd_remove,
   "share": cmd_share,
   "network": cmd_network,
@@ -5201,6 +5462,7 @@ SUMMARIES = {
   "status": "Show the models that are set up, and whether a better one is recommended",
   "start": "Start a model that's set up, the last one started by default",
   "stop": "Stop a model, or every running one",
+  "update": "Update a model that's set up to the catalog's runtime, weights and settings",
   "remove": "Remove a model's weights, manifests and unused image",
   "share": "Share a model with the other machines on your tailnet, or stop with --off",
   "network": "List the models shared on your tailnet, including hosts that are offline",
