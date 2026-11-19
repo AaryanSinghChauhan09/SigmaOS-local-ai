@@ -226,6 +226,20 @@ with patch.object(a, "pending_pages_limit", return_value=0), patch.object(a, "_r
   raises("with no raise waiting, use is named instead of a reboot", lambda: a.check_headroom(needs_more, halo), "use raises its memory limit")
   check("and the panel isn't told a reboot would help", a.start_fit({"variant": needs_more}, profile) == (False, a.GPU_TOO_SMALL))
 
+# How long a clip a video model makes: MiniMax H3's own line, 38 GiB at 56 frames and 0.155 a frame more.
+h3 = {"fps": 24, "max_seconds": 15, "reference_frames": 56, "gib_per_frame": 0.155}
+check("a 64 GB Strix Halo's 54 GiB makes up to 6 s, not 10", a.clip_seconds(h3, 38, 54) == 6)
+check("a GPU with room for all of it makes the model's longest", a.clip_seconds(h3, 38, 280) == 15)
+check("a GPU without room for a second makes none", a.clip_seconds(h3, 38, 30) == 0)
+check("a recipe's clip table is checked", any(".video.gib_per_frame" in e for e in a.validate_recipe("v", {"kind": "video", "runtime": "x", "video": dict(h3, gib_per_frame=0)}, {}))
+      and any(".video:" in e for e in a.validate_recipe("t", {"runtime": "x", "video": h3}, {})))
+catalog_h3 = SimpleNamespace(recipes={"h3": {"kind": "video", "video": h3}})
+record = {"models": {"h3": {"kind": "video", "unit": "active"}, "klein": {"kind": "image", "unit": "active"}}}
+manifests = {"h3": {"variant": {"peak_gpu_gib": 38}}, "klein": {"variant": {"peak_gpu_gib": 12}}}
+with patch.object(a, "load_model", side_effect=manifests.get), patch.object(a, "choose_gpu", return_value=dict(gpu, memory_gib=54)):
+  a.add_clip_lengths(record, catalog_h3, profile)
+check("another running model's peak comes off the clip's room", record["models"]["h3"]["max_seconds"] == 3 and "max_seconds" not in record["models"]["klein"])
+
 # The root script against a limine-mkinitcpio that fails a kernel and still exits 0, as it does.
 fake = Path(os.environ["HOME"]) / "fake-limine"
 fake.mkdir()

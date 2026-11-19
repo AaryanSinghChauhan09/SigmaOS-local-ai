@@ -939,6 +939,17 @@ def validate_recipe(rid, recipe, runtimes, root=None):
         errors.append(f"{at}.{field}: must be a positive number")
     if variant.get("ctx") and runtime and "ctx" not in inputs:
       errors.append(f"{at}: runtime '{runtime_id}' has no ctx input")
+  # A video model's clip lengths: the longest it makes, and how its GPU peak grows with the clip,
+  # from the variant's peak at reference_frames by gib_per_frame for each frame more.
+  if "video" in recipe:
+    video = recipe["video"]
+    if kind != "video" or not isinstance(video, dict):
+      errors.append(f"{where}.video: a table, for video models only")
+    else:
+      for field, number in (("max_seconds", int), ("reference_frames", int), ("fps", int), ("gib_per_frame", (int, float))):
+        value = video.get(field, 24 if field == "fps" else None)
+        if not isinstance(value, number) or isinstance(value, bool) or value <= 0:
+          errors.append(f"{where}.video.{field}: must be a positive number")
   sampling = recipe.get("sampling", {})
   if not isinstance(sampling, dict):
     errors.append(f"{where}.sampling: must be a table")
@@ -3353,6 +3364,35 @@ def start_fit(manifest, profile):
   return False, "Not enough memory"
 
 
+def clip_seconds(video, peak_gpu_gib, room_gib):
+  """The longest clip in whole seconds, up to the model's own limit, whose peak fits in room_gib of
+  GPU memory: the variant's peak is at video.reference_frames, and each frame past it costs
+  video.gib_per_frame more. 0 when not even a second fits."""
+  fps = video.get("fps", 24)
+  longest = 0
+  for seconds in range(1, int(video["max_seconds"]) + 1):
+    if peak_gpu_gib + (seconds * fps - video["reference_frames"]) * video["gib_per_frame"] <= room_gib:
+      longest = seconds
+  return longest
+
+
+def add_clip_lengths(record, catalog, profile):
+  """Gives each video model the longest clip it can make here now: its GPU's memory less the
+  peaks of the other models running, any of which may be making something at the same time."""
+  running = {rid: load_model(rid) for rid, model in record["models"].items() if model["unit"] in ("active", "activating")}
+  for rid, model in record["models"].items():
+    recipe = catalog.recipes.get(rid) or {}
+    manifest = load_model(rid)
+    if model.get("kind") != "video" or not recipe.get("video") or not manifest:
+      continue
+    try:
+      gpu = choose_gpu(profile, manifest.get("gpu"))
+    except LocalError:
+      continue
+    others = sum(other["variant"]["peak_gpu_gib"] for other_id, other in running.items() if other_id != rid and other)
+    model["max_seconds"] = clip_seconds(recipe["video"], manifest["variant"]["peak_gpu_gib"], gpu["memory_gib"] - others)
+
+
 def model_record(rid, manifest, profile):
   props = unit_props(rid, "ActiveState", "SubState", "Result", "InactiveExitTimestamp", "ActiveExitTimestamp", "StateChangeTimestamp")
   unit = props.get("ActiveState", "inactive") or "inactive"
@@ -3461,6 +3501,7 @@ def write_status(catalog, profile, transitions=None, pending=None, publish=True)
         record["models"][rid]["since_ms"] = now if unit in ("activating", "deactivating") else None
         if unit == "active":
           record["models"][rid]["error"] = ""
+    add_clip_lengths(record, catalog, profile)
     write_atomic(os.path.join(state_dir(), "status.json"), json.dumps(record, indent=2) + "\n")
     # The tailnet sees the same transitions: a shared model's listing is
     # republished with every status write that changes it.
@@ -4097,6 +4138,8 @@ def shared_listing(record, catalog, profile, dns):
       # image model is for Fantasi, never for an agent.
       "kind": model.get("kind", "text"),
       "edit": bool(model.get("edit")),
+      # A video model's longest clip on the host.
+      **({"max_seconds": model["max_seconds"]} if "max_seconds" in model else {}),
       # Dense or mixture of experts, which a peer's panel shows beside the
       # speeds instead of this machine's memory.
       "architecture": recipe.get("architecture", ""),
@@ -4561,6 +4604,7 @@ def clean_listing(listing, dns):
       "vendor": model.get("vendor") if ID_RE.match(str(model.get("vendor", ""))) else "",
       "kind": model.get("kind") if model.get("kind") in KINDS else "text",
       "edit": model.get("edit") is True,
+      **({"max_seconds": int(model["max_seconds"])} if isinstance(model.get("max_seconds"), int) and not isinstance(model.get("max_seconds"), bool) and 0 <= model["max_seconds"] <= 600 else {}),
       "architecture": model.get("architecture") if model.get("architecture") in ARCHITECTURES else "",
       "ctx": int(ctx) if ctx and ctx > 0 else 0,
       "max_tokens": int(min(tokens, ctx or tokens)) if tokens and tokens > 0 else DEFAULT_MAX_OUTPUT_TOKENS,
