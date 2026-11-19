@@ -32,6 +32,7 @@ import threading
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 
 SCHEMA = 1
@@ -3015,19 +3016,28 @@ def clear_error(rid):
 
 
 class Lock:
+  # A command that holds the lock can run another that takes it (update runs use): only the
+  # outermost one locks and unlocks the file.
+  held = 0
+
   def __enter__(self):
+    Lock.held += 1
+    if Lock.held > 1:
+      return self
     ensure_dir(state_dir())
-    self.handle = open(os.path.join(state_dir(), "lock"), "w")
+    Lock.handle = open(os.path.join(state_dir(), "lock"), "w")
     try:
-      fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      fcntl.flock(Lock.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
       say("Another omarchy agent local command is running; waiting for it")
-      fcntl.flock(self.handle, fcntl.LOCK_EX)
+      fcntl.flock(Lock.handle, fcntl.LOCK_EX)
     return self
 
   def __exit__(self, *exc):
-    fcntl.flock(self.handle, fcntl.LOCK_UN)
-    self.handle.close()
+    Lock.held -= 1
+    if Lock.held == 0:
+      fcntl.flock(Lock.handle, fcntl.LOCK_UN)
+      Lock.handle.close()
 
 
 def write_unit_files(rid, container_text):
@@ -3435,11 +3445,118 @@ def pending_update(manifest, catalog, profile):
     if not change["weights"]:
       # The same files in the same roles: the units differ only by how the server is run.
       setup = (manifest["roles"], gpu, manifest["fileset"])
-      change["settings"] = (render_container(rid, recipe, dict(runtime, image=manifest["image"]), variant, *setup)
+      # A pair's workers are started from its manifest's own pair table, not the unit.
+      change["settings"] = (runtime.get("pair") != manifest["runtime"].get("pair")
+                            or render_container(rid, recipe, dict(runtime, image=manifest["image"]), variant, *setup)
                             != render_container(rid, manifest["recipe"], dict(manifest["runtime"], image=manifest["image"]), manifest["variant"], *setup))
   except (LocalError, KeyError, TypeError):
     return None
-  return change if any(change.values()) else None
+  if not any(change.values()):
+    return None
+  # How much it would fetch, once refresh has asked the registry and Hugging Face; null until then.
+  sized = update_sizes().get(rid) or {}
+  change["download_bytes"] = sized.get("bytes") if sized.get("for") == update_key(manifest, recipe, runtime) else None
+  return change
+
+
+def update_key(manifest, recipe, runtime):
+  """What a measured download was measured for: this setup moving to this image and these pins."""
+  return hashlib.sha256(json.dumps([manifest["image"], manifest["fileset"], runtime["image"], recipe.get("artifacts")], sort_keys=True).encode()).hexdigest()[:16]
+
+
+def update_sizes_path():
+  return os.path.join(state_dir(), "update-sizes.json")
+
+
+def update_sizes():
+  try:
+    with open(update_sizes_path()) as handle:
+      sizes = json.load(handle)
+    return sizes if isinstance(sizes, dict) else {}
+  except (OSError, ValueError):
+    return {}
+
+
+def registry_json(url, accept, timeout=15):
+  """A registry's answer, with the anonymous pull token its 401 asks for."""
+  headers = {"User-Agent": "omarchy-agent-local", "Accept": accept}
+  for _ in range(2):
+    try:
+      with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as response:
+        return json.load(response)
+    except urllib.error.HTTPError as error:
+      challenge = dict(re.findall(r'(\w+)="([^"]*)"', error.headers.get("WWW-Authenticate", "")))
+      if error.code != 401 or "Authorization" in headers or not challenge.get("realm", "").startswith("https://"):
+        raise LocalError(f"Can't read {url}: {error}")
+      query = urllib.parse.urlencode({key: challenge[key] for key in ("service", "scope") if key in challenge})
+      token = http_json(f"{challenge['realm']}?{query}", timeout)
+      headers["Authorization"] = f"Bearer {token.get('token') or token.get('access_token')}"
+    except (urllib.error.URLError, TimeoutError, ValueError) as error:
+      raise LocalError(f"Can't read {url}: {error}")
+  raise LocalError(f"Can't read {url}")
+
+
+IMAGE_MANIFESTS = "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json"
+
+
+def image_layers(image):
+  """The compressed layers of a pinned image, by digest, as its registry lists them."""
+  name, _, digest = image.rpartition("@")
+  registry, _, repo = name.partition("/")
+  manifest = registry_json(f"https://{registry}/v2/{repo}/manifests/{digest}", IMAGE_MANIFESTS)
+  if "manifests" in manifest:
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(os.uname().machine, os.uname().machine)
+    entry = next((m for m in manifest["manifests"] if (m.get("platform") or {}).get("architecture") == arch), None)
+    if entry is None:
+      raise LocalError(f"{image} has no build for {arch}")
+    manifest = registry_json(f"https://{registry}/v2/{repo}/manifests/{entry['digest']}", IMAGE_MANIFESTS)
+  return {layer["digest"]: int(layer["size"]) for layer in manifest.get("layers", [])}
+
+
+def update_download_bytes(manifest, recipe, runtime):
+  """What an update would fetch: the new image's layers the current one lacks, and the weights
+  not in the store yet. Asks the registry and Hugging Face, so only refresh runs it."""
+  need = 0
+  if runtime["image"].rpartition("@")[2] != manifest["image"].rpartition("@")[2] and subprocess.run(["podman", "image", "exists", runtime["image"]]).returncode != 0:
+    layers = image_layers(runtime["image"])
+    try:
+      have = image_layers(manifest["image"])
+    except LocalError:
+      have = {}
+    need += sum(size for digest, size in layers.items() if digest not in have)
+  if recipe.get("artifacts") != manifest["recipe"].get("artifacts"):
+    files, _ = build_artifacts(recipe)
+    need += sum(record["size"] for record in files if not os.path.isfile(blob_path(record)))
+  return need
+
+
+def measure_updates(catalog, profile):
+  """Size the updates that haven't been sized, for the panel to say before one is started. A
+  registry or Hugging Face that can't be reached leaves a size unknown until the next refresh."""
+  sizes = update_sizes()
+  kept = {}
+  for rid in known_models():
+    manifest = load_model(rid)
+    if not pending_update(manifest, catalog, profile):
+      continue
+    recipe = catalog.recipes[rid]
+    runtime = catalog.runtimes[recipe["runtime"]]
+    key = update_key(manifest, recipe, runtime)
+    if (sizes.get(rid) or {}).get("for") == key:
+      kept[rid] = sizes[rid]
+      continue
+    try:
+      kept[rid] = {"for": key, "bytes": update_download_bytes(manifest, recipe, runtime)}
+    except (LocalError, KeyError, TypeError, ValueError):
+      pass
+  if kept != sizes:
+    write_atomic(update_sizes_path(), json.dumps(kept, indent=2) + "\n")
+
+
+def update_fields(rid, manifest, catalog, profile):
+  """What an update would change (image, weights, settings, and its download once sized), or
+  null when the model is current, and whether one is under way."""
+  return {"update": pending_update(manifest, catalog, profile), "updating": updating(rid)}
 
 
 def updating_path(rid):
@@ -3466,10 +3583,7 @@ def status_record(catalog, profile):
     vendor = (catalog.recipes.get(rid) or {}).get("vendor", "")
     if vendor:
       row["vendor"] = vendor
-    # What an update would change (image, weights, settings), or null when it is current,
-    # and whether one is under way.
-    row["update"] = pending_update(load_model(rid), catalog, profile)
-    row["updating"] = updating(rid)
+    row.update(update_fields(rid, load_model(rid), catalog, profile))
   for rid in installing_models():
     record = load_installing(rid)
     if record is not None and rid not in models:
@@ -3506,6 +3620,8 @@ def write_status(catalog, profile, transitions=None, pending=None, publish=True)
     for rid, manifest in (pending or {}).items():
       previous = load_model(rid) or {}
       record["models"][rid] = model_record(rid, {**manifest, "observed": previous.get("observed")}, profile)
+      # The setup being started is the catalog's, and an update stays one while it loads.
+      record["models"][rid].update(update_fields(rid, manifest, catalog, profile))
     for rid, unit in (transitions or {}).items():
       if rid in record["models"] and record["models"][rid]["unit"] != "removing":
         record["models"][rid]["unit"] = unit
@@ -3569,7 +3685,8 @@ def cmd_status(argv):
     say(f"{rid} ({model['name']}) on {model['runtime']}: {state}")
     say(f"  endpoint {model['endpoint']} · model id {rid}" + (f" · context {model['ctx']}" if model["ctx"] else f" · {model['kind']}"))
     if model.get("update"):
-      say(f"  update available ({update_summary(model['update'])}): omarchy agent local update {rid}")
+      size = f", {gib(model['update']['download_bytes']):.1f} GiB to download" if model["update"].get("download_bytes") else ""
+      say(f"  update available ({update_summary(model['update'])}{size}): omarchy agent local update {rid}")
     if model["unit"] == "failed":
       say(f"  last failure: {model['result']}")
       tail = journal_tail(rid, 5)
@@ -3606,21 +3723,32 @@ def cmd_update(argv):
     if args.detach:
       detach_update(rid, catalog, profile)
       continue
-    manifest = load_model(rid)
-    was_running = unit_active(rid)
-    write_atomic(updating_path(rid), f"{os.getpid()}\n")
+    # Shown as updating from now on, while it waits for another setup too.
+    marker = f"{os.getpid()}\n"
+    write_atomic(updating_path(rid), marker)
     write_status(catalog, profile)
     try:
-      ctx = manifest["variant"].get("ctx")
-      code = cmd_use([rid, "--gpu", manifest["gpu"]] + (["--ctx", str(ctx)] if ctx else []))
-      if code == 0 and not was_running and unit_active(rid):
-        code = cmd_stop([rid])
-      status = status or code
+      # One locked step with use's own: whether it runs and which model is the default are read
+      # once nothing else can start it or set another up, and put back before anything can.
+      with Lock():
+        manifest = load_model(rid)
+        if manifest is None or not pending_update(manifest, catalog, profile):
+          say(f"{rid} is up to date")
+          continue
+        was_running = unit_active(rid)
+        default = _read(os.path.join(state_dir(), "last"))
+        ctx = manifest["variant"].get("ctx")
+        code = cmd_use([rid, "--gpu", manifest["gpu"]] + (["--ctx", str(ctx)] if ctx else []))
+        if code == 0 and not was_running and unit_active(rid):
+          code = cmd_stop([rid])
+        # An update is upkeep: the agents' default stays the model the user last started.
+        if default and _read(os.path.join(state_dir(), "last")) != default:
+          write_atomic(os.path.join(state_dir(), "last"), default + "\n")
+        status = status or code
     finally:
-      try:
+      # Another update of the same model that took the marker over keeps it.
+      if _read(updating_path(rid)) == marker.strip():
         os.unlink(updating_path(rid))
-      except OSError:
-        pass
       write_status(catalog, profile)
   return status
 
@@ -4041,7 +4169,12 @@ def cmd_refresh(argv):
   profile = machine_profile()
   link_probe(profile)
   refresh_list_cache(catalog, profile)
+  # The updates show first, their download sizes once the registry and Hugging Face have answered.
   write_status(catalog, profile)
+  before = _read(update_sizes_path())
+  measure_updates(catalog, profile)
+  if _read(update_sizes_path()) != before:
+    write_status(catalog, profile)
   if not args.quiet:
     say("Refreshed what fits this machine")
   return 0
