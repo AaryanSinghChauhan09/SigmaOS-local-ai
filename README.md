@@ -39,16 +39,16 @@ The engine reads the catalog beside `agent_local.py`, following the installed en
 
 ## Build a runtime image
 
-A runtime whose image is built here has its Containerfile in `images/<runtime>/`: `llamacpp`, `sdcpp`, `sdcpp-cuda`, `acestep`, `tensorfold`, `tensorfold-dsv41`, `tensorfold-glm53` and `tensorfold-nemotron-bolt`. The base image and upstream commits are pinned in the Containerfile, but packages come from the distribution at build time, so a rebuild gives a new digest even with nothing changed. To update one, for example to a newer llama.cpp:
+A runtime whose image is built here has its Containerfile in `images/<image>/`: `llamacpp`, `sdcpp`, `sdcpp-cuda`, `acestep`, `tensorfold`, `tensorfold-dsv41`, `tensorfold-glm53` and `tensorfold-nemotron-bolt`. The base image and upstream commits are pinned in the Containerfile, but packages come from the distribution at build time, so a rebuild gives a new digest even with nothing changed. To update one, for example to a newer llama.cpp:
 
-1. Change the pinned `COMMIT` and its `BUILD` tag, or the base digest, in `images/llamacpp/Containerfile`, in a pull request. CI builds the image to check it.
-2. Merging it publishes the image: `.github/workflows/llamacpp-image.yml` pushes `ghcr.io/omacom/llamacpp:<build>-<run>` and puts the digest to pin in the run's summary. Run the workflow by hand to rebuild without a change, for Arch's newer packages.
-3. Pin `ghcr.io/omacom/llamacpp@<digest>` as `image` in `runtimes/llamacpp.toml`.
+1. Change the pinned `COMMIT` and its `BUILD` tag, or the base digest, in `images/llamacpp/Containerfile`, in a pull request. CI builds every image a pull request changes, to check it.
+2. Merging it publishes the image: `.github/workflows/images.yml` pushes `ghcr.io/omacom/omarchy-local-ai/llamacpp:<version>-<run>` and puts the digest to pin in the run's summary. Run the workflow by hand, naming the image, to rebuild without a change, for the distribution's newer packages.
+3. Pin `ghcr.io/omacom/omarchy-local-ai/llamacpp@<digest>` as `image` in `runtimes/llamacpp.toml`.
 4. Review the new digest in `reviews/llamacpp-<first 12 hex of the digest>.toml`, rerunning the checks the last review lists (license, read-only root, no network, key, stop on SIGTERM), and point the runtime's `review` at it. Keep the old review: it records what was reviewed then.
 5. Set the image up with `./omarchy-local-ai use <recipe>` and rebench every recipe on that runtime with `./tools/bench`, since a measurement records the image it was measured on.
 6. Run `./omarchy-local-ai validate .` and `./tests/engine-test.sh`, and submit the runtime, review and measurements together.
 
-To build it locally instead: `podman build -t llamacpp images/llamacpp`.
+To build one locally instead: `podman build --format docker -t llamacpp images/llamacpp`. The GB10 and N1x images build on arm64 runners and the others on x86, as in the workflow's table; a new folder needs a line there.
 
 ## Releases and packaging
 

@@ -1,0 +1,156 @@
+name: Build runtime images
+
+# Builds every images/<name>/ a pull request changes, and on master also publishes it to
+# ghcr.io/omacom/omarchy-local-ai/<name>, tagged with the upstream version its Containerfile pins
+# and this workflow's run number. Publishing doesn't change what the catalog runs: the digest in
+# the run's summary still has to be pinned in the runtime, reviewed and measured (README,
+# "Build a runtime image").
+
+on:
+  pull_request:
+    paths:
+      - images/**
+      - .github/workflows/images.yml
+  push:
+    branches: [master]
+    paths:
+      - images/**
+      - .github/workflows/images.yml
+  workflow_dispatch:
+    inputs:
+      images:
+        description: Folders under images/ to build, separated by spaces, or "all"
+        default: all
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      any: ${{ steps.pick.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pick the images to build
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          WANTED: ${{ inputs.images }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # Where each image runs decides the runner it's built on; the check runs in the built image.
+          declare -A runner=(
+            [llamacpp]=ubuntu-latest [sdcpp]=ubuntu-latest [acestep]=ubuntu-latest
+            [sdcpp-cuda]=ubuntu-24.04-arm [tensorfold]=ubuntu-24.04-arm [tensorfold-dsv41]=ubuntu-24.04-arm
+            [tensorfold-glm53]=ubuntu-24.04-arm [tensorfold-nemotron-bolt]=ubuntu-24.04-arm
+          )
+          declare -A check=(
+            [llamacpp]="llama-server --version" [sdcpp]="command -v sd-server" [acestep]="command -v ace-server"
+            [sdcpp-cuda]="command -v sd-server" [tensorfold]="command -v tensorfold-native"
+            [tensorfold-dsv41]="command -v tensorfold-native" [tensorfold-glm53]="command -v tensorfold-native"
+            [tensorfold-nemotron-bolt]="command -v tensorfold-native"
+          )
+          all=$(ls images)
+          case $EVENT in
+            workflow_dispatch) [[ $WANTED == "all" ]] && names=$all || names=$WANTED ;;
+            pull_request) changed=$(git diff --name-only "$BASE" HEAD) ;;
+            push) changed=$(git diff --name-only "$BEFORE" HEAD 2>/dev/null || echo .github/workflows/images.yml) ;;
+          esac
+          if [[ $EVENT != "workflow_dispatch" ]]; then
+            if grep -qx .github/workflows/images.yml <<<"$changed"; then
+              names=$all
+            else
+              names=$(sed -n 's#^images/\([^/]*\)/.*#\1#p' <<<"$changed" | sort -u)
+            fi
+          fi
+          picked=()
+          for name in $names; do
+            if [[ ! -d images/$name ]]; then
+              # A folder a change removed builds nothing; one asked for by name has to exist.
+              [[ $EVENT == "workflow_dispatch" ]] && { echo "::error::no images/$name"; exit 1; }
+              continue
+            fi
+            if [[ -z ${runner[$name]:-} ]]; then
+              echo "::error file=.github/workflows/images.yml::images/$name needs a runner and a check here"
+              exit 1
+            fi
+            picked+=("$name")
+          done
+          matrix=$(for name in "${picked[@]}"; do
+            jq -cn --arg name "$name" --arg runner "${runner[$name]}" --arg check "${check[$name]}" '$ARGS.named'
+          done | jq -cs '{include: .}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "any=$(( ${#picked[@]} > 0 ))" >> "$GITHUB_OUTPUT"
+          echo "Building: ${picked[*]:-nothing}"
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.any == '1'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    concurrency:
+      group: image-${{ matrix.name }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # The TensorFold images build on NVIDIA's ~20 GB PyTorch container.
+      - name: Make room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          df -h /
+
+      - name: Install podman
+        run: command -v podman || { sudo apt-get update && sudo apt-get install -y podman; }
+
+      - name: Name the image
+        id: name
+        run: |
+          file=images/${{ matrix.name }}/Containerfile
+          # llama.cpp's build tag, TensorFold's version, or the upstream commit, shortened.
+          for arg in BUILD TF_VERSION TF_REF COMMIT; do
+            version=$(sed -n "s/^ARG $arg=//p" "$file" | head -1)
+            [[ -n $version ]] && break
+          done
+          [[ $version =~ ^[0-9a-f]{40}$ ]] && version=${version:0:8}
+          if [[ -z $version ]]; then
+            echo "::error file=$file::pin the upstream in ARG BUILD, TF_VERSION, TF_REF or COMMIT"
+            exit 1
+          fi
+          echo "tag=ghcr.io/omacom/omarchy-local-ai/${{ matrix.name }}:$version-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      # Docker format keeps a Containerfile's SHELL in the image, as the GLM build relies on.
+      - name: Build
+        run: |
+          podman build --pull --format docker -t "${{ steps.name.outputs.tag }}" \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            --label org.opencontainers.image.revision=${{ github.sha }} images/${{ matrix.name }}
+
+      - name: Check the server is there
+        run: podman run --rm --network none --entrypoint sh "${{ steps.name.outputs.tag }}" -c '${{ matrix.check }}'
+
+      - name: Publish
+        if: github.event_name != 'pull_request'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          podman push --digestfile digest "${{ steps.name.outputs.tag }}"
+          image="ghcr.io/omacom/omarchy-local-ai/${{ matrix.name }}@$(cat digest)"
+          {
+            echo "Published \`${{ steps.name.outputs.tag }}\`. To run it, pin it in its runtime under \`runtimes/\`, then review and measure it:"
+            echo
+            echo '```toml'
+            echo "image = \"$image\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
