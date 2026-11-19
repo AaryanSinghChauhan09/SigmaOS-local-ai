@@ -41,20 +41,14 @@ The engine reads the catalog beside `agent_local.py`, following the installed en
 
 A runtime whose image is built here has its Containerfile in `images/<runtime>/`: `llamacpp`, `sdcpp`, `sdcpp-cuda`, `acestep`, `tensorfold`, `tensorfold-dsv41` and `tensorfold-glm53`. The base image and upstream commits are pinned in the Containerfile, but packages come from the distribution at build time, so a rebuild gives a new digest even with nothing changed. To update one, for example to a newer llama.cpp:
 
-1. Change the pinned commit (and the build tag in the comment beside it) or the base digest in `images/llamacpp/Containerfile`.
-2. Build and publish it, tagged with the upstream build and a build number, keeping the digest it was pushed under:
-
-   ```sh
-   podman build -t ghcr.io/omacom/llamacpp:b12521-1 images/llamacpp
-   podman push --digestfile /tmp/llamacpp.digest ghcr.io/omacom/llamacpp:b12521-1
-   ```
-
+1. Change the pinned `COMMIT` and its `BUILD` tag, or the base digest, in `images/llamacpp/Containerfile`, in a pull request. CI builds the image to check it.
+2. Merging it publishes the image: `.github/workflows/llamacpp-image.yml` pushes `ghcr.io/omacom/llamacpp:<build>-<run>` and puts the digest to pin in the run's summary. Run the workflow by hand to rebuild without a change, for Arch's newer packages.
 3. Pin `ghcr.io/omacom/llamacpp@<digest>` as `image` in `runtimes/llamacpp.toml`.
 4. Review the new digest in `reviews/llamacpp-<first 12 hex of the digest>.toml`, rerunning the checks the last review lists (license, read-only root, no network, key, stop on SIGTERM), and point the runtime's `review` at it. Keep the old review: it records what was reviewed then.
 5. Set the image up with `./omarchy-local-ai use <recipe>` and rebench every recipe on that runtime with `./tools/bench`, since a measurement records the image it was measured on.
-6. Run `./omarchy-local-ai validate .` and `./tests/engine-test.sh`, and submit the Containerfile, runtime, review and measurements together.
+6. Run `./omarchy-local-ai validate .` and `./tests/engine-test.sh`, and submit the runtime, review and measurements together.
 
-Publishing to `ghcr.io/omacom` needs `podman login ghcr.io` with a token that can write Omacom's packages.
+To build it locally instead: `podman build -t llamacpp images/llamacpp`.
 
 ## Releases and packaging
 
