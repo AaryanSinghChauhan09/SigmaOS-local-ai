@@ -754,6 +754,68 @@ with patch.object(a, "load_catalog"), patch.object(a, "machine_profile", return_
      patch.object(a, "unit_active", return_value=False), patch.object(a, "systemctl") as ctl:
   a.cmd_dismiss(["current"])
 check("dismissing a failure forgets its reason and resets the unit", not Path(a.error_path("current")).exists() and ctl.call_args.args == ("reset-failed", a.unit_name("current")) and wrote.called)
+
+# An update is what setting a model up again from the catalog would change. A setup made from the
+# catalog as it is has none, and neither has one whose image only moved to another name.
+def update_for(recipe_now, runtime_now):
+  now = SimpleNamespace(recipes={"current": recipe_now}, runtimes={recipe_now["runtime"]: runtime_now})
+  with patch.object(a, "choose_gpu", return_value=gpu), patch.object(a, "compatibility", return_value=(manifest["variant"], "")):
+    return a.pending_update(manifest, now, profile)
+renamed = dict(runtime, image=runtime["image"].replace("/test/", "/moved/"))
+check("a model set up from the catalog as it is has no update", update_for(recipe, runtime) is None and update_for(recipe, renamed) is None)
+check("a new image digest is an update", update_for(recipe, dict(runtime, image=runtime["image"].replace("a" * 64, "b" * 64))) == {"image": True, "weights": False, "settings": False, "download_bytes": None})
+repinned = dict(recipe, artifacts=[dict(recipe["artifacts"][0], revision="f" * 40)] + recipe["artifacts"][1:])
+check("a new weights pin is an update", update_for(repinned, runtime) == {"image": False, "weights": True, "settings": False, "download_bytes": None})
+retuned = dict(recipe, server={"args": recipe.get("server", {}).get("args", []) + ["--slots", "2"]})
+check("new server arguments are an update", update_for(retuned, runtime) == {"image": False, "weights": False, "settings": True, "download_bytes": None})
+check("a recipe the catalog dropped has no update", a.pending_update(manifest, SimpleNamespace(recipes={}, runtimes={}), profile) is None)
+# A pair's workers start from the manifest's own pair table, so a change there is an update too.
+check("a paired runtime's new worker settings are an update", update_for(recipe, dict(runtime, pair={"nodes": 2, "env": {"RESERVE": "9"}}))["settings"])
+# The download is sized by refresh, which asks the registry and Hugging Face, and shown once it has:
+# the new image's layers the current one lacks, and the weights not in the store.
+newer = dict(runtime, image=runtime["image"].replace("a" * 64, "b" * 64))
+layers = {newer["image"]: {"sha256:base": 100, "sha256:server": 40}, runtime["image"]: {"sha256:base": 100, "sha256:old": 30}}
+with patch.object(a, "known_models", return_value=["current"]), patch.object(a, "load_model", return_value=manifest), patch.object(a, "choose_gpu", return_value=gpu), \
+     patch.object(a, "compatibility", return_value=(manifest["variant"], "")), patch.object(a, "image_layers", side_effect=lambda image: layers[image]), \
+     patch.object(a.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
+  a.measure_updates(SimpleNamespace(recipes={"current": recipe}, runtimes={"server": newer}), profile)
+check("an update's download is the image layers the current image lacks", update_for(recipe, newer)["download_bytes"] == 40, str(update_for(recipe, newer)))
+# What an update fetches depends on what is stored now, so a refresh measures again rather than
+# trusting the last answer; an unreachable registry keeps it.
+def remeasure(**how):
+  with patch.object(a, "known_models", return_value=["current"]), patch.object(a, "load_model", return_value=manifest), patch.object(a, "choose_gpu", return_value=gpu), \
+       patch.object(a, "compatibility", return_value=(manifest["variant"], "")), patch.object(a, "update_download_bytes", **how):
+    a.measure_updates(SimpleNamespace(recipes={"current": recipe}, runtimes={"server": newer}), profile)
+  return update_for(recipe, newer)["download_bytes"]
+check("a refresh sizes an update again", remeasure(return_value=140) == 140)
+check("an unreachable registry keeps the last size", remeasure(side_effect=a.LocalError("offline")) == 140)
+check("a size measured for another update isn't shown for this one", update_for(recipe, dict(runtime, image=runtime["image"].replace("a" * 64, "c" * 64)))["download_bytes"] is None)
+index = {"manifests": [{"digest": "sha256:x86", "platform": {"architecture": "amd64"}}, {"digest": "sha256:arm", "platform": {"architecture": "arm64"}}]}
+with patch.object(a, "registry_json", side_effect=lambda url, accept: index if url.endswith("a" * 64) else {"layers": [{"digest": "sha256:l", "size": 7}]}) as asked, \
+     patch.object(a.os, "uname", return_value=SimpleNamespace(machine="aarch64")):
+  check("a multi-arch image's layers are this machine's build's", a.image_layers(runtime["image"]) == {"sha256:l": 7} and asked.call_args.args[0].endswith("/manifests/sha256:arm"))
+# Updating is use with the context and GPU the model was set up with. A model that was stopped
+# stays stopped, the agents' default stays the model the user last started, and a model that is
+# loading its update still says it is updating.
+last = Path(a.state_dir()) / "last"
+for was_running, stops in ((False, 1), (True, 0)):
+  last.write_text("other\n")
+  def set_up(argv):
+    last.write_text("current\n")
+    with patch.object(a, "unit_props", return_value={}), patch.object(a, "free_memory", return_value=(64, 48)), patch.object(a, "known_models", return_value=["current"]):
+      set_up.loading = a.write_status(a.load_catalog(), profile, {"current": "activating"}, pending={"current": a.load_model("current")})["models"]["current"]
+    return 0
+  write_status = a.write_status
+  with patch.object(a, "machine_profile", return_value=profile), patch.object(a, "write_status", side_effect=lambda *args, **kw: write_status(*args, **kw) if kw.get("pending") else None), \
+       patch.object(a, "pending_update", return_value={"image": True, "weights": False, "settings": False}), \
+       patch.object(a, "unit_active", side_effect=[was_running, True]), patch.object(a, "cmd_use", side_effect=set_up) as use, patch.object(a, "cmd_stop", return_value=0) as stop:
+    a.cmd_update(["current"])
+  check(f"update sets a {'running' if was_running else 'stopped'} model up again and leaves it that way",
+        use.call_args.args[0] == ["current", "--gpu", gpu["family"], "--ctx", str(a.load_model("current")["variant"]["ctx"])] and stop.call_count == stops and not Path(a.updating_path("current")).exists(),
+        f"{use.call_args} {stop.call_count}")
+  check("an update leaves the agents' default model alone", last.read_text() == "other\n")
+  check("a model loading its update says it is updating", set_up.loading["updating"] is True and set_up.loading["unit"] == "activating", str(set_up.loading))
+last.unlink()
 with patch.object(a, "known_models", return_value=["current", "survivor"]), patch.object(a, "write_unit_files"), patch.object(a.subprocess, "run") as rmi:
   a._remove_files("current")
   check("removal retains an image used by a surviving current manifest", not rmi.called)

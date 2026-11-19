@@ -125,6 +125,20 @@ the agents' default or an overlay, pi provider or tailnet share.
 A model that failed to start, or stopped on its own, keeps its reason as its `error` until its
 next start. `dismiss <recipe>` forgets it sooner, and resets the failed unit: the panel runs it
 once the model's logs have been opened, so an error that has been read leaves the model's line.
+A model keeps running as it was set up: a newer package changes nothing for it. Every status
+write compares each set-up model with what the catalog would now set up, from the manifest and
+the catalog alone, and reports the difference as its `update`: a new runtime image (by digest, so
+an image that only moved to another name is no update), new weights pins, or a different server
+invocation. `update [recipe]` then sets the model, or every model with an update, up again with
+the context and GPU it has. That is `use`'s setup: unchanged files aren't fetched again, the old
+setup stays until the new one has started, and a failed update leaves the old one in place. A
+model that was stopped is stopped again afterwards, and the agents' default model stays the one
+last started. `update --detach` runs in the setup's transient unit, for the panel. `refresh`,
+which runs after a package update, sizes each update's download for the panel to show: the new
+image's layers the current image lacks, as the registry lists them, and the weights not in the
+store. Each refresh measures again, as that depends on what is stored now, and keeps the last
+answer in `update-sizes.json` for when the registry can't be reached. Nothing updates on its own: an update restarts the model, which
+ends what its agents were doing and drops its prompt cache.
 
 `remove <recipe>` stops it, removes its unit and file sets, drops blobs unused by
 other recipes and removes its image only if no surviving current manifest uses
@@ -207,6 +221,9 @@ with a notification whose action opens `link setup` in a terminal. Each model co
 - Identity: `recipe`, `kind` (`text` or `image`; installing rows too), `name`, `vendor`, `runtime`, `image`, `ctx` (null for an image model).
 - Connection: `port`, `endpoint` (including `/v1`).
 - State: `unit`, `sub_state`, `result`, `error`, `fits`, `fit_reason`.
+- Updates: `update`, null when the model is as the catalog would set it up, else which of
+  `image`, `weights` and `settings` would change and its `download_bytes`, null until sized, and
+  `updating`, true while an update runs or waits its turn.
 - Progress: `since_ms`, `expected_load_seconds`, `expected_stop_seconds`,
   `expected_remove_seconds`, and nullable `observed` (`load_seconds`,
   `ram_used_gib`, `gpu_used_gib`) and `ram_total_gib`, the memory of the
