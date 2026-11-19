@@ -87,6 +87,9 @@ A GPU class is its family, except that the N1x (`nvidia-n1x`) shares the GB10's 
 chip, so what either can run depends only on memory. Measurements keep the family they ran on. `use <recipe>` supports `--ctx`, `--gpu`,
 `--seed` and explicit `--unqualified`; static memory limits still apply. Admission
 also checks current free RAM and GPU memory and reserves 8 GiB for the desktop.
+An Intel GPU is integrated graphics a recipe was measured on (`INTEL_FAMILIES`, by PCI id), addressing
+three quarters of RAM up to the kernel's `ttm.pages_limit`. Memory a GPU driver freed and still
+holds in its pool (`GPUReclaim` in `/proc/meminfo`) counts as free RAM: the next model loads into it.
 Use, start and removal are serialized. Several models can run at once on distinct,
 stable loopback ports, beginning at 11435.
 

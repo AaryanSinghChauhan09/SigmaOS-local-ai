@@ -89,6 +89,12 @@ KINDS = ("text", "image", "video", "music")
 # acestep.cpp's list of the models it found.
 APIS = ("openai", "sdcpp", "acestep")
 GFX_FAMILIES = {"gfx1151": "amd-strix-halo", "gfx1150": "amd-strix-point"}
+# Intel integrated GPUs by PCI device id. Only one a recipe was measured on is listed: every
+# other Intel laptop stays without a GPU here instead of gaining one nothing runs on.
+INTEL_FAMILIES = {"0xb080": "intel-arc-b390"}
+# Mesa lets its Intel driver address three quarters of RAM, and the kernel's ttm.pages_limit
+# (half of RAM unless raised) caps what the driver may map of it.
+INTEL_MEMORY_SHARE = 0.75
 # NVIDIA platforms whose GPU shares the system's memory. The N1x is the GB10's GPU in a
 # laptop: it keeps its own family name so a measurement records which machine it came from,
 # but it runs what a GB10 with the same memory runs.
@@ -272,6 +278,35 @@ def amd_gpus(kfd_root="/sys/class/kfd/kfd/topology/nodes", drm_root="/sys/class/
   return gpus
 
 
+def intel_gpus(ram_gib, drm_root="/sys/class/drm"):
+  gpus = []
+  try:
+    renders = sorted(name for name in os.listdir(drm_root) if name.startswith("renderD"))
+  except OSError:
+    return gpus
+  memory = ram_gib * INTEL_MEMORY_SHARE
+  pages_limit = int(_read(TTM_PAGES_LIMIT, "0") or 0)
+  if pages_limit:
+    memory = min(memory, gib(pages_limit * os.sysconf("SC_PAGE_SIZE")))
+  for render in renders:
+    device = os.path.join(drm_root, render, "device")
+    family = INTEL_FAMILIES.get(_read(os.path.join(device, "device")))
+    # Integrated graphics is always the device at 00:02.0; an Arc card has memory of its own.
+    if _read(os.path.join(device, "vendor")) != "0x8086" or not family or os.path.basename(os.path.realpath(device)) != "0000:00:02.0":
+      continue
+    gpus.append({
+      "vendor": "intel",
+      "family": family,
+      "render_node": f"/dev/dri/{render}",
+      "vram_gib": 0,
+      "gtt_gib": 0,
+      "unified": True,
+      "memory_gib": round(memory, 2),
+      "sysfs": "",
+    })
+  return gpus
+
+
 def gpu_memory_ceiling_gib(gpu, ram_gib):
   """The most memory this GPU can be given to address: a unified AMD GPU's cap can rise to all of
   RAM but the desktop's reserve, any other GPU has what it has."""
@@ -346,6 +381,7 @@ def machine_profile():
   gpus = amd_gpus()
   for gpu in gpus:
     gpu["max_memory_gib"] = gpu_memory_ceiling_gib(gpu, ram)
+  gpus += intel_gpus(ram)
   if platform in NVIDIA_UNIFIED_FAMILIES:
     gpus.append({"vendor": "nvidia", "family": NVIDIA_UNIFIED_FAMILIES[platform], "render_node": "", "vram_gib": 0, "gtt_gib": 0, "unified": True, "memory_gib": round(ram, 2), "sysfs": ""})
   profile = {"platform": platform, "ram_gib": round(ram, 2), "ram_class": ram_class(ram), "gpus": gpus}
@@ -1039,6 +1075,8 @@ def runtime_supports(runtime, gpu):
   devices = runtime.get("run", {}).get("devices", [])
   if gpu["vendor"] == "amd":
     return "cdi-nvidia" not in devices
+  if gpu["vendor"] == "intel":
+    return "cdi-nvidia" not in devices and "kfd" not in devices
   if gpu["vendor"] == "nvidia":
     return "kfd" not in devices and "render" not in devices
   return False
@@ -2067,11 +2105,15 @@ def post_start_checks(rid, key, runtime=None):
 
 def free_memory(gpu):
   mem = meminfo()
-  available = gib(mem.get("MemAvailable", 0))
+  # Pages a GPU driver has freed wait in its pool (GPUReclaim), which MemAvailable leaves out:
+  # the kernel gives them back under pressure, and the next model loads into them.
+  available = gib(mem.get("MemAvailable", 0) + mem.get("GPUReclaim", 0))
   gpu_free = gpu["memory_gib"]
   if gpu.get("sysfs"):
     used = int(_read(os.path.join(gpu["sysfs"], "mem_info_gtt_used"), "0") or 0) + int(_read(os.path.join(gpu["sysfs"], "mem_info_vram_used"), "0") or 0)
     gpu_free = gpu["memory_gib"] - gib(used)
+  elif gpu["vendor"] == "intel":
+    gpu_free = gpu["memory_gib"] - gib(mem.get("GPUActive", 0))
   return available, gpu_free
 
 
