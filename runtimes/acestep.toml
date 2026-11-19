@@ -1,4 +1,4 @@
-# acestep.cpp's ace-server, for music models, built by Omacom (omacom/acestep-image) from
+# acestep.cpp's ace-server, for music models, built by Omacom from images/acestep (first published from omacom/acestep-image) from
 # ServeurpersoCom/acestep.cpp with one patch: the key from ACE_API_KEY (or --api-key-file).
 # Vulkan on the render node only, no ROCm. It takes the folder holding its models, loads one only
 # when asked for a song and frees it after, so it holds no GPU memory between songs and is checked

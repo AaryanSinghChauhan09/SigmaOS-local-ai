@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash across two DGX Sparks: TensorFold's native Zig engine from BertholomusAI's fork (branch
 # deepseek-v41-zig) with MiaAI-Lab's recipe patches and BertholomusAI's kernel kit, built on NVIDIA's PyTorch container
-# by omacom/tensorfold-dsv41-image. Rank 0 is tensorfold-native serve, the API, on this machine; rank 1 is
+# by images/tensorfold-dsv41. Rank 0 is tensorfold-native serve, the API, on this machine; rank 1 is
 # tf-dsv41-lanes on the paired machine. They rendezvous over the ConnectX-7 cable (TCP on master_port) and exchange a
 # decode round's activations over RoCE on both rails. Settings are MiaAI-Lab's start.sh defaults but for
 # the engine's reserve.
