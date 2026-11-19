@@ -24,15 +24,15 @@ The engine reads the catalog beside `agent_local.py`, following the installed en
 - `catalog.toml` — the catalog schema.
 - `best.toml` — ordered recommendations per hardware class: text recipes for the agents, and image models beside them.
 - `recipes/<id>.toml` — kind (text or image), runtime, pinned Hugging Face artifacts, measured context variants, memory peaks and sampling defaults.
-- `runtimes/<id>.toml` — image pinned by digest, input mappings, health probe, post-start check (`api`) and allowlisted run options.
+- `runtimes/<id>.toml` — image pinned by digest, the GPUs it works on (`gpus`), input mappings, health probe, post-start check (`api`) and allowlisted run options.
 - `reviews/` — license and behavior reviews for third-party image digests.
-- `measurements/` — evidence for hardware classes a recipe claims.
+- `measurements/` — speed and memory on a machine class, which `best.toml` recommends by.
 - `images/<runtime>/Containerfile` — how Omacom builds a runtime's image, for runtimes whose image is built here. Checkout-only, like `tools/`.
 - `tools/bench` and `bench/context.txt` — checkout-only benchmark script and long prompt.
 
 ## Add a recipe
 
-1. Add a recipe and any runtime/review it requires, or add a measured hardware class to an existing recipe. Update `best.toml` where appropriate.
+1. Add a recipe and any runtime/review it requires, or add a measured hardware class to an existing recipe. Every machine whose GPU the runtime lists in `gpus` and that has the memory for a variant is offered the recipe; `best.toml` decides which machines it is recommended to, and needs a measurement for each class it recommends it for.
 2. Run `./omarchy-local-ai validate .`, then `./omarchy-local-ai use <id>` on the target hardware.
 3. Run `./tools/bench <id> --output measurements/<id>-<gpu>-<ram>.toml` and reference the measurement in the recipe.
 4. Submit the recipe, review and measurement together. CI validates the catalog online and runs engine tests. Merging catalog changes grants software publication authority within the engine's security boundary.
@@ -47,6 +47,8 @@ A runtime whose image is built here has its Containerfile in `images/<image>/`: 
 4. Review the new digest in `reviews/llamacpp-<first 12 hex of the digest>.toml`, rerunning the checks the last review lists (license, read-only root, no network, key, stop on SIGTERM), and point the runtime's `review` at it. Keep the old review: it records what was reviewed then.
 5. Set the image up with `./omarchy-local-ai use <recipe>` and rebench every recipe on that runtime with `./tools/bench`, since a measurement records the image it was measured on.
 6. Run `./omarchy-local-ai validate .` and `./tests/engine-test.sh`, and submit the runtime, review and measurements together.
+
+The `sdcpp` and `acestep` builds also fail if the server uses AVX-512, which Intel laptops and older AMD machines don't have, or lacks Mesa's AMD or Intel driver.
 
 To build one locally instead: `podman build --format docker -t llamacpp images/llamacpp`. The GB10 and N1x images build on arm64 runners and the others on x86, as in the workflow's table; a new folder needs a line there.
 

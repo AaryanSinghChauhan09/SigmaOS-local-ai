@@ -15,6 +15,8 @@ port = 8888
 command = ["tensorfold-native", "serve", "--host", "0.0.0.0", "--port", "8888", "--no-update-check", "--snapshot-dir", "none"]
 health = { probe = ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/health', timeout=4)"] }
 run = { devices = ["cdi-nvidia"], memlock = "unlimited" }
+# Its CUDA kernels are built for the GB10's sm_121 (the N1x shares its class).
+gpus = ["nvidia-gb10"]
 reserved = ["--host", "--port", "--api-key", "--api-key-file", "--snapshot-dir", "--learn-dir", "--record", "--dashboard", "--metrics-open", "TENSORFOLD_API_KEY", "HF_HUB_OFFLINE", "HF_TOKEN"]
 
 [inputs]
