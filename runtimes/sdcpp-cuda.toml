@@ -1,6 +1,6 @@
 # stable-diffusion.cpp's sd-server built with CUDA, for image and video models on NVIDIA's
 # unified-memory ARM machines (GB10, N1x). The same commit and patches as sdcpp, from
-# images/sdcpp/Containerfile.cuda: the key from SD_API_KEY and a clean stop on SIGTERM.
+# images/sdcpp-cuda: the key from SD_API_KEY and a clean stop on SIGTERM.
 # The driver's libcuda arrives through CDI; the image carries only cudart and cuBLAS.
 image = "ghcr.io/omacom/sdcpp-cuda@sha256:0571b9ddbb8ad78fddb0bc6909eb4ddd7f3d4c1d23828c14309bbf9f1783ef7d"
 tier = "third-party"
