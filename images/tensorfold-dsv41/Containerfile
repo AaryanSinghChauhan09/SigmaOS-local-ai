@@ -35,6 +35,8 @@ RUN ok=0; \
     mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && rm /tmp/zig.tar.xz && \
     /opt/zig/zig version
 ARG SM=121
+# The GB10's CPU, so the build is the same on any aarch64 machine (zig build defaults to the one it runs on).
+ARG ZIG_CPU=cortex_x925
 
 # MiaAI-Lab's pair recipe: its engine patches, the inputs' patches and the chat template.
 ARG RECIPE_REPO=https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks.git
@@ -51,7 +53,7 @@ RUN git init -q /tensorfold && cd /tensorfold && git remote add origin "${TF_REP
     test "$(git rev-parse HEAD)" = "${TF_REF}"
 RUN cd /tensorfold && \
     for p in /recipe/zig/patches/*.patch; do echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done
-RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${SM} -Doptimize=ReleaseFast \
+RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${SM} -Dcpu=${ZIG_CPU} -Doptimize=ReleaseFast \
       --prefix /opt/tensorfold -j"$(nproc)" install native && \
     test -x /opt/tensorfold/native/bin/tensorfold-native && test -x /opt/tensorfold/bin/tf-dsv41-lanes && \
     mkdir -p /opt/tensorfold/share/doc/tensorfold && \
@@ -66,7 +68,7 @@ RUN git init -q /tf-inputs && cd /tf-inputs && git remote add origin "${TF_REPO}
     test "$(git rev-parse HEAD)" = "${INPUTS_REF}"
 RUN cd /tf-inputs && \
     for p in /recipe/zig/patches-inputs/*.patch; do echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done
-RUN cd /tf-inputs && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${SM} -Doptimize=ReleaseFast \
+RUN cd /tf-inputs && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${SM} -Dcpu=${ZIG_CPU} -Doptimize=ReleaseFast \
       --prefix /opt/inputs -j"$(nproc)" install && \
     cp /opt/inputs/bin/tf-dsv41-rank-cache /opt/tensorfold/bin/ && \
     mkdir -p /opt/tensorfold/tools/inputs && \
