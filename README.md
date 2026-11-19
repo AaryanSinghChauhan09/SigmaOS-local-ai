@@ -39,7 +39,7 @@ The engine reads the catalog beside `agent_local.py`, following the installed en
 
 ## Build a runtime image
 
-A runtime whose image is built here has its Containerfile in `images/<runtime>/`; today that's `llamacpp`. The base image and upstream commit are pinned in the Containerfile, but its packages come from Arch at build time, so a rebuild gives a new digest even with nothing changed. To update one, for example to a newer llama.cpp:
+A runtime whose image is built here has its Containerfile in `images/<runtime>/`: `llamacpp`, `sdcpp` (and `sdcpp-cuda` from its `Containerfile.cuda`), `acestep`, `tensorfold`, `tensorfold-dsv41` and `tensorfold-glm53`. The base image and upstream commits are pinned in the Containerfile, but packages come from the distribution at build time, so a rebuild gives a new digest even with nothing changed. The TensorFold pair images build on a DGX Spark and take MiaAI-Lab's recipe patches from the `RECIPE_REF` their Containerfile pins. To update one, for example to a newer llama.cpp:
 
 1. Change the pinned commit (and the build tag in the comment beside it) or the base digest in `images/llamacpp/Containerfile`.
 2. Build and publish it, tagged with the upstream build and a build number, keeping the digest it was pushed under:

@@ -1,4 +1,4 @@
-# stable-diffusion.cpp's sd-server, for image models, built by Omacom (omacom/sdcpp-image) from
+# stable-diffusion.cpp's sd-server, for image models, built by Omacom from images/sdcpp (first published from omacom/sdcpp-image) from
 # leejet/stable-diffusion.cpp with two patches open upstream: the key from SD_API_KEY (or
 # --api-key-file), and a clean stop on SIGINT and SIGTERM. Vulkan on the render node only, no ROCm.
 # It lists itself as sd-cpp-local rather than the recipe, so the engine checks it is ready by its

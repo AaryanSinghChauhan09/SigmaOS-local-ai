@@ -1,5 +1,5 @@
 # GLM-5.3-Flash across two DGX Sparks: upstream TensorFold (ashhart/TensorFold at f350cd3e, tensorfold-native 1.1.9)
-# with MiaAI-Lab's GLM-5.3-Flash-DGX-Sparks-1104 patches, on NVIDIA's CUDA runtime, built by omacom/tensorfold-glm53-image.
+# with MiaAI-Lab's GLM-5.3-Flash-DGX-Sparks-1104 patches, on NVIDIA's CUDA runtime, built by images/tensorfold-glm53.
 # Both ranks run the same tensorfold-native serve: rank 0 here answers the API, rank 1 on the paired machine; they
 # rendezvous through NCCL_COMM_ID over the ConnectX-7 cable and all-gather over RoCE on both rails. Their startup
 # fingerprints compare the serve arguments, so rank 1 gets exactly rank 0's (no [pair] worker command). Settings are

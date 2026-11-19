@@ -1,11 +1,11 @@
 # TensorFold's native server, tensorfold-native, from its signed upstream release (1.2.1) with no patches,
-# unpacked onto debian:trixie-slim by omacom/tensorfold-image. Its CUDA kernels are embedded in the
+# unpacked onto debian:trixie-slim by images/tensorfold. Its CUDA kernels are embedded in the
 # executable and the driver's libcuda arrives through CDI, so the image holds no CUDA toolkit or PyTorch;
 # it adds cuBLASLt for --vision and libjpeg-turbo and libwebp for JPEG and WebP pictures.
 # Configured by `tensorfold-native serve` arguments, with the model directory bare and the key in
 # TENSORFOLD_API_KEY. The image sets TENSORFOLD_MEMORY_RESERVE_GIB=9 (12.2 by default), which gives the
 # difference to the prompt cache, and TF_FLASHNEXT_CHUNK_SOLO=3072, which only Flash Next reads.
-# Published by Omacom from omacom/tensorfold-image.
+# Published by Omacom from images/tensorfold.
 image = "ghcr.io/omacom/tensorfold@sha256:c88821d872e22f9dc6148173816b654e2c6dcd712fae50bc5e95915e3f817856"
 tier = "third-party"
 review = "reviews/tensorfold-c88821d872e2.toml"
