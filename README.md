@@ -48,6 +48,8 @@ A runtime whose image is built here has its Containerfile in `images/<runtime>/`
 5. Set the image up with `./omarchy-local-ai use <recipe>` and rebench every recipe on that runtime with `./tools/bench`, since a measurement records the image it was measured on.
 6. Run `./omarchy-local-ai validate .` and `./tests/engine-test.sh`, and submit the runtime, review and measurements together.
 
+`sdcpp` and `acestep` are published the same way, by `sdcpp-image.yml` and `acestep-image.yml`, tagged with the first 12 hex of their pinned `COMMIT`; their builds also fail if the server uses AVX-512, which Intel laptops and older AMD machines don't have, or lacks Mesa's AMD or Intel driver. The others are still built and pushed by hand.
+
 To build it locally instead: `podman build -t llamacpp images/llamacpp`.
 
 ## Releases and packaging
