@@ -3410,6 +3410,53 @@ def model_record(rid, manifest, profile):
   }
 
 
+def pending_update(manifest, catalog, profile):
+  """What setting a model up again would change, now that the catalog has moved on from the one
+  it was set up from: its runtime image, its weights, or how its server is run. None when it
+  would change nothing, or when the catalog no longer has the recipe or a variant for it here.
+  Read from the catalog and the manifest alone, so every status write can afford it."""
+  try:
+    rid = manifest["recipe_id"]
+    recipe = catalog.recipes.get(rid)
+    runtime = catalog.runtimes.get((recipe or {}).get("runtime"))
+    if not recipe or not runtime:
+      return None
+    gpu = choose_gpu(profile, manifest["gpu"])
+    # The context it was set up with stays the user's choice.
+    variant, _ = compatibility(catalog, rid, profile, gpu, manifest["variant"].get("ctx"))
+    if variant is None:
+      return None
+    change = {
+      # By digest: an image that only moved to another name is the same image.
+      "image": runtime["image"].rpartition("@")[2] != manifest["image"].rpartition("@")[2],
+      "weights": recipe.get("artifacts") != manifest["recipe"].get("artifacts"),
+      "settings": False,
+    }
+    if not change["weights"]:
+      # The same files in the same roles: the units differ only by how the server is run.
+      setup = (manifest["roles"], gpu, manifest["fileset"])
+      change["settings"] = (render_container(rid, recipe, dict(runtime, image=manifest["image"]), variant, *setup)
+                            != render_container(rid, manifest["recipe"], dict(manifest["runtime"], image=manifest["image"]), manifest["variant"], *setup))
+  except (LocalError, KeyError, TypeError):
+    return None
+  return change if any(change.values()) else None
+
+
+def updating_path(rid):
+  return os.path.join(state_dir(), "updating", rid)
+
+
+def updating(rid):
+  """Whether an update of this model is under way: its marker names the process doing it, or
+  was left by the caller of a detached update whose unit is doing it."""
+  pid = _read(updating_path(rid)).strip()
+  if not pid:
+    return False
+  if pid.isdigit() and os.path.exists(f"/proc/{pid}"):
+    return True
+  return systemctl("is-active", "--quiet", install_unit(rid)).returncode == 0
+
+
 def status_record(catalog, profile):
   models = {rid: model_record(rid, load_model(rid), profile) for rid in known_models()}
   # A model runs as the recipe it was set up from, but its maker's mark
@@ -3419,6 +3466,10 @@ def status_record(catalog, profile):
     vendor = (catalog.recipes.get(rid) or {}).get("vendor", "")
     if vendor:
       row["vendor"] = vendor
+    # What an update would change (image, weights, settings), or null when it is current,
+    # and whether one is under way.
+    row["update"] = pending_update(load_model(rid), catalog, profile)
+    row["updating"] = updating(rid)
   for rid in installing_models():
     record = load_installing(rid)
     if record is not None and rid not in models:
@@ -3517,6 +3568,8 @@ def cmd_status(argv):
     state = {"active": "running", "activating": "loading", "deactivating": "stopping"}.get(model["unit"], model["unit"])
     say(f"{rid} ({model['name']}) on {model['runtime']}: {state}")
     say(f"  endpoint {model['endpoint']} · model id {rid}" + (f" · context {model['ctx']}" if model["ctx"] else f" · {model['kind']}"))
+    if model.get("update"):
+      say(f"  update available ({update_summary(model['update'])}): omarchy agent local update {rid}")
     if model["unit"] == "failed":
       say(f"  last failure: {model['result']}")
       tail = journal_tail(rid, 5)
@@ -3525,6 +3578,80 @@ def cmd_status(argv):
   if record["best"] and record["best"] not in record["models"]:
     say(f"The recommendation for this machine is {record['best']}: omarchy agent local use best")
   return 0
+
+
+def update_summary(change):
+  names = {"image": "a new runtime", "weights": "new weights", "settings": "new settings"}
+  return ", ".join(text for key, text in names.items() if change.get(key))
+
+
+def cmd_update(argv):
+  """Set a model up again from the catalog, when the catalog has moved on from the one it was set
+  up from. The setup is use's: the old one keeps running until the new one has started, files
+  that didn't change aren't fetched again, and a model that was stopped is stopped again after."""
+  parser = argparse.ArgumentParser(prog="omarchy agent local update")
+  parser.add_argument("recipe", nargs="?", help="the model to update (default: every one with an update)")
+  parser.add_argument("--detach", action="store_true", help="update in the background; the agents panel shows it")
+  args = parser.parse_args(argv)
+  catalog = load_catalog()
+  profile = machine_profile()
+  targets = [resolve_model(args.recipe)["recipe_id"]] if args.recipe else sorted(known_models())
+  pending = {rid: change for rid in targets if (change := pending_update(load_model(rid), catalog, profile))}
+  if not pending:
+    say(f"{args.recipe} is up to date" if args.recipe else "Every model is up to date")
+    return 0
+  status = 0
+  for rid, change in pending.items():
+    say(f"Updating {rid}: {update_summary(change)}")
+    if args.detach:
+      detach_update(rid, catalog, profile)
+      continue
+    manifest = load_model(rid)
+    was_running = unit_active(rid)
+    write_atomic(updating_path(rid), f"{os.getpid()}\n")
+    write_status(catalog, profile)
+    try:
+      ctx = manifest["variant"].get("ctx")
+      code = cmd_use([rid, "--gpu", manifest["gpu"]] + (["--ctx", str(ctx)] if ctx else []))
+      if code == 0 and not was_running and unit_active(rid):
+        code = cmd_stop([rid])
+      status = status or code
+    finally:
+      try:
+        os.unlink(updating_path(rid))
+      except OSError:
+        pass
+      write_status(catalog, profile)
+  return status
+
+
+def detach_update(rid, catalog, profile):
+  """Run one model's update as the transient user unit a detached setup uses, so it outlives the
+  panel that asked for it; its output goes to the journal."""
+  unit = install_unit(rid)
+  if systemctl("is-active", "--quiet", unit).returncode == 0:
+    say(f"{rid} is already being set up; follow it with: journalctl --user -u {unit} -f")
+    return
+  systemctl("reset-failed", unit)
+  # The panel shows it from now on; the unit's own process takes the marker over.
+  write_atomic(updating_path(rid), "detached\n")
+  entry = os.path.join(os.path.dirname(os.path.realpath(__file__)), "omarchy-local-ai")
+  command = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}", f"--description=Update local model {rid}"]
+  env = dict(os.environ)
+  if env.get("OMARCHY_LOCAL_AI_CATALOG"):
+    env["OMARCHY_LOCAL_AI_CATALOG"] = os.path.abspath(env["OMARCHY_LOCAL_AI_CATALOG"])
+  for name in ("OMARCHY_LOCAL_AI_CATALOG", "HF_TOKEN"):
+    if env.get(name):
+      command.append(f"--setenv={name}")
+  result = subprocess.run(command + [entry, "update", rid], capture_output=True, text=True, env=env)
+  if result.returncode != 0:
+    try:
+      os.unlink(updating_path(rid))
+    except OSError:
+      pass
+    raise LocalError(f"Can't start the update of {rid}: {(result.stderr.strip().splitlines() or ['systemd-run failed'])[-1]}")
+  write_status(catalog, profile)
+  say(f"Updating {rid} in the background; the agents panel shows it, or follow it with: journalctl --user -u {unit} -f")
 
 
 def cmd_stop(argv):
@@ -5122,6 +5249,7 @@ COMMANDS = {
   "status": cmd_status,
   "start": cmd_start,
   "stop": cmd_stop,
+  "update": cmd_update,
   "remove": cmd_remove,
   "share": cmd_share,
   "network": cmd_network,
@@ -5145,6 +5273,7 @@ SUMMARIES = {
   "status": "Show the models that are set up, and whether a better one is recommended",
   "start": "Start a model that's set up, the last one started by default",
   "stop": "Stop a model, or every running one",
+  "update": "Update a model that's set up to the catalog's runtime, weights and settings",
   "remove": "Remove a model's weights, manifests and unused image",
   "share": "Share a model with the other machines on your tailnet, or stop with --off",
   "network": "List the models shared on your tailnet, including hosts that are offline",

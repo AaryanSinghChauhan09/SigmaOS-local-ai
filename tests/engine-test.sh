@@ -747,6 +747,30 @@ with patch.object(a, "known_models", return_value=["current"]), patch.object(a, 
   pending = a.write_status(a.load_catalog(), profile, {"current": "activating"}, pending={"current": dict(updated, observed=None)})
 check("pending activation uses the current manifest's observations", pending["models"]["current"]["observed"] == manifest["observed"] and pending["models"]["current"]["unit"] == "activating")
 a.save_model(dict(manifest, recipe_id="survivor"), started=False)
+
+# An update is what setting a model up again from the catalog would change. A setup made from the
+# catalog as it is has none, and neither has one whose image only moved to another name.
+def update_for(recipe_now, runtime_now):
+  now = SimpleNamespace(recipes={"current": recipe_now}, runtimes={recipe_now["runtime"]: runtime_now})
+  with patch.object(a, "choose_gpu", return_value=gpu), patch.object(a, "compatibility", return_value=(manifest["variant"], "")):
+    return a.pending_update(manifest, now, profile)
+renamed = dict(runtime, image=runtime["image"].replace("/test/", "/moved/"))
+check("a model set up from the catalog as it is has no update", update_for(recipe, runtime) is None and update_for(recipe, renamed) is None)
+check("a new image digest is an update", update_for(recipe, dict(runtime, image=runtime["image"].replace("a" * 64, "b" * 64))) == {"image": True, "weights": False, "settings": False})
+repinned = dict(recipe, artifacts=[dict(recipe["artifacts"][0], revision="f" * 40)] + recipe["artifacts"][1:])
+check("a new weights pin is an update", update_for(repinned, runtime) == {"image": False, "weights": True, "settings": False})
+retuned = dict(recipe, server={"args": recipe.get("server", {}).get("args", []) + ["--slots", "2"]})
+check("new server arguments are an update", update_for(retuned, runtime) == {"image": False, "weights": False, "settings": True})
+check("a recipe the catalog dropped has no update", a.pending_update(manifest, SimpleNamespace(recipes={}, runtimes={}), profile) is None)
+# Updating is use with the context and GPU the model was set up with, and a model that was stopped stays stopped.
+for was_running, stops in ((False, 1), (True, 0)):
+  with patch.object(a, "load_catalog"), patch.object(a, "machine_profile", return_value=profile), patch.object(a, "write_status"), \
+       patch.object(a, "pending_update", return_value={"image": True, "weights": False, "settings": False}), \
+       patch.object(a, "unit_active", side_effect=[was_running, True]), patch.object(a, "cmd_use", return_value=0) as use, patch.object(a, "cmd_stop", return_value=0) as stop:
+    a.cmd_update(["current"])
+  check(f"update sets a {'running' if was_running else 'stopped'} model up again and leaves it that way",
+        use.call_args.args[0] == ["current", "--gpu", gpu["family"], "--ctx", str(a.load_model("current")["variant"]["ctx"])] and stop.call_count == stops and not Path(a.updating_path("current")).exists(),
+        f"{use.call_args} {stop.call_count}")
 with patch.object(a, "known_models", return_value=["current", "survivor"]), patch.object(a, "write_unit_files"), patch.object(a.subprocess, "run") as rmi:
   a._remove_files("current")
   check("removal retains an image used by a surviving current manifest", not rmi.called)
