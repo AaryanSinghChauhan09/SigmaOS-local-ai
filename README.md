@@ -39,7 +39,7 @@ The engine reads the catalog beside `agent_local.py`, following the installed en
 
 ## Build a runtime image
 
-A runtime whose image is built here has its Containerfile in `images/<runtime>/`: `llamacpp`, `sdcpp`, `sdcpp-cuda`, `acestep`, `tensorfold`, `tensorfold-dsv41` and `tensorfold-glm53`. The base image and upstream commits are pinned in the Containerfile, but packages come from the distribution at build time, so a rebuild gives a new digest even with nothing changed. To update one, for example to a newer llama.cpp:
+A runtime whose image is built here has its Containerfile in `images/<runtime>/`: `llamacpp`, `sdcpp`, `sdcpp-cuda`, `acestep`, `tensorfold`, `tensorfold-dsv41`, `tensorfold-glm53` and `tensorfold-nemotron-bolt`. The base image and upstream commits are pinned in the Containerfile, but packages come from the distribution at build time, so a rebuild gives a new digest even with nothing changed. To update one, for example to a newer llama.cpp:
 
 1. Change the pinned `COMMIT` and its `BUILD` tag, or the base digest, in `images/llamacpp/Containerfile`, in a pull request. CI builds the image to check it.
 2. Merging it publishes the image: `.github/workflows/llamacpp-image.yml` pushes `ghcr.io/omacom/llamacpp:<build>-<run>` and puts the digest to pin in the run's summary. Run the workflow by hand to rebuild without a change, for Arch's newer packages.
