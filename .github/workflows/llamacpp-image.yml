@@ -1,0 +1,66 @@
+name: Build llama.cpp image
+
+# Builds images/llamacpp on every pull request that changes it, and on master
+# also publishes it to ghcr.io/omacom/llamacpp, tagged with llama.cpp's build
+# and this workflow's run number. Publishing doesn't change what the catalog
+# runs: the digest in the run's summary still has to be pinned in
+# runtimes/llamacpp.toml, reviewed and measured (README, "Build a runtime image").
+
+on:
+  pull_request:
+    paths:
+      - images/llamacpp/**
+      - .github/workflows/llamacpp-image.yml
+  push:
+    branches: [master]
+    paths:
+      - images/llamacpp/**
+      - .github/workflows/llamacpp-image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: llamacpp-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Name the image
+        id: name
+        run: |
+          build=$(sed -n 's/^ARG BUILD=//p' images/llamacpp/Containerfile)
+          if [[ ! $build =~ ^b[0-9]+$ ]]; then
+            echo "::error file=images/llamacpp/Containerfile::ARG BUILD must be llama.cpp's build tag, like b12521"
+            exit 1
+          fi
+          echo "tag=ghcr.io/omacom/llamacpp:$build-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: podman build --pull -t "${{ steps.name.outputs.tag }}" images/llamacpp
+
+      - name: Check the server runs
+        run: podman run --rm --network none "${{ steps.name.outputs.tag }}" llama-server --version
+
+      - name: Publish
+        if: github.event_name != 'pull_request'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          podman push --digestfile digest "${{ steps.name.outputs.tag }}"
+          image="ghcr.io/omacom/llamacpp@$(cat digest)"
+          {
+            echo "Published \`${{ steps.name.outputs.tag }}\`. To run it, pin it in \`runtimes/llamacpp.toml\`, then review and measure it:"
+            echo
+            echo '```toml'
+            echo "image = \"$image\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
