@@ -154,6 +154,15 @@ check("an N1x laptop has a unified NVIDIA GPU of its own family", n1x["ram_class
 spark = dict(recipe, hardware=[{"gpu": "nvidia-gb10", "ram_class": 128, "measured": "measurements/model.toml"}])
 check("an N1x runs what a GB10 with the same memory runs", a.runtime_supports(dict(runtime, gpus=["nvidia-gb10"]), n1x["gpus"][0]) and a.match_class({"class": [dict(entry, gpu="nvidia-gb10", ram_class=128)]}, n1x, n1x["gpus"][0]) is not None)
 check("best treats the N1x and GB10 as one class", any("same selectors" in e for e in a.validate_best({"class": [dict(entry, gpu="nvidia-gb10", ram_class=128, recipes=["spark"]), dict(entry, gpu="nvidia-n1x", ram_class=128, recipes=["spark"])]}, {"spark": spark})))
+# Families that share a class may each have a measurement: a machine shows its own family's.
+shared = Path(os.environ["HOME"]) / "shared-measurements"
+shared.mkdir()
+for family, speed in (("gb10", 60.0), ("n1x", 50.0)):
+  (shared / f"{family}.toml").write_text(f"[long]\ndecode_tok_s = {speed}\n")
+both_measured = {"hardware": [{"gpu": "nvidia-gb10", "ram_class": 128, "measured": "gb10.toml"}, {"gpu": "nvidia-n1x", "ram_class": 128, "measured": "n1x.toml"}]}
+speeds = [a.load_measurement(SimpleNamespace(root=str(shared)), recipe, {"ram_class": 128, "platform": "aarch64"}, {"family": family})["long"]["decode_tok_s"]
+          for recipe, family in ((both_measured, "nvidia-n1x"), (both_measured, "nvidia-gb10"), ({"hardware": both_measured["hardware"][:1]}, "nvidia-n1x"))]
+check("a machine shows its own family's measurement, else its class's", speeds == [50.0, 60.0, 60.0], str(speeds))
 # An Intel laptop: integrated graphics on the xe driver counts as a GPU.
 drm = Path(os.environ["HOME"]) / "intel-drm"
 for driver in ("xe", "i915"):

@@ -1238,14 +1238,16 @@ def recipe_installed(rid):
 
 
 def load_measurement(catalog, recipe, profile, gpu):
-  """The bench numbers the catalog recorded for this recipe on this machine class."""
-  for hw in recipe.get("hardware", []):
-    if gpu_class(hw.get("gpu")) == gpu_class(gpu["family"]) and hw.get("ram_class") == profile["ram_class"] and hw.get("platform") in (None, profile["platform"]):
-      try:
-        with open(os.path.join(catalog.root, hw["measured"]), "rb") as handle:
-          return tomllib.load(handle)
-      except (OSError, KeyError, tomllib.TOMLDecodeError):
-        return {}
+  """The bench numbers the catalog recorded for this recipe on this machine class: its own
+  family's where it has them, else those of a family sharing the class (a GB10's for an N1x)."""
+  matches = [hw for hw in recipe.get("hardware", [])
+             if gpu_class(hw.get("gpu")) == gpu_class(gpu["family"]) and hw.get("ram_class") == profile["ram_class"] and hw.get("platform") in (None, profile["platform"])]
+  for hw in sorted(matches, key=lambda hw: hw.get("gpu") != gpu["family"])[:1]:
+    try:
+      with open(os.path.join(catalog.root, hw["measured"]), "rb") as handle:
+        return tomllib.load(handle)
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+      return {}
   return {}
 
 
