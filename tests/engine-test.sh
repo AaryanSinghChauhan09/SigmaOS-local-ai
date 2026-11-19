@@ -54,7 +54,7 @@ runtime = {
   "image": "registry.example/test/server@sha256:" + "a" * 64,
   "tier": "third-party", "review": "reviews/server.toml", "port": 8080,
   "health": {"probe": ["curl", "http://localhost:8080/health"]},
-  "command": ["server"], "reserved": ["--host", "API_KEY"], "gpus": ["amd"],
+  "command": ["server"], "reserved": ["--host", "API_KEY"], "gpus": ["amd"], "run": {"devices": ["render"]},
   "inputs": {"model": {"arg": "--model"}, "draft": {"arg": "--draft"},
              "ctx": {"arg": "--ctx"}, "alias": {"arg": "--alias"}, "key": {"env": "API_KEY"}},
 }
@@ -64,7 +64,7 @@ artifact = {"repo": "test/model", "revision": "b" * 40, "license": "mit",
 recipe = {"name": "Test model", "runtime": "server",
           "hardware": [{"gpu": "amd-strix-halo", "ram_class": 64, "measured": "measurements/model.toml"}],
           "artifacts": [artifact], "variant": [variant]}
-gpu = {"vendor": "amd", "family": "amd-strix-halo", "memory_gib": 48}
+gpu = {"vendor": "amd", "family": "amd-strix-halo", "memory_gib": 48, "render_node": "/dev/dri/renderD128"}
 profile = {"platform": "x86", "ram_class": 64, "ram_gib": 64, "gpus": [gpu]}
 entry = {"gpu": gpu["family"], "ram_class": 64, "recipes": ["model"]}
 check("valid recipe and runtime fixtures are accepted", not a.validate_runtime("server", runtime) and not a.validate_recipe("model", recipe, {"server": runtime}))
@@ -189,7 +189,8 @@ check("a runtime's gpus must be vendors or GPU classes its devices reach",
       any("gpus" in e for e in a.validate_runtime("server", dict(runtime, gpus=[])))
       and any("gpus" in e for e in a.validate_runtime("server", dict(runtime, gpus=["arm"])))
       and any("can't be reached" in e for e in a.validate_runtime("server", dict(runtime, gpus=["nvidia-gb10"], run={"devices": ["render"]})))
-      and any("can't be reached" in e for e in a.validate_runtime("server", dict(runtime, gpus=["intel"], run={"devices": ["render", "kfd"]}))))
+      and any("can't be reached" in e for e in a.validate_runtime("server", dict(runtime, gpus=["intel"], run={"devices": ["render", "kfd"]})))
+      and any("can't be reached" in e for e in a.validate_runtime("server", dict(runtime, gpus=["amd"], run={"devices": []}))))
 check("GPU peak exceeding capacity does not fit", not a.fits(dict(variant, peak_gpu_gib=49), profile, gpu)[0])
 check("RAM fit preserves desktop reserve", not a.fits(dict(variant, peak_ram_gib=57), profile, gpu)[0])
 with patch.object(a, "free_memory", return_value=(1, 1)), patch.object(a, "top_memory_users", return_value="browser (12 GiB), editor (4 GiB)"), patch.object(a.time, "sleep"):

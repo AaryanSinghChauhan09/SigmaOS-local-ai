@@ -677,7 +677,7 @@ def validate_runtime(rid, runtime, root=None):
   else:
     for entry in gpus:
       vendor = entry.split("-")[0]
-      if (vendor == "nvidia") != ("cdi-nvidia" in devices) or (vendor == "intel" and "kfd" in devices):
+      if (vendor == "nvidia") != ("cdi-nvidia" in devices) or (vendor != "nvidia" and "render" not in devices) or (vendor == "intel" and "kfd" in devices):
         errors.append(f"{where}.gpus: {entry} can't be reached through devices {devices}")
   port = runtime.get("port")
   if not isinstance(port, int) or not 1 <= port <= 65535:
