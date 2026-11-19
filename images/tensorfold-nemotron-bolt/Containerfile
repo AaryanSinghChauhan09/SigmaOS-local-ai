@@ -49,7 +49,9 @@ RUN git init -q /bolt && cd /bolt && git remote add origin "${BOLT_REPO}" && \
     cd /tensorfold && \
     for p in /bolt/patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done && \
     cp /opt/bolt-engine/bolt_native.zig /opt/bolt-engine/bolt_api.zig zig/src/families/nemotron/ && rm -rf /bolt
-RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dbolt-src=/opt/bolt-engine -Dffmpeg=/opt/ffmpeg \
+# The GB10's and N1x's CPU, so the build is the same on any aarch64 machine.
+ARG ZIG_CPU=cortex_x925
+RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dcpu=${ZIG_CPU} -Dbolt-src=/opt/bolt-engine -Dffmpeg=/opt/ffmpeg \
       -Dxgrammar=/opt/xgrammar -Doptimize=fast --prefix /opt/tensorfold -j"$(nproc)" install native bolt video grammar && \
     cp -a /opt/jpeg/lib/libturbojpeg.so.0* /opt/tensorfold/native/lib/ && \
     test -x /opt/tensorfold/native/bin/tensorfold-native && \

@@ -113,42 +113,58 @@ jobs:
       - name: Install podman
         run: command -v podman || { sudo apt-get update && sudo apt-get install -y podman; }
 
+      # A pull request controls the Containerfile, so what it says reaches the shell only through
+      # environment variables, and the version only once it is a plain tag.
       - name: Name the image
         id: name
+        env:
+          NAME: ${{ matrix.name }}
+          RUN: ${{ github.run_number }}
         run: |
-          file=images/${{ matrix.name }}/Containerfile
+          file=images/$NAME/Containerfile
           # llama.cpp's build tag, TensorFold's version, or the upstream commit, shortened.
           for arg in BUILD TF_VERSION TF_REF COMMIT; do
             version=$(sed -n "s/^ARG $arg=//p" "$file" | head -1)
             [[ -n $version ]] && break
           done
           [[ $version =~ ^[0-9a-f]{40}$ ]] && version=${version:0:8}
-          if [[ -z $version ]]; then
-            echo "::error file=$file::pin the upstream in ARG BUILD, TF_VERSION, TF_REF or COMMIT"
+          if [[ ! $version =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+            echo "::error file=$file::pin the upstream in ARG BUILD, TF_VERSION, TF_REF or COMMIT, as letters, digits, dots, dashes and underscores"
             exit 1
           fi
-          echo "tag=ghcr.io/omacom/omarchy-local-ai/${{ matrix.name }}:$version-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "tag=ghcr.io/omacom/omarchy-local-ai/$NAME:$version-$RUN" >> "$GITHUB_OUTPUT"
 
       # Docker format keeps a Containerfile's SHELL in the image, as the GLM build relies on.
       - name: Build
+        env:
+          TAG: ${{ steps.name.outputs.tag }}
+          NAME: ${{ matrix.name }}
+          SOURCE: https://github.com/${{ github.repository }}
+          REVISION: ${{ github.sha }}
         run: |
-          podman build --pull --format docker -t "${{ steps.name.outputs.tag }}" \
-            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
-            --label org.opencontainers.image.revision=${{ github.sha }} images/${{ matrix.name }}
+          podman build --pull --format docker -t "$TAG" \
+            --label org.opencontainers.image.source="$SOURCE" \
+            --label org.opencontainers.image.revision="$REVISION" "images/$NAME"
 
       - name: Check the server is there
-        run: podman run --rm --network none --entrypoint sh "${{ steps.name.outputs.tag }}" -c '${{ matrix.check }}'
+        env:
+          TAG: ${{ steps.name.outputs.tag }}
+          CHECK: ${{ matrix.check }}
+        run: podman run --rm --network none --entrypoint sh "$TAG" -c "$CHECK"
 
       - name: Publish
         if: github.event_name != 'pull_request'
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          TAG: ${{ steps.name.outputs.tag }}
+          NAME: ${{ matrix.name }}
         run: |
-          echo "$TOKEN" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
-          podman push --digestfile digest "${{ steps.name.outputs.tag }}"
-          image="ghcr.io/omacom/omarchy-local-ai/${{ matrix.name }}@$(cat digest)"
+          echo "$TOKEN" | podman login ghcr.io -u "$ACTOR" --password-stdin
+          podman push --digestfile digest "$TAG"
+          image="ghcr.io/omacom/omarchy-local-ai/$NAME@$(cat digest)"
           {
-            echo "Published \`${{ steps.name.outputs.tag }}\`. To run it, pin it in its runtime under \`runtimes/\`, then review and measure it:"
+            echo "Published \`$TAG\`. To run it, pin it in its runtime under \`runtimes/\`, then review and measure it:"
             echo
             echo '```toml'
             echo "image = \"$image\""
