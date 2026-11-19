@@ -1,0 +1,77 @@
+name: Build sdcpp image
+
+# Builds images/sdcpp on every pull request that changes it, and on master
+# also publishes it to ghcr.io/omacom/sdcpp, tagged with the first 12 hex of
+# the pinned upstream commit and this workflow's run number. Publishing doesn't
+# change what the catalog runs: the digest in the run's summary still has to
+# be pinned in runtimes/sdcpp.toml, reviewed and measured (README, "Build a
+# runtime image").
+
+on:
+  pull_request:
+    paths:
+      - images/sdcpp/**
+      - .github/workflows/sdcpp-image.yml
+  push:
+    branches: [master]
+    paths:
+      - images/sdcpp/**
+      - .github/workflows/sdcpp-image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: sdcpp-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Name the image
+        id: name
+        run: |
+          commit=$(sed -n 's/^ARG COMMIT=//p' images/sdcpp/Containerfile)
+          if [[ ! $commit =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error file=images/sdcpp/Containerfile::ARG COMMIT must be a full upstream commit"
+            exit 1
+          fi
+          echo "tag=ghcr.io/omacom/sdcpp:${commit:0:12}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: podman build --pull -t "${{ steps.name.outputs.tag }}" images/sdcpp
+
+      # The runner's own CPU may have AVX-512, so running the server here proves
+      # nothing about the laptops it ships to: its code must stop at AVX2.
+      - name: Check the server runs on any x86-64 with AVX2
+        run: |
+          container=$(podman create "${{ steps.name.outputs.tag }}")
+          podman cp "$container:/usr/bin/sd-server" "$RUNNER_TEMP/sd-server"
+          podman rm "$container"
+          if objdump -d "$RUNNER_TEMP/sd-server" | grep -q '%zmm'; then
+            echo "::error::sd-server uses AVX-512, which Intel laptops and older AMD machines don't have"
+            exit 1
+          fi
+          podman run --rm --network none "${{ steps.name.outputs.tag }}" ls /usr/share/vulkan/icd.d/radeon_icd.json /usr/share/vulkan/icd.d/intel_icd.json
+
+      - name: Publish
+        if: github.event_name != 'pull_request'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          podman push --digestfile digest "${{ steps.name.outputs.tag }}"
+          image="ghcr.io/omacom/sdcpp@$(cat digest)"
+          {
+            echo "Published \`${{ steps.name.outputs.tag }}\`. To run it, pin it in \`runtimes/sdcpp.toml\`, then review and measure it:"
+            echo
+            echo '```toml'
+            echo "image = \"$image\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
