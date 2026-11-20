@@ -2120,22 +2120,42 @@ def post_start_checks(rid, key, runtime=None):
     raise LocalError(f"Port {port_for(rid)} is serving {', '.join(map(str, ids)) or 'an unknown model'}, not {rid}")
 
 
-def warmup_vocabulary(rid):
-  """The model's own vocabulary, from the tokenizer.json in its files, as text pieces."""
-  base = os.path.join(data_dir(), "models", rid)
-  for directory, _, names in os.walk(base):
-    if "tokenizer.json" in names and directory.count(os.sep) - base.count(os.sep) <= 3:
-      try:
-        with open(os.path.join(directory, "tokenizer.json"), encoding="utf-8") as handle:
-          vocab = json.load(handle)["model"]["vocab"]
-      except (OSError, ValueError, KeyError, TypeError):
-        return []
-      return [piece.replace("\u0120", " ").replace("\u010a", "\n") for piece in vocab
-              if not piece.startswith("<") and "\ufffd" not in piece]
+def warmup_vocabulary(rid, fileset):
+  """The model's own vocabulary, from the tokenizer.json in its file set, as text pieces. Only the
+  file set: a rank folder's links into /models resolve inside the container, not here."""
+  base = os.path.join(data_dir(), "models", rid, fileset)
+  for directory, _, names in sorted(os.walk(base)):
+    if "tokenizer.json" not in names or directory.count(os.sep) - base.count(os.sep) > 2:
+      continue
+    try:
+      with open(os.path.join(directory, "tokenizer.json"), encoding="utf-8") as handle:
+        vocab = json.load(handle)["model"]["vocab"]
+    except (OSError, ValueError, KeyError, TypeError):
+      continue
+    return [piece.replace("\u0120", " ").replace("\u010a", "\n") for piece in vocab
+            if not piece.startswith("<") and "\ufffd" not in piece]
   return []
 
 
-def warm_up(rid, key, runtime):
+def warming_path(rid):
+  return os.path.join(state_dir(), "warming", rid)
+
+
+def warming(rid):
+  """Whether a warm-up holds the model back from running: its marker names a live process."""
+  pid = _read(warming_path(rid))
+  if not pid.isdigit():
+    return False
+  try:
+    os.kill(int(pid), 0)
+  except ProcessLookupError:
+    return False
+  except PermissionError:
+    pass
+  return True
+
+
+def warm_up(rid, fileset, key, runtime, publish=None):
   """Some servers run their first prompts slowly while they settle in, by what the prompts route
   through: DeepSeek's pair ran a quarter of its speed until it had met most of its experts. A
   runtime naming warmup gets that many prompts of its own vocabulary drawn at random (pieces, which
@@ -2144,12 +2164,26 @@ def warm_up(rid, key, runtime):
   warmup = runtime.get("warmup")
   if not warmup:
     return
-  pieces = warmup_vocabulary(rid)
+  pieces = warmup_vocabulary(rid, fileset)
   if not pieces:
     say("No tokenizer.json in the model's files to warm it up with")
     return
   say("Warming up")
   started = time.time()
+  # Its unit is already active: the marker keeps status showing it loading until this is done.
+  ensure_dir(os.path.dirname(warming_path(rid)))
+  write_atomic(warming_path(rid), f"{os.getpid()}\n")
+  if publish:
+    publish()
+  try:
+    send_warmup(rid, key, warmup, pieces)
+  finally:
+    with contextlib.suppress(FileNotFoundError):
+      os.unlink(warming_path(rid))
+  say(f"Warmed up in {time.time() - started:.0f}s")
+
+
+def send_warmup(rid, key, warmup, pieces):
   for n in range(warmup["prompts"]):
     rng = random.Random(f"{rid}-{n}-{time.time()}")
     text = f"Warm-up {n} {rng.random()}.\n" + "".join(rng.choice(pieces) for _ in range(warmup["pieces"]))
@@ -2163,7 +2197,6 @@ def warm_up(rid, key, runtime):
     except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
       say(f"  warm-up stopped after {n} prompts: {error}")
       return
-  say(f"Warmed up in {time.time() - started:.0f}s")
 
 
 def free_memory(gpu):
@@ -3161,7 +3194,7 @@ def activate(manifest, recipe, runtime, gpu, key, catalog, profile):
     "ram_used_gib": ram_used_gib(manifest, before_ram, after_ram, before_peer, peer_free_gib(manifest)),
     "gpu_used_gib": round(before_gpu - after_gpu, 1),
   }
-  warm_up(rid, key, runtime)
+  warm_up(rid, manifest["fileset"], key, runtime, publish=lambda: write_status(catalog, profile))
 
 
 # ---------------------------------------------------------------- commands
@@ -3427,6 +3460,8 @@ def model_record(rid, manifest, profile):
   removing = _read(removing_path(rid))
   if removing:
     unit = "removing"
+  elif unit == "active" and warming(rid):
+    unit = "activating"
   recipe = manifest["recipe"]
   vendor = recipe.get("vendor", "")
   observed = manifest.get("observed") or {}
@@ -3503,6 +3538,7 @@ def pending_update(manifest, catalog, profile):
       setup = (manifest["roles"], gpu, manifest["fileset"])
       # A pair's workers are started from its manifest's own pair table, not the unit.
       change["settings"] = (runtime.get("pair") != manifest["runtime"].get("pair")
+                            or runtime.get("warmup") != manifest["runtime"].get("warmup")
                             or render_container(rid, recipe, dict(runtime, image=manifest["image"]), variant, *setup)
                             != render_container(rid, manifest["recipe"], dict(manifest["runtime"], image=manifest["image"]), manifest["variant"], *setup))
   except (LocalError, KeyError, TypeError):
@@ -3908,7 +3944,7 @@ def _start(args, catalog, profile):
     # Timed from the same moment the panel's bar starts from, the click.
     write_atomic(load_seconds_path(rid), f"{time.time() - started:.1f}\n")
     # Still shown as starting while it warms up.
-    warm_up(rid, ensure_key(), manifest.get("runtime") or {})
+    warm_up(rid, manifest["fileset"], ensure_key(), manifest.get("runtime") or {}, publish=lambda: write_status(catalog, profile))
   write_status(catalog, profile)
   if result.returncode != 0:
     raise LocalError(f"{rid} didn't start: {result.stderr.strip()}\n{journal_tail(rid)}")
