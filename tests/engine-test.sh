@@ -677,7 +677,7 @@ with patch.object(a, "unit_props", return_value={"InactiveExitTimestamp": "@%d" 
   a.record_error("crashy", "Locked memory limited: run link setup")
   check("a reason the start already recorded isn't overwritten", a.failure_reason("crashy", "exit-code") == "Locked memory limited: run link setup")
 with patch.object(a, "unit_props", return_value={"InactiveExitTimestamp": "@%d" % int(__import__("time").time() + 60)}), patch.object(a, "journal_tail", return_value="nothing useful"):
-  check("an older reason gives way, and with no server error systemd's result is shown", a.failure_reason("crashy", "exit-code") == "Stopped unexpectedly (exit-code)")
+  check("an older reason gives way, and with no server error it stopped unexpectedly, without systemd's result code", a.failure_reason("crashy", "exit-code") == "Stopped unexpectedly")
 a.clear_error("crashy")
 # logs prints the last error, the model's journal and, for a pair, rank 1's log from the peer.
 a.record_error("crashy", "Locked memory limited: run link setup")
@@ -788,7 +788,7 @@ check("pending activation uses the current manifest's observations", pending["mo
 a.save_model(dict(manifest, recipe_id="survivor"), started=False)
 # Reading a failed model's logs dismisses the failure: the recorded reason goes, and so does the
 # unit's failed state, which reads as stopped unexpectedly for as long as it stays.
-a.record_error("current", "Stopped unexpectedly (exit-code)")
+a.record_error("current", "Stopped unexpectedly")
 with patch.object(a, "load_catalog"), patch.object(a, "machine_profile", return_value=profile), patch.object(a, "write_status") as wrote, \
      patch.object(a, "unit_active", return_value=False), patch.object(a, "systemctl") as ctl:
   a.cmd_dismiss(["current"])

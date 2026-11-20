@@ -1936,7 +1936,9 @@ def failure_reason(rid, result):
       match = SERVER_ERROR_RE.match(line.strip())
       if match:
         return match.group(2).strip()[:160]
-  return f"Stopped unexpectedly ({result})"
+  # systemd's result ("exit-code", "signal") says nothing to the person reading the panel: the
+  # logs the line links to say what happened.
+  return "Stopped unexpectedly"
 
 
 def journal_tail(rid, lines=15, since_ms=None):
@@ -3444,7 +3446,7 @@ def model_record(rid, manifest, profile):
   if error.startswith(NOT_ENOUGH_MEMORY):
     error = ""
   if not error and unit == "failed":
-    error = f"Stopped unexpectedly ({props.get('Result') or 'failed'})"
+    error = "Stopped unexpectedly"
   return {
     # Why the last start failed, shown where the progress bar was.
     "error": error,
