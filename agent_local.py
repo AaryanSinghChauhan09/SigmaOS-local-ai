@@ -3386,10 +3386,15 @@ def clip_seconds(video, peak_gpu_gib, room_gib):
   return longest
 
 
-def add_clip_lengths(record, catalog, profile):
+def add_clip_lengths(record, catalog, profile, pending=None):
   """Gives each video model the longest clip it can make here now: its GPU's memory less the
   peaks of the other models on that GPU, any of which may be making something at the same time.
-  A model on its way down still holds its memory until its unit is gone."""
+  A model on its way down still holds its memory until its unit is gone, and one being set up
+  holds it from the start, before its setup is saved. A GPU that shares the machine's RAM is
+  bounded by that too: the RAM left once the desktop's reserve and the other models' peaks are
+  taken."""
+  pending = pending or {}
+  manifest_of = lambda rid: pending.get(rid) or load_model(rid)
   def gpu_of(manifest):
     try:
       gpu = choose_gpu(profile, manifest.get("gpu"))
@@ -3400,19 +3405,23 @@ def add_clip_lengths(record, catalog, profile):
     return gpu, (family, gpu.get("render_node", ""), gpu.get("sysfs", ""))
   holding = {}
   for rid, model in record["models"].items():
-    manifest = load_model(rid) if model["unit"] in ("active", "activating", "deactivating", "removing") else None
+    loaded = rid in pending or model["unit"] in ("active", "activating", "deactivating", "removing")
+    manifest = manifest_of(rid) if loaded else None
     found = gpu_of(manifest) if manifest else None
     if found:
-      holding[rid] = (found[1], manifest["variant"]["peak_gpu_gib"])
+      holding[rid] = (found[1], manifest["variant"]["peak_gpu_gib"], manifest["variant"]["peak_ram_gib"])
   for rid, model in record["models"].items():
     recipe = catalog.recipes.get(rid) or {}
-    manifest = load_model(rid)
+    manifest = manifest_of(rid)
     found = gpu_of(manifest) if model.get("kind") == "video" and recipe.get("video") and manifest else None
     if not found:
       continue
     gpu, card = found
-    others = sum(peak for other_id, (other_card, peak) in holding.items() if other_id != rid and other_card == card)
-    model["max_seconds"] = clip_seconds(recipe["video"], manifest["variant"]["peak_gpu_gib"], gpu["memory_gib"] - others)
+    others = {other_id: held for other_id, held in holding.items() if other_id != rid}
+    room = gpu["memory_gib"] - sum(peak_gpu for other_card, peak_gpu, _ in others.values() if other_card == card)
+    if gpu.get("unified"):
+      room = min(room, profile["ram_gib"] - RESERVE_GIB - sum(peak_ram for _, _, peak_ram in others.values()))
+    model["max_seconds"] = clip_seconds(recipe["video"], manifest["variant"]["peak_gpu_gib"], room)
 
 
 def model_record(rid, manifest, profile):
@@ -3680,7 +3689,7 @@ def write_status(catalog, profile, transitions=None, pending=None, publish=True)
         record["models"][rid]["since_ms"] = now if unit in ("activating", "deactivating") else None
         if unit == "active":
           record["models"][rid]["error"] = ""
-    add_clip_lengths(record, catalog, profile)
+    add_clip_lengths(record, catalog, profile, pending)
     write_atomic(os.path.join(state_dir(), "status.json"), json.dumps(record, indent=2) + "\n")
     # The tailnet sees the same transitions: a shared model's listing is
     # republished with every status write that changes it.

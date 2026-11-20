@@ -235,7 +235,7 @@ check("a recipe's clip table is checked", any(".video.gib_per_frame" in e for e 
       and any(".video:" in e for e in a.validate_recipe("t", {"runtime": "x", "video": h3}, {})))
 catalog_h3 = SimpleNamespace(recipes={"h3": {"kind": "video", "video": h3}})
 record = {"models": {"h3": {"kind": "video", "unit": "active"}, "klein": {"kind": "image", "unit": "active"}}}
-manifests = {"h3": {"variant": {"peak_gpu_gib": 38}}, "klein": {"variant": {"peak_gpu_gib": 12}}}
+manifests = {"h3": {"variant": {"peak_gpu_gib": 38, "peak_ram_gib": 38}}, "klein": {"variant": {"peak_gpu_gib": 12, "peak_ram_gib": 12}}}
 with patch.object(a, "load_model", side_effect=manifests.get), patch.object(a, "choose_gpu", return_value=dict(gpu, memory_gib=54)):
   a.add_clip_lengths(record, catalog_h3, profile)
 check("another running model's peak comes off the clip's room", record["models"]["h3"]["max_seconds"] == 3 and "max_seconds" not in record["models"]["klein"])
@@ -245,16 +245,25 @@ with patch.object(a, "load_model", side_effect=manifests.get), patch.object(a, "
 check("a model still stopping keeps its memory", record["models"]["h3"]["max_seconds"] == 3)
 record = {"models": {"h3": {"kind": "video", "unit": "active"}, "klein": {"kind": "image", "unit": "active"}}}
 cards = {"amd-a": dict(gpu, family="amd-a", memory_gib=54), "amd-b": dict(gpu, family="amd-b", memory_gib=24)}
-split = {"h3": {"gpu": "amd-a", "variant": {"peak_gpu_gib": 38}}, "klein": {"gpu": "amd-b", "variant": {"peak_gpu_gib": 12}}}
+split = {"h3": {"gpu": "amd-a", "variant": {"peak_gpu_gib": 38, "peak_ram_gib": 38}}, "klein": {"gpu": "amd-b", "variant": {"peak_gpu_gib": 12, "peak_ram_gib": 12}}}
 with patch.object(a, "load_model", side_effect=split.get), patch.object(a, "choose_gpu", side_effect=lambda profile, family=None: cards[family]):
   a.add_clip_lengths(record, catalog_h3, profile)
 check("a model on another GPU leaves the clip's room alone", record["models"]["h3"]["max_seconds"] == 6)
 record = {"models": {"h3": {"kind": "video", "unit": "active"}, "big": {"kind": "text", "unit": "active"}}}
 spark = {"nvidia-gb10": dict(gpu, family="nvidia-gb10", memory_gib=120), "nvidia-gb10-pair": dict(gpu, family="nvidia-gb10-pair", nodes=2, memory_gib=120)}
-paired = {"h3": {"gpu": "nvidia-gb10", "variant": {"peak_gpu_gib": 46}}, "big": {"gpu": "nvidia-gb10-pair", "variant": {"peak_gpu_gib": 70}}}
+paired = {"h3": {"gpu": "nvidia-gb10", "variant": {"peak_gpu_gib": 46, "peak_ram_gib": 46}}, "big": {"gpu": "nvidia-gb10-pair", "variant": {"peak_gpu_gib": 70, "peak_ram_gib": 70}}}
 with patch.object(a, "load_model", side_effect=paired.get), patch.object(a, "choose_gpu", side_effect=lambda profile, family=None: spark[family]):
   a.add_clip_lengths(record, catalog_h3, profile)
 check("a paired model on linked Sparks shares the clip's GPU", record["models"]["h3"]["max_seconds"] == 3)
+record = {"models": {"h3": {"kind": "video", "unit": "active"}, "klein": {"kind": "image", "unit": "installing"}}}
+with patch.object(a, "load_model", side_effect={"h3": manifests["h3"]}.get), patch.object(a, "choose_gpu", return_value=dict(gpu, memory_gib=54)):
+  a.add_clip_lengths(record, catalog_h3, profile, pending={"klein": manifests["klein"]})
+check("a model being set up holds its memory before its setup is saved", record["models"]["h3"]["max_seconds"] == 3)
+record = {"models": {"h3": {"kind": "video", "unit": "active"}, "qwen": {"kind": "text", "unit": "active"}}}
+unified = {"h3": {"variant": {"peak_gpu_gib": 46, "peak_ram_gib": 46}}, "qwen": {"variant": {"peak_gpu_gib": 30, "peak_ram_gib": 40}}}
+with patch.object(a, "load_model", side_effect=unified.get), patch.object(a, "choose_gpu", return_value=dict(gpu, family="nvidia-gb10", unified=True, memory_gib=120)):
+  a.add_clip_lengths(record, catalog_h3, dict(profile, ram_gib=120))
+check("a GPU sharing RAM leaves room for the desktop and the other models' RAM", record["models"]["h3"]["max_seconds"] == 9)
 
 # The root script against a limine-mkinitcpio that fails a kernel and still exits 0, as it does.
 fake = Path(os.environ["HOME"]) / "fake-limine"
