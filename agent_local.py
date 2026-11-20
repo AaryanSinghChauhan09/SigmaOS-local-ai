@@ -16,6 +16,7 @@ import hashlib
 import ipaddress
 import itertools
 import json
+import math
 import os
 import posixpath
 import pty
@@ -864,8 +865,9 @@ def validate_recipe(rid, recipe, runtimes, root=None):
   if "edit" in recipe and (not isinstance(recipe["edit"], bool) or kind != "image"):
     errors.append(f"{where}.edit: true or false, for image models only")
   # What a setup downloads, for a first-run screen to say before it starts.
-  if "download_gib" in recipe and (not isinstance(recipe["download_gib"], (int, float)) or isinstance(recipe["download_gib"], bool) or recipe["download_gib"] <= 0):
-    errors.append(f"{where}.download_gib: must be a positive number")
+  if "download_gib" in recipe and (not isinstance(recipe["download_gib"], (int, float)) or isinstance(recipe["download_gib"], bool)
+                                   or not math.isfinite(recipe["download_gib"]) or recipe["download_gib"] <= 0):
+    errors.append(f"{where}.download_gib: must be a finite positive number")
   # Dense or mixture of experts, shown on the recipe's card.
   if "architecture" in recipe and recipe["architecture"] not in ARCHITECTURES:
     errors.append(f"{where}.architecture: must be one of {', '.join(ARCHITECTURES)}")
