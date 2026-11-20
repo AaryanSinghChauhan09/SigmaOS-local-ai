@@ -231,6 +231,8 @@ h3 = {"fps": 24, "max_seconds": 15, "reference_frames": 56, "gib_per_frame": 0.1
 check("a 64 GB Strix Halo's 54 GiB makes up to 6 s, not 10", a.clip_seconds(h3, 38, 54) == 6)
 check("a GPU with room for all of it makes the model's longest", a.clip_seconds(h3, 38, 280) == 15)
 check("a GPU without room for a second makes none", a.clip_seconds(h3, 38, 30) == 0)
+check("a recipe's download size is checked", all(any(".download_gib" in e for e in a.validate_recipe("v", {"kind": "image", "runtime": "x", "download_gib": size}, {}))
+                                                  for size in (0, float("nan"), float("inf"))))
 check("a recipe's clip table is checked", any(".video.gib_per_frame" in e for e in a.validate_recipe("v", {"kind": "video", "runtime": "x", "video": dict(h3, gib_per_frame=0)}, {}))
       and any(".video:" in e for e in a.validate_recipe("t", {"runtime": "x", "video": h3}, {})))
 catalog_h3 = SimpleNamespace(recipes={"h3": {"kind": "video", "video": h3}})

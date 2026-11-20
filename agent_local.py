@@ -16,6 +16,7 @@ import hashlib
 import ipaddress
 import itertools
 import json
+import math
 import os
 import posixpath
 import pty
@@ -863,6 +864,10 @@ def validate_recipe(rid, recipe, runtimes, root=None):
   # rather than redrawing it from a description.
   if "edit" in recipe and (not isinstance(recipe["edit"], bool) or kind != "image"):
     errors.append(f"{where}.edit: true or false, for image models only")
+  # What a setup downloads, for a first-run screen to say before it starts.
+  if "download_gib" in recipe and (not isinstance(recipe["download_gib"], (int, float)) or isinstance(recipe["download_gib"], bool)
+                                   or not math.isfinite(recipe["download_gib"]) or recipe["download_gib"] <= 0):
+    errors.append(f"{where}.download_gib: must be a finite positive number")
   # Dense or mixture of experts, shown on the recipe's card.
   if "architecture" in recipe and recipe["architecture"] not in ARCHITECTURES:
     errors.append(f"{where}.architecture: must be one of {', '.join(ARCHITECTURES)}")
@@ -1246,6 +1251,8 @@ def recipe_listing(catalog, profile, running=()):
       # What the card shows: the measured footprint, context and speed at a
       # long prompt on this machine class.
       "memory_gib": variant["peak_ram_gib"] if variant else None,
+      # What its setup downloads, when the recipe says.
+      "download_gib": recipe.get("download_gib"),
       "context": variant.get("ctx") if variant else None,
       "decode_tok_s": measured.get("long", {}).get("decode_tok_s"),
       "prefill_tok_s": measured.get("long", {}).get("prefill_tok_s"),
