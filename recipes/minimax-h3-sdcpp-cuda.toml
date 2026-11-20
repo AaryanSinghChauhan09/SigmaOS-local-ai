@@ -9,6 +9,8 @@ name = "MiniMax H3"
 vendor = "minimax"
 kind = "video"
 runtime = "sdcpp-cuda"
+# What a setup downloads: the files the artifacts below pin, not the runtime image.
+download_gib = 41.47
 
 [[hardware]]
 gpu = "nvidia-n1x"
