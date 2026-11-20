@@ -1,4 +1,4 @@
-# llama.cpp's llama-server, built with Vulkan for Intel GPUs, as
+# llama.cpp's llama-server, built with Vulkan for AMD and Intel GPUs, as
 # runtimes/llamacpp.toml runs it, published as ghcr.io/omacom/omarchy-local-ai/llamacpp.
 # Built from ggml-org/llama.cpp at a pinned commit with no patches. Everything
 # is from Arch Linux's packages at the pinned base: upstream's own image is
@@ -29,9 +29,9 @@ RUN mkdir -p /licenses \
     | while read -r file; do install -Dm644 "$file" "/licenses/${file#./}"; done
 
 FROM ${BASE}
-# The Vulkan loader and Mesa's ANV driver, which run the GPU; curl for the
-# health probe; libgomp for the CPU backends.
-RUN pacman -Syu --noconfirm --needed vulkan-icd-loader vulkan-intel curl gcc-libs \
+# The Vulkan loader and Mesa's RADV and ANV drivers, which run AMD and Intel
+# GPUs; curl for the health probe; libgomp for the CPU backends.
+RUN pacman -Syu --noconfirm --needed vulkan-icd-loader vulkan-radeon vulkan-intel curl gcc-libs \
  && pacman -Scc --noconfirm
 COPY --from=build /out/usr/bin/ /usr/bin/
 COPY --from=build /out/usr/lib/ /usr/lib/
