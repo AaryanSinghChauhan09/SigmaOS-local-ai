@@ -19,6 +19,13 @@ min_available_during_bench_gib = 8.5
 total_gib = 62.1
 peak_gpu_gib = 36.2
 
+# A 5 s clip, 864x480 and 124 frames, peaked at 46.7 GiB of GPU memory and took 510 s. A 10 s
+# clip doesn't fit beside the desktop on this machine.
+[[clip]]
+frames = 124
+peak_gpu_gib = 46.7
+seconds = 510
+
 [generation]
 width = 864
 height = 480
