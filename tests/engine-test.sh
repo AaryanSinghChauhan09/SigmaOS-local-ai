@@ -777,6 +777,13 @@ with patch.object(a, "known_models", return_value=["current"]), patch.object(a, 
   pending = a.write_status(a.load_catalog(), profile, {"current": "activating"}, pending={"current": dict(updated, observed=None)})
 check("pending activation uses the current manifest's observations", pending["models"]["current"]["observed"] == manifest["observed"] and pending["models"]["current"]["unit"] == "activating")
 a.save_model(dict(manifest, recipe_id="survivor"), started=False)
+# Reading a failed model's logs dismisses the failure: the recorded reason goes, and so does the
+# unit's failed state, which reads as stopped unexpectedly for as long as it stays.
+a.record_error("current", "Stopped unexpectedly (exit-code)")
+with patch.object(a, "load_catalog"), patch.object(a, "machine_profile", return_value=profile), patch.object(a, "write_status") as wrote, \
+     patch.object(a, "unit_active", return_value=False), patch.object(a, "systemctl") as ctl:
+  a.cmd_dismiss(["current"])
+check("dismissing a failure forgets its reason and resets the unit", not Path(a.error_path("current")).exists() and ctl.call_args.args == ("reset-failed", a.unit_name("current")) and wrote.called)
 
 # An update is what setting a model up again from the catalog would change. A setup made from the
 # catalog as it is has none, and neither has one whose image only moved to another name.
