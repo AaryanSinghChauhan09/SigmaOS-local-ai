@@ -168,7 +168,13 @@ jobs:
             echo "::error::$server uses AVX-512, which Intel laptops and older AMD machines don't have"
             exit 1
           fi
-          podman run --rm --network none "$TAG" ls /usr/share/vulkan/icd.d/radeon_icd.json /usr/share/vulkan/icd.d/intel_icd.json
+
+      # The Vulkan images run on AMD and Intel GPUs alike, through Mesa's RADV and ANV.
+      - name: Check the image carries Mesa's AMD and Intel drivers
+        if: matrix.name == 'llamacpp' || matrix.name == 'sdcpp' || matrix.name == 'acestep'
+        env:
+          TAG: ${{ steps.name.outputs.tag }}
+        run: podman run --rm --network none --entrypoint ls "$TAG" /usr/share/vulkan/icd.d/radeon_icd.json /usr/share/vulkan/icd.d/intel_icd.json
 
       - name: Publish
         if: github.event_name != 'pull_request'

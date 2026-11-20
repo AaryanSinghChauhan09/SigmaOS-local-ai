@@ -48,7 +48,7 @@ A runtime whose image is built here has its Containerfile in `images/<image>/`: 
 5. Set the image up with `./omarchy-local-ai use <recipe>` and rebench every recipe on that runtime with `./tools/bench`, since a measurement records the image it was measured on.
 6. Run `./omarchy-local-ai validate .` and `./tests/engine-test.sh`, and submit the runtime, review and measurements together.
 
-The `sdcpp` and `acestep` builds also fail if the server uses AVX-512, which Intel laptops and older AMD machines don't have, or lacks Mesa's AMD or Intel driver.
+The `llamacpp`, `sdcpp` and `acestep` builds also fail if the image lacks Mesa's AMD or Intel driver, and the `sdcpp` and `acestep` ones if the server uses AVX-512, which Intel laptops and older AMD machines don't have.
 
 To build one locally instead: `podman build --format docker -t llamacpp images/llamacpp`. The GB10 and N1x images build on arm64 runners and the others on x86, as in the workflow's table; a new folder needs a line there.
 
