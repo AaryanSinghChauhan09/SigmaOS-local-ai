@@ -807,6 +807,7 @@ repinned = dict(recipe, artifacts=[dict(recipe["artifacts"][0], revision="f" * 4
 check("a new weights pin is an update", update_for(repinned, runtime) == {"image": False, "weights": True, "settings": False, "download_bytes": None})
 retuned = dict(recipe, server={"args": recipe.get("server", {}).get("args", []) + ["--slots", "2"]})
 check("new server arguments are an update", update_for(retuned, runtime) == {"image": False, "weights": False, "settings": True, "download_bytes": None})
+check("a new warm-up is an update", update_for(recipe, dict(runtime, warmup={"prompts": 1, "pieces": 20000})) == {"image": False, "weights": False, "settings": True, "download_bytes": None})
 check("a recipe the catalog dropped has no update", a.pending_update(manifest, SimpleNamespace(recipes={}, runtimes={}), profile) is None)
 # A pair's workers start from the manifest's own pair table, so a change there is an update too.
 check("a paired runtime's new worker settings are an update", update_for(recipe, dict(runtime, pair={"nodes": 2, "env": {"RESERVE": "9"}}))["settings"])
@@ -1605,4 +1606,47 @@ for name, answers, message in (("that answers without the key", [(200, found)], 
   with patch.object(a, "http_status", side_effect=answers):
     raises(f"an ace-server {name} is refused", lambda: a.post_start_checks("song", "test-key", ace_rt), message)
 
+
+# A runtime's warm-up: a malformed one is refused; one prompt of the model's own vocabulary goes
+# out with the key, nothing is sent without a tokenizer, and a failure doesn't fail the start.
+for bad in ({"prompts": 0, "pieces": 20000}, {"prompts": 1}, {"prompts": True, "pieces": 20000}):
+  changed = dict(runtime, warmup=bad)
+  check(f"runtime rejects warmup {bad}", any(".warmup" in e for e in a.validate_runtime("server", changed)))
+check("an OpenAI runtime takes a warm-up", not a.validate_runtime("server", dict(runtime, warmup={"prompts": 1, "pieces": 20000})))
+tok = Path(a.data_dir(), "models", "warm", "f" * 16, "model")
+# A rank folder's tokenizer.json links into /models, which only resolves inside the container.
+rank_tok = Path(a.data_dir(), "models", "warm", "f" * 16 + ".abc.rank0", "model")
+rank_tok.mkdir(parents=True, exist_ok=True)
+(rank_tok / "tokenizer.json").unlink(missing_ok=True)
+(rank_tok / "tokenizer.json").symlink_to("/models/model/tokenizer.json")
+tok.mkdir(parents=True, exist_ok=True)
+(tok / "tokenizer.json").write_text(json.dumps({"model": {"vocab": {"\u0120river": 0, "stone": 1, "<|eos|>": 2}}}))
+sent = []
+class Reply:
+  def __enter__(self): return self
+  def __exit__(self, *exc): return False
+  def read(self, *a): return b"{}"
+def fake_urlopen(request, timeout=None):
+  sent.append(request)
+  return Reply()
+published = []
+def fake_urlopen_checking(request, timeout=None):
+  published.append(a.warming("warm"))
+  return fake_urlopen(request, timeout)
+with patch.object(a.urllib.request, "urlopen", side_effect=fake_urlopen_checking):
+  a.warm_up("warm", "f" * 16, "test-key", {"warmup": {"prompts": 1, "pieces": 300}}, publish=lambda: published.append("published"))
+check("the model shows loading while it warms up, and running after", published[:2] == ["published", True] and not a.warming("warm"), repr(published))
+body = json.loads(sent[0].data) if sent else {}
+text = body.get("messages", [{}])[0].get("content", "")
+check("the warm-up sends one prompt of the model's vocabulary with the key",
+      len(sent) == 1 and sent[0].get_header("Authorization") == "Bearer test-key" and " river" in text and "<|eos|>" not in text and body.get("max_tokens") == 1)
+sent.clear()
+with patch.object(a.urllib.request, "urlopen", side_effect=fake_urlopen):
+  a.warm_up("missing", "f" * 16, "test-key", {"warmup": {"prompts": 1, "pieces": 300}})
+check("no tokenizer, no warm-up prompt", not sent)
+with patch.object(a.urllib.request, "urlopen", side_effect=a.urllib.error.URLError("refused")):
+  a.warm_up("warm", "f" * 16, "test-key", {"warmup": {"prompts": 2, "pieces": 300}})
+check("a failed warm-up leaves no marker behind", not a.warming("warm"))
+Path(a.warming_path("warm")).write_text("999999999\n")
+check("a marker whose process is gone holds nothing back", not a.warming("warm"))
 PY
