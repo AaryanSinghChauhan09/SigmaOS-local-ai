@@ -224,7 +224,9 @@ with a notification whose action opens `link setup` in a terminal. Each model co
 - State: `unit`, `sub_state`, `result`, `error`, `fits`, `fit_reason`.
 - Updates: `update`, null when the model is as the catalog would set it up, else which of
   `image`, `weights` and `settings` would change and its `download_bytes`, null until sized, and
-  `updating`, true while an update runs or waits its turn.
+  `updating`, true while an update runs or waits its turn. While it does, `update_progress` carries
+  its download as an installing row's `install` does (`phase` `waiting` or `downloading`,
+  `done_bytes`, `total_bytes`, `rate_bytes_s`); its reload shows in `unit` as any restart does.
 - Progress: `since_ms`, `expected_load_seconds`, `expected_stop_seconds`,
   `expected_remove_seconds`, and nullable `observed` (`load_seconds`,
   `ram_used_gib`, `gpu_used_gib`) and `ram_total_gib`, the memory of the

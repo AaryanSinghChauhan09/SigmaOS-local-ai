@@ -980,8 +980,10 @@ with patch.object(a, "known_models", return_value=["flux", "plain"]), patch.obje
 check("a model set up before its recipe named a maker shows the catalog's mark", vendors == {"flux": "bfl", "plain": ""}, json.dumps(vendors))
 with patch.object(a, "known_models", return_value=["current"]), patch.object(a, "unit_props", return_value={}), patch.object(a, "free_memory", return_value=(64, 48)):
   a.write_status(a.load_catalog(), profile)
-a.publish_installing("current", {"name": "Current", "phase": "downloading"})
-check("setting up an installed model again leaves its row as it is", json.loads(Path(a.state_dir(), "status.json").read_text())["models"]["current"]["unit"] != "installing")
+a.publish_installing("current", {"name": "Current", "phase": "downloading", "done_bytes": 5, "total_bytes": 10})
+current = json.loads(Path(a.state_dir(), "status.json").read_text())["models"]["current"]
+check("setting up an installed model again leaves its row as it is", current["unit"] != "installing")
+check("an update's download rides on the model's own row", current["update_progress"] == {"phase": "downloading", "done_bytes": 5, "total_bytes": 10, "rate_bytes_s": 0}, json.dumps(current.get("update_progress")))
 
 a.clear_installing("timed")
 a.begin_installing("timed", {"name": "Timed"}, 48.0)

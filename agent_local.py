@@ -3343,7 +3343,8 @@ def _use_setup(rid, variant, args, catalog, profile, gpu, fresh, measured_load=N
   say(f"Recipe {rid}: {len(files)} file(s), {gib(sum(f['size'] for f in files)):.1f} GiB{context}")
   for license_name in sorted({f"{f['repo']} ({f['license']})" for f in files}):
     say(f"  weights: {license_name}")
-  progress = Progress(rid=rid if fresh else None)
+  # A first setup's download shows on its own row, an update's on the model's (update_progress).
+  progress = Progress(rid=rid)
   fileset = materialize(rid, files, roles, args.seed, progress)
   if fresh:
     # Until the manifest exists, removal knows the image from the record.
@@ -3746,6 +3747,10 @@ def status_record(catalog, profile):
     if vendor:
       row["vendor"] = vendor
     row.update(update_fields(rid, load_model(rid), catalog, profile))
+    # An update under way: how far its download has got, until it's done.
+    record = load_installing(rid)
+    if record is not None and row["updating"]:
+      row["update_progress"] = install_row(rid, record)["install"]
   for rid in installing_models():
     record = load_installing(rid)
     if record is not None and rid not in models:
@@ -3886,9 +3891,13 @@ def cmd_update(argv):
     if args.detach:
       detach_update(rid, catalog, profile)
       continue
-    # Shown as updating from now on, while it waits for another setup too.
+    # Shown as updating from now on, while it waits for another setup too, with
+    # its progress from the first moment: waiting, then the download, which
+    # use publishes, then the reload, which activate reports as the model's own.
     marker = f"{os.getpid()}\n"
     write_atomic(updating_path(rid), marker)
+    if installing_idle(rid):
+      begin_installing(rid, (load_model(rid) or {}).get("recipe") or {})
     write_status(catalog, profile)
     try:
       # One locked step with use's own: whether it runs and which model is the default are read
@@ -3912,6 +3921,7 @@ def cmd_update(argv):
       # Another update of the same model that took the marker over keeps it.
       if _read(updating_path(rid)) == marker.strip():
         os.unlink(updating_path(rid))
+        clear_installing(rid)
       write_status(catalog, profile)
   return status
 
@@ -3926,6 +3936,8 @@ def detach_update(rid, catalog, profile):
   systemctl("reset-failed", unit)
   # The panel shows it from now on; the unit's own process takes the marker over.
   write_atomic(updating_path(rid), "detached\n")
+  if installing_idle(rid):
+    begin_installing(rid, (load_model(rid) or {}).get("recipe") or {})
   entry = os.path.join(os.path.dirname(os.path.realpath(__file__)), "omarchy-local-ai")
   command = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}", f"--description=Update local model {rid}"]
   env = dict(os.environ)
@@ -3940,6 +3952,7 @@ def detach_update(rid, catalog, profile):
       os.unlink(updating_path(rid))
     except OSError:
       pass
+    clear_installing(rid)
     raise LocalError(f"Can't start the update of {rid}: {(result.stderr.strip().splitlines() or ['systemd-run failed'])[-1]}")
   write_status(catalog, profile)
   say(f"Updating {rid} in the background; the agents panel shows it, or follow it with: journalctl --user -u {unit} -f")
@@ -4098,6 +4111,8 @@ def cmd_remove(argv):
       if manifest:
         pair_remove(manifest, args.local_only)
       result = _remove_files(rid)
+      # An update cancelled above leaves its progress behind.
+      clear_installing(rid)
       if size_gib > 1:
         write_atomic(os.path.join(state_dir(), "removal_rate"), f"{(time.time() - deleting) / size_gib:.4f}\n")
       # Only once everything else is gone: an interrupted removal leaves a
@@ -4260,10 +4275,12 @@ def publish_installing(rid, record):
       status = None
     if not isinstance(status, dict) or not isinstance(status.get("models"), dict):
       status = {"models": {}, "last": None, "ram_total_gib": round(gib(meminfo().get("MemTotal", 0)), 1), "best": None}
-    # An installed model's own row wins: setting up a recipe again leaves it listed as it is.
-    if status["models"].get(rid, {}).get("unit", "installing") != "installing":
-      return
-    status["models"][rid] = install_row(rid, record)
+    # An installed model keeps its own row: an update's progress rides on it.
+    row = status["models"].get(rid)
+    if row and row.get("unit", "installing") != "installing":
+      row["update_progress"] = install_row(rid, record)["install"]
+    else:
+      status["models"][rid] = install_row(rid, record)
     write_atomic(path, json.dumps(status, indent=2) + "\n")
 
 
