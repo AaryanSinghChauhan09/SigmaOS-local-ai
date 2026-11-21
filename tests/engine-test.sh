@@ -994,12 +994,13 @@ with tempfile.TemporaryDirectory() as fake:
   (unit / "memory.stat").write_text("anon 1073741824\nfile 8589934592\n")
   (unit / "cgroup.procs").write_text("10\n")
   (unit / "libpod-payload-1" / "cgroup.procs").write_text("11\n")
-  for pid, fds in {"10": {}, "11": {"3": "drm-client-id:\t7\ndrm-memory-gtt:\t2097152 KiB\n", "4": "drm-client-id:\t7\ndrm-memory-gtt:\t2097152 KiB\n", "5": "pos: 0\n"}}.items():
+  # Process 10 forked from 11 after it opened the GPU, so both show client 7.
+  for pid, fds in {"10": {"3": "drm-client-id:\t7\ndrm-memory-gtt:\t2097152 KiB\n"}, "11": {"3": "drm-client-id:\t7\ndrm-memory-gtt:\t2097152 KiB\n", "4": "drm-client-id:\t7\ndrm-memory-gtt:\t2097152 KiB\n", "5": "pos: 0\n"}}.items():
     Path(fake, "proc", pid, "fdinfo").mkdir(parents=True)
     for fd, text in fds.items():
       Path(fake, "proc", pid, "fdinfo", fd).write_text(text)
   held = a.held_bytes("/app.slice/m.service", str(Path(fake, "cg")), str(Path(fake, "proc")))
-check("a model holds its anonymous memory and its GTT once per GPU client, not its file cache", held == 3 * 2**30, str(held))
+check("a model holds its anonymous memory and its GTT once per GPU client, across its processes, not its file cache", held == 3 * 2**30, str(held))
 
 a.clear_installing("timed")
 a.begin_installing("timed", {"name": "Timed"}, 48.0)

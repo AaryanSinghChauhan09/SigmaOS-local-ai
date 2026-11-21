@@ -3840,7 +3840,8 @@ def write_status(catalog, profile, transitions=None, pending=None, publish=True)
 def held_bytes(cgroup, cgroup_root="/sys/fs/cgroup", proc="/proc"):
   """What the processes of one cgroup hold now that the machine can't take back: their anonymous
   memory, and the GPU memory mapped from system RAM (GTT) that the driver charges to no cgroup,
-  counted once per GPU client however many descriptors share it. The file cache they read
+  counted once per GPU client however many descriptors, or processes forked after opening the
+  GPU, share it. The file cache they read
   weights through isn't held: the kernel counts it as available, and frees it under pressure."""
   base = os.path.join(cgroup_root, cgroup.lstrip("/"))
   held = 0
@@ -3852,8 +3853,8 @@ def held_bytes(cgroup, cgroup_root="/sys/fs/cgroup", proc="/proc"):
   for folder, _, files in os.walk(base):
     if "cgroup.procs" in files:
       pids += [pid for pid in _read(os.path.join(folder, "cgroup.procs")).split() if pid.isdigit()]
+  clients = {}
   for pid in pids:
-    clients = {}
     try:
       names = os.listdir(os.path.join(proc, pid, "fdinfo"))
     except OSError:
@@ -3866,9 +3867,8 @@ def held_bytes(cgroup, cgroup_root="/sys/fs/cgroup", proc="/proc"):
       client = fields.get("drm-client-id")
       gtt = fields.get("drm-memory-gtt", "").split()
       if client and gtt and gtt[0].isdigit():
-        clients[client] = int(gtt[0]) * (1024 if gtt[1:] == ["KiB"] else 2**20 if gtt[1:] == ["MiB"] else 1)
-    held += sum(clients.values())
-  return held
+        clients[(fields.get("drm-pdev", ""), client)] = int(gtt[0]) * (1024 if gtt[1:] == ["KiB"] else 2**20 if gtt[1:] == ["MiB"] else 1)
+  return held + sum(clients.values())
 
 
 def cmd_memory(argv):
