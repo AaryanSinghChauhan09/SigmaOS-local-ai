@@ -1,7 +1,7 @@
 # Local model engine contract
 
 `omarchy-local-ai` installs the engine and catalog together; Omarchy routes
-`omarchy agent local <command>` to it. The engine reads the catalog beside
+`omarchy models <command>` to it. The engine reads the catalog beside
 `agent_local.py`, following the entry script's symlink. Developers can select a
 checkout catalog with `OMARCHY_LOCAL_AI_CATALOG`.
 
@@ -299,15 +299,15 @@ leaves the picker whole.
 
 `share <recipe>` lets the other machines of the user's tailnet use a model, text or image, and `share <recipe> --off` stops. The container, its loopback port and its key check are unchanged: `tailscale serve` proxies `https://<host>.<tailnet>.ts.net/local-ai/<recipe>`, reachable only on the tailnet, to the share proxy at `127.0.0.1:11430/<recipe>`, which forwards each request untouched to the model's loopback port and streams the answer back, and the model still refuses a request without the key. Beside the models, a `text:` route at `/local-ai/models.json` lists the shared models with their state, `kind` (`text` or `image`), `edit` (whether an image model edits by instruction), context, reply cap, inputs, memory and measured speeds. It never contains the key. Every status write republishes the listing when it changed, so remote machines see starts and stops as they happen. Changing Serve needs the user to be Tailscale's operator (`sudo tailscale set --operator=$USER`); a refusal is recorded as `share_error` in `status.json` with that fix. Removing a model unshares it.
 
-The share proxy (`share-proxy`, run as the `omarchy-agent-local-share.service` user unit while anything is shared, and stopped once nothing is) counts who uses each shared model. A request the model accepted counts the machine that sent it, by the tailnet address `tailscale serve` puts in `X-Forwarded-For`, for five minutes after its last one; a refused request counts nothing. `.local/state/omarchy/agent-local/clients.json` is `{models: {<recipe>: <machines>}}`, rewritten only when a count changes, as a machine starts or lapses, and removed when the proxy stops. The agents panel watches it to say how many machines use a shared model.
+The share proxy (`share-proxy`, run as the `omarchy-agent-local-share.service` user unit while anything is shared, and stopped once nothing is) counts who uses each shared model. A request the model accepted counts the machine that sent it, by the tailnet address `tailscale serve` puts in `X-Forwarded-For`, for five minutes after its last one; a refused request counts nothing. `.local/state/omarchy/agent-local/clients.json` is `{models: {<recipe>: <machines>}}`, rewritten only when a count changes, as a machine starts or lapses, and removed when the proxy stops. The local models panel watches it to say how many machines use a shared model.
 
-`pair <host>` runs `omarchy-agent-local share --export` on the host over SSH, which prints its tailnet name and key, and stores them in `.config/omarchy/agent-local/remotes/<host>.{json,key}` (mode 0600). SSH is the only way a key leaves its machine. `forget <host>` deletes both and drops the host's models.
+`pair <host>` runs `omarchy-models share --export` on the host over SSH, which prints its tailnet name and key, and stores them in `.config/omarchy/agent-local/remotes/<host>.{json,key}` (mode 0600). SSH is the only way a key leaves its machine. `forget <host>` deletes both and drops the host's models.
 
 `network` asks the local tailscaled for its online Linux peers, fetches each one's `models.json` in parallel (4s timeout) and writes `network.json`: `{schema, updated_ms, tailnet, self, hosts, models}`. Models are keyed `host/recipe` and carry the local model fields plus `host`, `dns`, `paired`, `endpoint`, `ram_total_gib`, `last_seen_ms` and `offline`. A host that drops off keeps its models, with `offline` set to `offline` (Tailscale says so) or `unreachable` (online but not answering) and `last_seen_ms` from its last answer. Paired hosts are kept until forgotten; unpaired ones for a week. An online host serving no listing shares nothing and its models go. Listings are untrusted input: only known states, kinds, recipe IDs and inputs survive, and text loses control characters. A row without a `kind`, from a host older than image sharing, is a text model. A paired host's image model is for Fantasi, which reaches it at its endpoint with that host's key; pi's providers and the launch overlays leave it out, as they do a local image model.
 
 `overlay pi|opencode <host>/<recipe>` writes the same overlays for a paired host's running model, with provider `omarchy-local-<host>`, the tailnet endpoint and the stored key file, so `omarchy agent --local-model <host>/<recipe>` launches against it.
 
-The agents panel watches `network.json` and runs `network --write` when it opens and every 20 seconds while it stays open. Each network model gets a line beside the local ones: pair while unpaired, start/stop and launch once paired, and an offline line with the last-seen time while its host is away.
+The local models panel watches `network.json` and runs `network --write` when it opens and every 20 seconds while it stays open. Each network model gets a line beside the local ones: pair while unpaired, start/stop and launch once paired, and an offline line with the last-seen time while its host is away.
 
 Maintainers run [tools/bench](../tools/bench) from a checkout against a running
 model. It imports the checkout engine and uses [bench/context.txt](../bench/context.txt)

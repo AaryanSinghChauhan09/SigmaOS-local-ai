@@ -470,7 +470,7 @@ pair_port = a.port_for("paired")
 check("the pair unit shares the host network and publishes nothing", "Network=host" in pair_text and "PublishPort" not in pair_text)
 check("the pair unit binds its API to loopback on the model's port", f'"--host" "127.0.0.1" "--port" "{pair_port}"' in pair_text and f"127.0.0.1:{pair_port}/health" in pair_text)
 check("the pair unit mounts rank 0's inputs and reads the link from its environment file", f"models/paired/{a.rank_folder('b' * 16, 0, pair_rt)}:/prepared:ro" in pair_text and "EnvironmentFile=%h/.local/state/omarchy/agent-local/pair/paired.env" in pair_text)
-check("the pair unit starts and stops rank 1 with itself", "ExecStartPre=/usr/bin/env omarchy-agent-local link-worker start paired" in pair_text and "ExecStopPost=-/usr/bin/env omarchy-agent-local link-worker stop paired" in pair_text)
+check("the pair unit starts and stops rank 1 with itself", "ExecStartPre=/usr/bin/env omarchy-models link-worker start paired" in pair_text and "ExecStopPost=-/usr/bin/env omarchy-models link-worker stop paired" in pair_text)
 check("a paired runtime may serve its prepared folder", '"--model" "/prepared/model"' in a.render_container("paired", paired, dict(pair_rt, pair=dict(pair_rt["pair"], model="/prepared/model")), paired["variant"][0], {"model": "model"}, pair_gpu, "b" * 16))
 same_rt = copy.deepcopy(pair_rt)
 for key in ("worker", "prepare"):
@@ -628,7 +628,7 @@ with patch.object(a, "cable_neighbors", return_value=["fe80::2%enp1"]), patch.ob
   a.link_notify(pair_profile)
   a.link_notify(pair_profile)
 notices = [call.args[0] for call in sent.call_args_list if call.args and call.args[0][:1] == ["omarchy-notification-send"]]
-check("a newly cabled Spark is announced once, with link setup as its action", len(notices) == 1 and notices[0][-1] == "omarchy-agent-local link setup", repr(notices))
+check("a newly cabled Spark is announced once, with link setup as its action", len(notices) == 1 and notices[0][-1] == "omarchy-models link setup", repr(notices))
 os.unlink(os.path.join(a.state_dir(), "link-notified"))
 # A refresh that found the Spark first doesn't stop the announcement.
 with patch.object(a, "cable_neighbors", return_value=["fe80::3%enp1"]), patch.object(a, "mdns_names", return_value={}):
@@ -1280,7 +1280,7 @@ with patch.object(a.subprocess, "run", return_value=subprocess.CompletedProcess(
   # The panel shows the first line alone, so it names the machine short.
   raises("a pairing error's first line names the machine without user or domain", lambda: a.cmd_pair(["alice@new.tail1234.ts.net"]), "new refused this machine's SSH keys\n")
 check("an address stays whole as a machine's name", a.short_host("dhh@100.90.162.80") == "100.90.162.80")
-# The agents panel pairs with no terminal (stdin here is the test script), so
+# The local models panel pairs with no terminal (stdin here is the test script), so
 # ssh must ask nothing: a prompt would wait forever. A new host's key is taken.
 with patch.object(a.subprocess, "run", return_value=subprocess.CompletedProcess([], 255, "", "Host key verification failed.\n")) as run:
   raises("pairing with a host whose key changed says how to forget the old one, by host alone", lambda: a.cmd_pair(["alice@new.tail1234.ts.net"]), "ssh-keygen -R new.tail1234.ts.net")
@@ -1289,7 +1289,7 @@ a.write_atomic(a.remote_key_path("away"), "k" * 32, mode=0o600)
 a.write_atomic(os.path.join(a.remotes_dir(), "away.json"), json.dumps({"host": "away", "dns": "away.tail.ts.net", "ssh": "away"}))
 raises("a network model is named host/recipe", lambda: a.split_remote_id("box/../x"), "host/recipe")
 raises("an SSH target can't smuggle options", lambda: a.ssh_command({"ssh": "-oProxyCommand=x", "dns": ""}, "share", "--export"), "Not an SSH target")
-check("remote commands quote their arguments", a.ssh_command({"ssh": "box", "dns": "box.tail.ts.net"}, "share", "--export")[-2:] == ["box", "omarchy-agent-local share --export"])
+check("remote commands quote their arguments", a.ssh_command({"ssh": "box", "dns": "box.tail.ts.net"}, "share", "--export")[-2:] == ["box", "omarchy-models share --export"])
 
 # A paired, running remote model becomes an overlay with its own provider.
 a.write_atomic(a.remote_key_path("box"), "b" * 32, mode=0o600)
