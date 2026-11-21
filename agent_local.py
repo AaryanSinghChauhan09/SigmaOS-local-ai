@@ -87,6 +87,9 @@ ROLES = ("model", "draft", "text_encoder", "vae", "audio_vae", "lora")
 # What a recipe serves: text (chat completions, for the agents), images, video or music. Agents,
 # overlays, the default model and tailnet sharing only ever see text models.
 KINDS = ("text", "image", "video", "music")
+# Where best.toml lists each kind's recommendations, in order of preference: the agents' text
+# models, and the models that make pictures, clips and music beside them.
+BEST_FIELDS = {"text": "recipes", "image": "images", "video": "videos", "music": "music"}
 # How the engine checks a server it just started answers only with the key: an OpenAI-compatible
 # /v1/models that lists the recipe id, stable-diffusion.cpp's model status reporting ready, or
 # acestep.cpp's list of the models it found.
@@ -149,7 +152,7 @@ PAIR_NCCL = ("NCCL_SOCKET_IFNAME", "NCCL_IB_HCA", "NCCL_IB_GID_INDEX")
 
 class LocalError(Exception):
   """A failure with its full explanation, and optionally a one-line reason
-  short enough for the agents panel to show where a model's progress bar was."""
+  short enough for the local models panel to show where a model's progress bar was."""
 
   def __init__(self, message, short=None):
     super().__init__(message)
@@ -345,7 +348,7 @@ def gpu_short_error(variant, gpu):
   if gpu_memory_pending(variant, gpu):
     return LocalError(f"the GPU addresses {gpu['memory_gib']:.0f} GiB and the model needs {variant['peak_gpu_gib']:g}, until a reboot raises its memory limit",
                       short=REBOOT_FOR_GPU_MEMORY)
-  hint = "; omarchy agent local use raises its memory limit" if variant["peak_gpu_gib"] <= gpu.get("max_memory_gib", gpu["memory_gib"]) else ""
+  hint = "; omarchy models use raises its memory limit" if variant["peak_gpu_gib"] <= gpu.get("max_memory_gib", gpu["memory_gib"]) else ""
   return LocalError(f"the GPU addresses {gpu['memory_gib']:.0f} GiB and the model needs {variant['peak_gpu_gib']:g}{hint}", short=GPU_TOO_SMALL)
 
 
@@ -854,7 +857,7 @@ def validate_recipe(rid, recipe, runtimes, root=None):
   if not ID_RE.match(rid):
     errors.append(f"{where}: id must match {ID_RE.pattern}")
   _safe_string(recipe.get("name"), f"{where}.name", errors)
-  # The model maker, naming the logo the agents panel shows (assets/<vendor>.svg).
+  # The model maker, naming the logo the local models panel shows (assets/<vendor>.svg).
   if "vendor" in recipe and not (isinstance(recipe["vendor"], str) and ID_RE.match(recipe["vendor"])):
     errors.append(f"{where}.vendor: must match {ID_RE.pattern}")
   kind = recipe_kind(recipe)
@@ -1035,12 +1038,16 @@ def validate_best(best, recipes):
     if not isinstance(names, list) or not names:
       errors.append(f"{where}.recipes: must be a non-empty list")
       continue
-    # `recipes` choose the agents' model and `use best`; `images`, the image models offered beside them.
-    images = entry.get("images", [])
-    if not isinstance(images, list):
-      errors.append(f"{where}.images: must be a list")
-      images = []
-    for field, kind, name in [("recipes", "text", name) for name in names] + [("images", "image", name) for name in images]:
+    # `recipes` choose the agents' model and `use best text`; the other kinds' lists, the models
+    # recommended beside it, each its own `use best <kind>`.
+    listed = []
+    for kind, field in BEST_FIELDS.items():
+      values = names if field == "recipes" else entry.get(field, [])
+      if not isinstance(values, list):
+        errors.append(f"{where}.{field}: must be a list")
+        continue
+      listed += [(field, kind, name) for name in values]
+    for field, kind, name in listed:
       recipe = recipes.get(name)
       if recipe is None:
         errors.append(f"{where}: unknown recipe '{name}'")
@@ -1168,7 +1175,7 @@ def match_class(best, profile, gpu):
 def resolve_best(catalog, profile, gpu=None, ctx=None, field="recipes"):
   """The first fitting recipe of the class of `gpu`, or, with none named, of this machine's
   GPUs from the strongest down: a pair's class first, then its own node's. `field` is the class's
-  list to choose from: its text recipes, or with "images" its image models."""
+  list to choose from: its text recipes, or another kind's list (BEST_FIELDS)."""
   if gpu is not None:
     return _resolve_class(catalog, profile, gpu, ctx, field)
   gpus = sorted(profile["gpus"], key=lambda g: (g.get("nodes", 1), g["memory_gib"]), reverse=True)
@@ -1193,6 +1200,9 @@ def _resolve_class(catalog, profile, gpu, ctx=None, field="recipes"):
       f"No recommendation for this machine yet ({gpu['family']}, {profile['ram_class']} GB, {profile['platform']}).\n"
       + (f"Recipes measured on the same GPU family: {', '.join(near)}" if near else "No recipes are measured on this GPU family yet.")
     )
+  if not entry.get(field):
+    kind = next((name for name, listed in BEST_FIELDS.items() if listed == field), field)
+    raise LocalError(f"No {kind} model is recommended for this machine yet ({gpu['family']}, {profile['ram_class']} GB)")
   skipped = []
   for rid in entry.get(field, []):
     if rid not in catalog.recipes:
@@ -1217,7 +1227,7 @@ def recipe_listing(catalog, profile, running=()):
     gpu, gpu_error = None, str(error)
   best_ids = set()
   if gpu:
-    for field in ("recipes", "images"):
+    for field in BEST_FIELDS.values():
       try:
         best_ids.add(resolve_best(catalog, profile, field=field)[0])
       except LocalError:
@@ -1396,7 +1406,7 @@ def verify_file(path, record):
 
 class Progress:
   """Bytes a setup fetches: printed every few seconds and, with a recipe id,
-  published to the agents panel through the setup's installing record."""
+  published to the local models panel through the setup's installing record."""
 
   def __init__(self, total=0, rid=None):
     self.total = total
@@ -1742,7 +1752,7 @@ def render_container(rid, recipe, runtime, variant, roles, gpu, fileset):
   pair = runtime.get("pair")
   port = port_for(rid)
   lines = [
-    "# Generated by omarchy-agent-local use; changes are overwritten.",
+    "# Generated by omarchy-models use; changes are overwritten.",
     "[Unit]",
     f"Description=Omarchy local model {rid}",
     "PartOf=graphical-session.target",
@@ -1823,17 +1833,17 @@ def render_container(rid, recipe, runtime, variant, roles, gpu, fileset):
     # Rank 1 starts on the peer first and stops with this unit, however it ends; the start also
     # writes this unit's environment file, the link as it is now.
     lines += [
-      f"ExecStartPre=/usr/bin/env omarchy-agent-local link-worker start {rid}",
-      f"ExecStopPost=-/usr/bin/env omarchy-agent-local link-worker stop {rid}",
+      f"ExecStartPre=/usr/bin/env omarchy-models link-worker start {rid}",
+      f"ExecStopPost=-/usr/bin/env omarchy-models link-worker stop {rid}",
     ]
   lines += [
-    # The agents panel watches status.json; every start, stop and crash rewrites it.
+    # The local models panel watches status.json; every start, stop and crash rewrites it.
     # systemd resolves a bare name in its own search path, not PATH; env uses the
     # unit's PATH, which holds Omarchy's bin.
     # Each hook says how the transition ended: systemd still reports it as
     # activating or deactivating while its Post commands run.
-    f"ExecStartPost=-/usr/bin/env omarchy-agent-local status --write --started {rid}",
-    f"ExecStopPost=-/usr/bin/env omarchy-agent-local status --write --stopped {rid}",
+    f"ExecStartPost=-/usr/bin/env omarchy-models status --write --started {rid}",
+    f"ExecStopPost=-/usr/bin/env omarchy-models status --write --stopped {rid}",
   ]
   return "\n".join(lines) + "\n"
 
@@ -2057,7 +2067,7 @@ def preflight(runtime, gpu):
     if not os.path.isdir("/dev/infiniband"):
       raise LocalError("/dev/infiniband is missing: the RDMA devices of the ConnectX-7 ports are needed (rdma-core)")
     if not shutil.which("rsync"):
-      raise LocalError("rsync is needed to copy the model files to the paired machine: omarchy agent local link setup")
+      raise LocalError("rsync is needed to copy the model files to the paired machine: omarchy models link setup")
 
 
 # Whether this user's services may lock unlimited memory: the manager's default for its units and
@@ -2070,7 +2080,7 @@ def pair_limits(peer):
   limit past its user's, and systemd's user manager takes that from PAM at login, so a limit
   `link setup` just lifted applies after the next login. Checked at admission: a setup is
   prepared and kept even while it can't start yet."""
-  fix = "run: omarchy agent local link setup"
+  fix = "run: omarchy models link setup"
   if subprocess.run(["bash", "-c", MEMLOCK_CHECK], capture_output=True).returncode != 0:
     raise LocalError(f"Locked memory is limited for services here, which RDMA between the two machines needs unlimited; {fix}", short="Locked memory limited: run link setup")
   if pair_ssh(peer, MEMLOCK_CHECK, check=False).returncode != 0:
@@ -2310,7 +2320,7 @@ def check_headroom(variant, gpu):
   raise LocalError(
     f"Not enough free memory right now: the model needs {need:g} GiB RAM "
     f"and {variant['peak_gpu_gib']:g} GiB GPU-addressable; {available:.1f} GiB RAM and {gpu_free:.1f} GiB GPU are free.\n"
-    + (f"Local models running: {', '.join(running)} (stop one with: omarchy agent local stop <recipe>)\n" if running else "")
+    + (f"Local models running: {', '.join(running)} (stop one with: omarchy models stop <recipe>)\n" if running else "")
     + f"Largest memory users: {top_memory_users()}",
     short=short,
   )
@@ -2611,7 +2621,7 @@ def pair_remove(manifest, local_only=False):
 
 
 def cmd_link_worker(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local link-worker")
+  parser = argparse.ArgumentParser(prog="omarchy models link-worker")
   parser.add_argument("action", choices=("start", "stop"))
   parser.add_argument("recipe")
   args = parser.parse_args(argv)
@@ -2813,7 +2823,7 @@ def root_script(script, *args, peer=None):
 
 
 def cmd_link_setup(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local link setup",
+  parser = argparse.ArgumentParser(prog="omarchy models link setup",
                                    description="Prepare this Spark and the one cabled to it to run models across both. Safe to run again.")
   parser.add_argument("peer", nargs="?", help="the other Spark as SSH reaches it now, e.g. user@spark-1234.local (default: the linked one)")
   args = parser.parse_args(argv)
@@ -2823,7 +2833,7 @@ def cmd_link_setup(argv):
   available = link_probe(profile) if not args.peer and not cached_pair(profile) else {}
   peer = args.peer or (cached_pair(profile) or {}).get("peer") or available.get("address")
   if not peer or not PEER_RE.match(peer):
-    raise LocalError("Name the other Spark as SSH reaches it, e.g.: omarchy agent local link setup spark-1234.local")
+    raise LocalError("Name the other Spark as SSH reaches it, e.g.: omarchy models link setup spark-1234.local")
   if not local_ports():
     raise LocalError("No ConnectX-7 port has a link: connect the two Sparks' QSFP ports with a direct cable")
 
@@ -2874,7 +2884,7 @@ def cmd_link(argv):
   if argv[:1] == ["notify"]:
     link_notify(machine_profile())
     return 0
-  parser = argparse.ArgumentParser(prog="omarchy agent local link")
+  parser = argparse.ArgumentParser(prog="omarchy models link")
   parser.add_argument("--json", action="store_true")
   args = parser.parse_args(argv)
   profile = machine_profile()
@@ -2884,10 +2894,10 @@ def cmd_link(argv):
     print(json.dumps(pair or state, indent=2))
     return 0
   if state["state"] == "available":
-    say(f"Another Spark is on the cable: {state['host'] or state['address']}. Set both up with: omarchy agent local link setup")
+    say(f"Another Spark is on the cable: {state['host'] or state['address']}. Set both up with: omarchy models link setup")
     return 0
   if not pair:
-    say("No Spark is linked to this one yet: cable them, then run omarchy agent local link setup <the other Spark>")
+    say("No Spark is linked to this one yet: cable them, then run omarchy models link setup <the other Spark>")
     return 0
   here, there = pair_link(pair)
   say(f"Linked to {pair['host']} at {pair['peer']} ({pair['ram_gib']:.0f} GiB)")
@@ -2900,7 +2910,7 @@ def cmd_link(argv):
 #
 # Before link setup there is no IPv4 on the cable and no key, but IPv6 link-local always works:
 # every host on a cable port answers the all-nodes address. Answers from addresses that aren't
-# this machine's are the other end. The agents panel offers setup when status.json's `link`
+# this machine's are the other end. The local models panel offers setup when status.json's `link`
 # says one is available.
 
 def link_path():
@@ -2987,7 +2997,7 @@ def link_notify(profile):
     name = state["host"] or "another DGX Spark"
     sent = subprocess.run(["omarchy-notification-send", "-g", "󰌘", "--app-name", "Local AI", f"{name} is connected to this Spark",
                            "Set both up to run models across them",
-                           "--exec", "omarchy-launch-floating-terminal-with-presentation", "omarchy-agent-local link setup"],
+                           "--exec", "omarchy-launch-floating-terminal-with-presentation", "omarchy-models link setup"],
                           capture_output=True)
     # Only what reached the desktop counts as announced; a failed send is tried again next time.
     if sent.returncode != 0:
@@ -3063,13 +3073,13 @@ def resolve_model(rid=None, running_only=False):
       raise LocalError("Not a recipe id")
     manifest = load_model(rid)
     if not manifest:
-      raise LocalError(f"{rid} isn't set up. Run: omarchy agent local use {rid}")
+      raise LocalError(f"{rid} isn't set up. Run: omarchy models use {rid}")
     if running_only and not unit_active(rid):
-      raise LocalError(f"{rid} isn't running. Start it with: omarchy agent local start {rid}")
+      raise LocalError(f"{rid} isn't running. Start it with: omarchy models start {rid}")
     return manifest
   manifest = default_model(running_only)
   if not manifest:
-    raise LocalError("No local model is running. Run: omarchy agent local use best" if running_only else "No local model set up. Run: omarchy agent local use best")
+    raise LocalError("No local model is running. Run: omarchy models use best text" if running_only else "No local model set up. Run: omarchy models use best text")
   return manifest
 
 
@@ -3137,7 +3147,7 @@ class Lock:
     try:
       fcntl.flock(Lock.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-      say("Another omarchy agent local command is running; waiting for it")
+      say("Another omarchy models command is running; waiting for it")
       fcntl.flock(Lock.handle, fcntl.LOCK_EX)
     return self
 
@@ -3228,22 +3238,34 @@ def _lookup_recipe(catalog, target):
 
 
 def cmd_use(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local use")
+  parser = argparse.ArgumentParser(prog="omarchy models use")
   parser.add_argument("target", help="best, or a recipe id")
+  parser.add_argument("kind", nargs="?", choices=KINDS, help="with best: the kind of model, text, image, video or music")
   parser.add_argument("--ctx", type=int)
   parser.add_argument("--gpu")
   parser.add_argument("--seed", help="reuse matching files from this directory before downloading")
-  parser.add_argument("--detach", action="store_true", help="set it up in the background; the agents panel shows its progress")
+  parser.add_argument("--detach", action="store_true", help="set it up in the background; the local models panel shows its progress")
   args = parser.parse_args(argv)
   catalog = load_catalog()
   profile = machine_profile()
   gpu = choose_gpu(profile, args.gpu) if args.gpu else None
+  if args.target == "best" and args.kind is None:
+    # Every kind has a best of its own, so best alone asks which.
+    say(f"Name the kind of model: omarchy models use best <{'|'.join(KINDS)}>")
+    for kind, field in BEST_FIELDS.items():
+      try:
+        say(f"  {kind}: {resolve_best(catalog, profile, gpu, field=field)[0]}")
+      except LocalError:
+        say(f"  {kind}: none for this machine yet")
+    return 2
+  if args.kind is not None and args.target != "best":
+    raise LocalError(f"A kind goes with best: omarchy models use best {args.kind}")
   if args.target == "best":
-    rid, variant, skipped = resolve_best(catalog, profile, gpu, args.ctx)
+    rid, variant, skipped = resolve_best(catalog, profile, gpu, args.ctx if args.kind == "text" else None, field=BEST_FIELDS[args.kind])
     gpu = recipe_gpu(profile, catalog.recipes[rid], args.gpu, catalog.runtimes.get(catalog.recipes[rid].get("runtime")))
     for skipped_id, reason in skipped:
       say(f"Skipping {skipped_id}: {reason}")
-    say(f"Best for this machine ({gpu['family']}, {profile['ram_class']} GB): {rid}")
+    say(f"Best {args.kind} model for this machine ({gpu['family']}, {profile['ram_class']} GB): {rid}")
   else:
     rid = args.target
     recipe = _lookup_recipe(catalog, rid)
@@ -3325,7 +3347,7 @@ def detach_use(rid, args, recipe, measured_load=None):
     if load_model(rid) is None:
       fail_installing(rid, reason)
     raise LocalError(f"Can't start the setup of {rid}: {reason}")
-  say(f"Setting up {rid} in the background; the agents panel shows its progress, or follow it with: journalctl --user -u {unit} -f")
+  say(f"Setting up {rid} in the background; the local models panel shows its progress, or follow it with: journalctl --user -u {unit} -f")
   return 0
 
 
@@ -3343,7 +3365,8 @@ def _use_setup(rid, variant, args, catalog, profile, gpu, fresh, measured_load=N
   say(f"Recipe {rid}: {len(files)} file(s), {gib(sum(f['size'] for f in files)):.1f} GiB{context}")
   for license_name in sorted({f"{f['repo']} ({f['license']})" for f in files}):
     say(f"  weights: {license_name}")
-  progress = Progress(rid=rid if fresh else None)
+  # A first setup's download shows on its own row, an update's on the model's (update_progress).
+  progress = Progress(rid=rid)
   fileset = materialize(rid, files, roles, args.seed, progress)
   if fresh:
     # Until the manifest exists, removal knows the image from the record.
@@ -3399,7 +3422,7 @@ def _use_setup(rid, variant, args, catalog, profile, gpu, fresh, measured_load=N
         first = "Stop another model, then press"
       else:
         first = "Then press"
-      say(f"{first} play in the agents panel or run: omarchy agent local start {rid}")
+      say(f"{first} play in the local models panel or run: omarchy models start {rid}")
       say(f"Manifest: {path}")
       return 0
   activate(manifest, recipe, runtime, gpu, key, catalog, profile)
@@ -3428,7 +3451,7 @@ def refresh_list_cache(catalog, profile):
 
 
 def cmd_list(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local list")
+  parser = argparse.ArgumentParser(prog="omarchy models list")
   parser.add_argument("--json", action="store_true")
   args = parser.parse_args(argv)
   profile = machine_profile()
@@ -3746,6 +3769,10 @@ def status_record(catalog, profile):
     if vendor:
       row["vendor"] = vendor
     row.update(update_fields(rid, load_model(rid), catalog, profile))
+    # An update under way: how far its download has got, until it's done.
+    record = load_installing(rid)
+    if record is not None and row["updating"]:
+      row["update_progress"] = install_row(rid, record)["install"]
   for rid in installing_models():
     record = load_installing(rid)
     if record is not None and rid not in models:
@@ -3768,7 +3795,7 @@ def status_record(catalog, profile):
 
 
 def write_status(catalog, profile, transitions=None, pending=None, publish=True):
-  """Rewrite status.json, which the agents panel watches. `transitions` reports
+  """Rewrite status.json, which the local models panel watches. `transitions` reports
   a start or stop before systemd reaches it, so a click shows at once;
   `pending` describes a model being set up before its manifest is saved.
 
@@ -3810,8 +3837,61 @@ def write_status(catalog, profile, transitions=None, pending=None, publish=True)
     return record
 
 
+def held_bytes(cgroup, cgroup_root="/sys/fs/cgroup", proc="/proc"):
+  """What the processes of one cgroup hold now that the machine can't take back: their anonymous
+  memory, and the GPU memory mapped from system RAM (GTT) that the driver charges to no cgroup,
+  counted once per GPU client however many descriptors, or processes forked after opening the
+  GPU, share it. The file cache they read
+  weights through isn't held: the kernel counts it as available, and frees it under pressure."""
+  base = os.path.join(cgroup_root, cgroup.lstrip("/"))
+  held = 0
+  for line in _read(os.path.join(base, "memory.stat")).splitlines():
+    key, _, value = line.partition(" ")
+    if key == "anon" and value.strip().isdigit():
+      held += int(value)
+  pids = []
+  for folder, _, files in os.walk(base):
+    if "cgroup.procs" in files:
+      pids += [pid for pid in _read(os.path.join(folder, "cgroup.procs")).split() if pid.isdigit()]
+  clients = {}
+  for pid in pids:
+    try:
+      names = os.listdir(os.path.join(proc, pid, "fdinfo"))
+    except OSError:
+      continue
+    for name in names:
+      fields = {}
+      for line in _read(os.path.join(proc, pid, "fdinfo", name)).splitlines():
+        key, _, value = line.partition(":")
+        fields[key] = value.strip()
+      client = fields.get("drm-client-id")
+      gtt = fields.get("drm-memory-gtt", "").split()
+      if client and gtt and gtt[0].isdigit():
+        clients[(fields.get("drm-pdev", ""), client)] = int(gtt[0]) * (1024 if gtt[1:] == ["KiB"] else 2**20 if gtt[1:] == ["MiB"] else 1)
+  return held + sum(clients.values())
+
+
+def cmd_memory(argv):
+  """What each running model holds now, in GiB, for the panel's memory bar: observed.ram_used_gib
+  is what it took to load, and an idle model may since have let much of that go."""
+  parser = argparse.ArgumentParser(prog="omarchy models memory")
+  parser.add_argument("--json", action="store_true")
+  args = parser.parse_args(argv)
+  held = {}
+  for rid in known_models():
+    props = unit_props(rid, "ActiveState", "ControlGroup")
+    if props.get("ActiveState") in ("active", "activating", "reloading") and props.get("ControlGroup"):
+      held[rid] = round(gib(held_bytes(props["ControlGroup"])), 1)
+  if args.json:
+    print(json.dumps(held))
+  else:
+    for rid, value in held.items():
+      say(f"{rid}: {value:.1f} GiB")
+  return 0
+
+
 def cmd_status(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local status")
+  parser = argparse.ArgumentParser(prog="omarchy models status")
   parser.add_argument("--json", action="store_true")
   parser.add_argument("--write", action="store_true", help=argparse.SUPPRESS)
   parser.add_argument("--started", metavar="RECIPE", help=argparse.SUPPRESS)
@@ -3841,7 +3921,7 @@ def cmd_status(argv):
     print(json.dumps(record, indent=2))
     return 0
   if not record["models"]:
-    say("No local model has been set up. Run: omarchy agent local use best")
+    say("No local model has been set up. Run: omarchy models use best text")
     return 0
   for rid, model in record["models"].items():
     state = {"active": "running", "activating": "loading", "deactivating": "stopping"}.get(model["unit"], model["unit"])
@@ -3849,14 +3929,14 @@ def cmd_status(argv):
     say(f"  endpoint {model['endpoint']} · model id {rid}" + (f" · context {model['ctx']}" if model["ctx"] else f" · {model['kind']}"))
     if model.get("update"):
       size = f", {gib(model['update']['download_bytes']):.1f} GiB to download" if model["update"].get("download_bytes") else ""
-      say(f"  update available ({update_summary(model['update'])}{size}): omarchy agent local update {rid}")
+      say(f"  update available ({update_summary(model['update'])}{size}): omarchy models update {rid}")
     if model["unit"] == "failed":
       say(f"  last failure: {model['result']}")
       tail = journal_tail(rid, 5)
       if tail:
         say("  " + tail.replace("\n", "\n  "))
   if record["best"] and record["best"] not in record["models"]:
-    say(f"The recommendation for this machine is {record['best']}: omarchy agent local use best")
+    say(f"The recommendation for this machine is {record['best']}: omarchy models use best text")
   return 0
 
 
@@ -3869,9 +3949,9 @@ def cmd_update(argv):
   """Set a model up again from the catalog, when the catalog has moved on from the one it was set
   up from. The setup is use's: the old one keeps running until the new one has started, files
   that didn't change aren't fetched again, and a model that was stopped is stopped again after."""
-  parser = argparse.ArgumentParser(prog="omarchy agent local update")
+  parser = argparse.ArgumentParser(prog="omarchy models update")
   parser.add_argument("recipe", nargs="?", help="the model to update (default: every one with an update)")
-  parser.add_argument("--detach", action="store_true", help="update in the background; the agents panel shows it")
+  parser.add_argument("--detach", action="store_true", help="update in the background; the local models panel shows it")
   args = parser.parse_args(argv)
   catalog = load_catalog()
   profile = machine_profile()
@@ -3886,9 +3966,13 @@ def cmd_update(argv):
     if args.detach:
       detach_update(rid, catalog, profile)
       continue
-    # Shown as updating from now on, while it waits for another setup too.
+    # Shown as updating from now on, while it waits for another setup too, with
+    # its progress from the first moment: waiting, then the download, which
+    # use publishes, then the reload, which activate reports as the model's own.
     marker = f"{os.getpid()}\n"
     write_atomic(updating_path(rid), marker)
+    if installing_idle(rid):
+      begin_installing(rid, (load_model(rid) or {}).get("recipe") or {})
     write_status(catalog, profile)
     try:
       # One locked step with use's own: whether it runs and which model is the default are read
@@ -3912,6 +3996,7 @@ def cmd_update(argv):
       # Another update of the same model that took the marker over keeps it.
       if _read(updating_path(rid)) == marker.strip():
         os.unlink(updating_path(rid))
+        clear_installing(rid)
       write_status(catalog, profile)
   return status
 
@@ -3926,6 +4011,8 @@ def detach_update(rid, catalog, profile):
   systemctl("reset-failed", unit)
   # The panel shows it from now on; the unit's own process takes the marker over.
   write_atomic(updating_path(rid), "detached\n")
+  if installing_idle(rid):
+    begin_installing(rid, (load_model(rid) or {}).get("recipe") or {})
   entry = os.path.join(os.path.dirname(os.path.realpath(__file__)), "omarchy-local-ai")
   command = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}", f"--description=Update local model {rid}"]
   env = dict(os.environ)
@@ -3940,13 +4027,14 @@ def detach_update(rid, catalog, profile):
       os.unlink(updating_path(rid))
     except OSError:
       pass
+    clear_installing(rid)
     raise LocalError(f"Can't start the update of {rid}: {(result.stderr.strip().splitlines() or ['systemd-run failed'])[-1]}")
   write_status(catalog, profile)
-  say(f"Updating {rid} in the background; the agents panel shows it, or follow it with: journalctl --user -u {unit} -f")
+  say(f"Updating {rid} in the background; the local models panel shows it, or follow it with: journalctl --user -u {unit} -f")
 
 
 def cmd_stop(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local stop")
+  parser = argparse.ArgumentParser(prog="omarchy models stop")
   parser.add_argument("recipe", nargs="?", help="the model to stop (default: every running one)")
   args = parser.parse_args(argv)
   catalog = load_catalog()
@@ -3972,7 +4060,7 @@ def cmd_stop(argv):
 
 
 def cmd_start(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local start")
+  parser = argparse.ArgumentParser(prog="omarchy models start")
   parser.add_argument("recipe", nargs="?", help="the model to start (default: the last one started)")
   args = parser.parse_args(argv)
   catalog = load_catalog()
@@ -4010,7 +4098,7 @@ def _start(args, catalog, profile):
     say(f"{rid} was stopped before it finished loading")
     return 1
   if result.returncode != 0:
-    record_error(rid, "Didn't start: omarchy agent local status shows why")
+    record_error(rid, "Didn't start: omarchy models status shows why")
   else:
     # Timed from the same moment the panel's bar starts from, the click.
     write_atomic(load_seconds_path(rid), f"{time.time() - started:.1f}\n")
@@ -4044,7 +4132,7 @@ def _start(args, catalog, profile):
 
 
 def cmd_remove(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local remove")
+  parser = argparse.ArgumentParser(prog="omarchy models remove")
   parser.add_argument("recipe")
   parser.add_argument("--local-only", action="store_true", help="for a model across two machines: remove it here even if the other can't be reached")
   args = parser.parse_args(argv)
@@ -4098,6 +4186,8 @@ def cmd_remove(argv):
       if manifest:
         pair_remove(manifest, args.local_only)
       result = _remove_files(rid)
+      # An update cancelled above leaves its progress behind.
+      clear_installing(rid)
       if size_gib > 1:
         write_atomic(os.path.join(state_dir(), "removal_rate"), f"{(time.time() - deleting) / size_gib:.4f}\n")
       # Only once everything else is gone: an interrupted removal leaves a
@@ -4260,10 +4350,12 @@ def publish_installing(rid, record):
       status = None
     if not isinstance(status, dict) or not isinstance(status.get("models"), dict):
       status = {"models": {}, "last": None, "ram_total_gib": round(gib(meminfo().get("MemTotal", 0)), 1), "best": None}
-    # An installed model's own row wins: setting up a recipe again leaves it listed as it is.
-    if status["models"].get(rid, {}).get("unit", "installing") != "installing":
-      return
-    status["models"][rid] = install_row(rid, record)
+    # An installed model keeps its own row: an update's progress rides on it.
+    row = status["models"].get(rid)
+    if row and row.get("unit", "installing") != "installing":
+      row["update_progress"] = install_row(rid, record)["install"]
+    else:
+      status["models"][rid] = install_row(rid, record)
     write_atomic(path, json.dumps(status, indent=2) + "\n")
 
 
@@ -4320,14 +4412,14 @@ def _remove_files(rid, setup_image=None):
 
 
 def cmd_profile(argv):
-  argparse.ArgumentParser(prog="omarchy agent local profile").parse_args(argv)
+  argparse.ArgumentParser(prog="omarchy models profile").parse_args(argv)
   profile = machine_profile()
   print(json.dumps(profile, indent=2))
   return 0
 
 
 def cmd_refresh(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local refresh")
+  parser = argparse.ArgumentParser(prog="omarchy models refresh")
   parser.add_argument("--quiet", action="store_true")
   args = parser.parse_args(argv)
   catalog = load_catalog()
@@ -4346,7 +4438,7 @@ def cmd_refresh(argv):
 
 
 def cmd_validate(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local validate")
+  parser = argparse.ArgumentParser(prog="omarchy models validate")
   parser.add_argument("catalog_dir")
   parser.add_argument("--online", action="store_true", help="also check every Hugging Face file and recipe license")
   args = parser.parse_args(argv)
@@ -4595,7 +4687,7 @@ def publish_shares(record, catalog, profile, force=False):
 
 
 def cmd_share(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local share", description="Share a model with the other machines on your tailnet")
+  parser = argparse.ArgumentParser(prog="omarchy models share", description="Share a model with the other machines on your tailnet")
   parser.add_argument("recipe", nargs="?")
   parser.add_argument("--off", action="store_true", help="stop sharing it")
   parser.add_argument("--export", action="store_true", help=argparse.SUPPRESS)
@@ -4612,7 +4704,7 @@ def cmd_share(argv):
   if not args.recipe:
     shares = shared_recipes()
     if not shares:
-      say("Nothing is shared. Share a model with: omarchy agent local share <recipe>")
+      say("Nothing is shared. Share a model with: omarchy models share <recipe>")
     for rid in shares:
       say(f"{rid}: https://{self_dns()}{SHARE_ROOT}/{rid}/v1")
     return 0
@@ -4621,7 +4713,7 @@ def cmd_share(argv):
     raise LocalError("Not a recipe id")
   if not args.off:
     if not load_model(rid):
-      raise LocalError(f"{rid} isn't set up. Run: omarchy agent local use {rid}")
+      raise LocalError(f"{rid} isn't set up. Run: omarchy models use {rid}")
     self_dns()
   with share_lock():
     shares = set(shared_recipes())
@@ -4673,7 +4765,7 @@ def ensure_share_proxy():
     "Description=Omarchy local AI: count who uses the shared models",
     "",
     "[Service]",
-    "ExecStart=/usr/bin/env omarchy-agent-local share-proxy",
+    "ExecStart=/usr/bin/env omarchy-models share-proxy",
     "Restart=on-failure",
     "",
   ])
@@ -4852,7 +4944,7 @@ def make_share_proxy(tracker, ports=None, shares=None):
 
 def cmd_share_proxy(argv):
   import http.server
-  argparse.ArgumentParser(prog="omarchy agent local share-proxy").parse_args(argv)
+  argparse.ArgumentParser(prog="omarchy models share-proxy").parse_args(argv)
   tracker = ClientTracker(clients_path())
   tracker.expire()
   server = http.server.ThreadingHTTPServer(("127.0.0.1", SHARE_PROXY_PORT), make_share_proxy(tracker))
@@ -5130,7 +5222,7 @@ def resolve_remote(mid, running_only=True):
   host, rid = split_remote_id(mid)
   remote = load_remotes().get(host)
   if not connected(remote, rid):
-    raise LocalError(f"{host}/{rid} isn't paired. Run: omarchy agent local pair {host} {rid}")
+    raise LocalError(f"{host}/{rid} isn't paired. Run: omarchy models pair {host} {rid}")
   state, listing, error = fetch_listing(remote["dns"])
   if state != "online":
     raise LocalError(f"{host} doesn't share models right now" if state == "not_sharing" else f"{host} isn't reachable{': ' + error if error else ''}")
@@ -5160,11 +5252,11 @@ def ssh_command(remote, *argv, interactive=False):
   # A host met for the first time is trusted on sight, as the tailnet vouches
   # for who it is; one whose key has changed since is still refused.
   options = ["-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"] + ([] if interactive else ["-o", "BatchMode=yes"])
-  return ["ssh", *options, "--", target, shlex.join(["omarchy-agent-local", *argv])]
+  return ["ssh", *options, "--", target, shlex.join(["omarchy-models", *argv])]
 
 
 def cmd_pair(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local pair", description="Use the models another machine on your tailnet shares")
+  parser = argparse.ArgumentParser(prog="omarchy models pair", description="Use the models another machine on your tailnet shares")
   parser.add_argument("host", help="its tailnet name, or an SSH host that reaches it")
   parser.add_argument("recipe", nargs="?", help="connect just this model; without one, every model it shares")
   args = parser.parse_args(argv)
@@ -5188,11 +5280,11 @@ def cmd_pair(argv):
   say(f"Pairing with {target} over SSH")
   # ssh exits 255 both when nothing answers and when sshd turns down every key
   # offered, so its stderr tells the two apart. On a terminal a key's
-  # passphrase can be asked for there; without one (the agents panel pairs this
+  # passphrase can be asked for there; without one (the local models panel pairs this
   # way) nothing can answer a prompt, so ssh asks none.
   result = subprocess.run(ssh_command({"ssh": target, "dns": ""}, "share", "--export", interactive=sys.stdin.isatty()), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
   sys.stderr.write(result.stderr)
-  # The agents panel shows an error's first line on the model's line, so that
+  # The local models panel shows an error's first line on the model's line, so that
   # line names the machine short and fits there; the next says what to do.
   name = short_host(target)
   if result.returncode == 255 and "Permission denied" in result.stderr:
@@ -5203,7 +5295,7 @@ def cmd_pair(argv):
   if result.returncode == 255:
     raise LocalError(f"Can't reach {name} over SSH\nTurn on SSHD on {target} in Setup > Security")
   if result.returncode != 0:
-    raise LocalError(f"Can't run omarchy-agent-local on {name}")
+    raise LocalError(f"Can't run omarchy-models on {name}")
   try:
     export = json.loads(result.stdout.strip().splitlines()[-1])
     host, dns, key = export["host"], export["dns"], export["key"]
@@ -5227,12 +5319,12 @@ def cmd_pair(argv):
   if shared:
     say(f"Paired with {host}: " + ", ".join(m["recipe"] + ("" if m["offline"] else f" ({m['unit']})") for m in shared))
   else:
-    say(f"Paired with {host}. It shares no models yet; on {host}, run: omarchy agent local share <recipe>")
+    say(f"Paired with {host}. It shares no models yet; on {host}, run: omarchy models share <recipe>")
   return 0
 
 
 def cmd_forget(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local forget", description="Unpair a host, or disconnect one of its models with host/recipe")
+  parser = argparse.ArgumentParser(prog="omarchy models forget", description="Unpair a host, or disconnect one of its models with host/recipe")
   parser.add_argument("host", help="host, or host/recipe for just that model")
   args = parser.parse_args(argv)
   host = args.host
@@ -5261,7 +5353,7 @@ def cmd_forget(argv):
 
 
 def cmd_network(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local network", description="List the models shared on your tailnet")
+  parser = argparse.ArgumentParser(prog="omarchy models network", description="List the models shared on your tailnet")
   parser.add_argument("--json", action="store_true")
   parser.add_argument("--write", action="store_true", help=argparse.SUPPRESS)
   args = parser.parse_args(argv)
@@ -5275,10 +5367,10 @@ def cmd_network(argv):
     say("This machine isn't on a tailnet. Run: tailscale up")
     return 0
   if not network["models"]:
-    say("No machine on your tailnet shares a model. On one that runs a model: omarchy agent local share <recipe>")
+    say("No machine on your tailnet shares a model. On one that runs a model: omarchy models share <recipe>")
   for mid, model in sorted(network["models"].items()):
     state = model["offline"] or {"active": "running", "activating": "loading", "deactivating": "stopping"}.get(model["unit"], model["unit"])
-    pairing = "" if model["paired"] else f" · pair with: omarchy agent local pair {model['host']} {model['recipe']}"
+    pairing = "" if model["paired"] else f" · pair with: omarchy models pair {model['host']} {model['recipe']}"
     say(f"{mid} ({model['name']}): {state} · context {model['ctx']}{pairing}")
   return 0
 
@@ -5415,7 +5507,7 @@ def sync_pi_extension():
       if os.path.exists(path):
         os.unlink(path)
       return
-    source = pi_provider_source("Generated by omarchy-agent-local for every model set up here or paired on the tailnet; rewritten as they change.", targets)
+    source = pi_provider_source("Generated by omarchy-models for every model set up here or paired on the tailnet; rewritten as they change.", targets)
     if _read(path) != source.strip():
       write_atomic(path, source)
 
@@ -5427,7 +5519,7 @@ def pi_overlay(rid=None):
   target = overlay_target(rid)
   siblings = local_targets() if target["provider"] == OVERLAY_PROVIDER else remote_targets()
   targets = [target] + [other for other in siblings if other["provider"] == target["provider"] and other["model"] != target["model"]]
-  source = pi_provider_source("Generated by omarchy-agent-local overlay for `omarchy agent --local`; rewritten on every launch.", targets)
+  source = pi_provider_source("Generated by omarchy-models overlay for `omarchy agent --local`; rewritten on every launch.", targets)
   # One file per model: launches of two models close together must not
   # swap each other's overlay before their agents read it.
   path = os.path.join(config_dir(), "overlays", f"pi-{target['file']}.ts")
@@ -5503,7 +5595,7 @@ OVERLAYS = {"pi": lambda rid: pi_overlay(rid), "opencode": lambda rid: opencode_
 
 
 def cmd_overlay(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local overlay")
+  parser = argparse.ArgumentParser(prog="omarchy models overlay")
   parser.add_argument("agent", choices=tuple(OVERLAYS))
   parser.add_argument("recipe", nargs="?", help="the running model, or host/recipe on a paired machine (default: the last one started here)")
   args = parser.parse_args(argv)
@@ -5513,13 +5605,13 @@ def cmd_overlay(argv):
 
 
 def cmd_logs(argv):
-  parser = argparse.ArgumentParser(prog="omarchy agent local logs")
+  parser = argparse.ArgumentParser(prog="omarchy models logs")
   parser.add_argument("recipe", nargs="?", help="the model (default: the last one started)")
   parser.add_argument("-n", "--lines", type=int, default=200)
   args = parser.parse_args(argv)
   rid = args.recipe or last_model_id()
   if not rid or not ID_RE.match(rid):
-    raise LocalError("Name the model: omarchy agent local logs <recipe>")
+    raise LocalError("Name the model: omarchy models logs <recipe>")
   # A first setup or start that failed keeps its reason, and its peer, in its installing record.
   installing = load_installing(rid) or {}
   error = _read(error_path(rid)) or installing.get("error", "")
@@ -5547,7 +5639,7 @@ def cmd_logs(argv):
 def cmd_dismiss(argv):
   """Forget why a model last failed, once its logs have been read: the panel drops the error from
   its line. The journal keeps the log itself."""
-  parser = argparse.ArgumentParser(prog="omarchy agent local dismiss")
+  parser = argparse.ArgumentParser(prog="omarchy models dismiss")
   parser.add_argument("recipe")
   args = parser.parse_args(argv)
   rid = resolve_model(args.recipe)["recipe_id"]
@@ -5575,6 +5667,7 @@ COMMANDS = {
   # Plumbing for the panel, omarchy agent, omarchy update and catalog
   # maintainers; they run but aren't listed.
   "profile": cmd_profile,
+  "memory": cmd_memory,
   "refresh": cmd_refresh,
   "dismiss": cmd_dismiss,
   "validate": cmd_validate,
@@ -5602,9 +5695,9 @@ SUMMARIES = {
 
 
 def usage():
-  lines = ["Usage: omarchy agent local <command> [args]", ""]
+  lines = ["Usage: omarchy models <command> [args]", ""]
   lines += [f"  {name:<10} {summary}" for name, summary in SUMMARIES.items()]
-  lines += ["", "Run omarchy-agent-local <command> --help for its arguments."]
+  lines += ["", "Run omarchy models <command> --help for its arguments."]
   return "\n".join(lines)
 
 

@@ -1,6 +1,6 @@
 # omarchy-local-ai
 
-The local-model engine, recipe catalog and internals reference for Omarchy. The Arch package `omarchy-local-ai` installs this tree to `/usr/share/omarchy-local-ai` and symlinks `/usr/bin/omarchy-local-ai` to its executable entry script. Omarchy's thin `omarchy-agent-local` wrapper exposes it as `omarchy agent local <command>`.
+The local-model engine, recipe catalog and internals reference for Omarchy. The Arch package `omarchy-local-ai` installs this tree to `/usr/share/omarchy-local-ai` and symlinks `/usr/bin/omarchy-local-ai` to its executable entry script. Omarchy's thin `omarchy-models` wrapper exposes it as `omarchy models <command>`.
 
 The engine resolves recipes, downloads pinned weights, and manages rootless Podman model servers with an internal network, read-only root, dropped capabilities, allowlisted devices and authenticated loopback endpoints. The catalog ships with the engine; it is never fetched at runtime. See [engine contract](docs/engine.md) for the security boundary, lifecycle and state formats.
 
@@ -10,7 +10,7 @@ Python 3.11 or newer is required. On Omarchy, run:
 
 ```bash
 ./omarchy-local-ai list
-./omarchy-local-ai use best
+./omarchy-local-ai use best text
 ./omarchy-local-ai validate .
 ./tests/engine-test.sh
 ```
@@ -58,4 +58,4 @@ Validate and test, then tag the release `vX.Y.Z`; nothing in the repo is bumped.
 
 `bench/` and `tools/` do not need to ship in the Arch package. Measurement records still ship: recipe validation and the panel use them.
 
-After package updates, `omarchy-agent-local refresh --quiet` rewrites the panel's list and status caches. It does not download a catalog or change running models.
+After package updates, `omarchy-models refresh --quiet` rewrites the panel's list and status caches. It does not download a catalog or change running models.
