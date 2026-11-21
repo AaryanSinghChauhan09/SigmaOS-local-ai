@@ -10,7 +10,7 @@ Python 3.11 or newer is required. On Omarchy, run:
 
 ```bash
 ./omarchy-local-ai list
-./omarchy-local-ai use best
+./omarchy-local-ai use best text
 ./omarchy-local-ai validate .
 ./tests/engine-test.sh
 ```

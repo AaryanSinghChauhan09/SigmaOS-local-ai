@@ -87,6 +87,9 @@ ROLES = ("model", "draft", "text_encoder", "vae", "audio_vae", "lora")
 # What a recipe serves: text (chat completions, for the agents), images, video or music. Agents,
 # overlays, the default model and tailnet sharing only ever see text models.
 KINDS = ("text", "image", "video", "music")
+# Where best.toml lists each kind's recommendations, in order of preference: the agents' text
+# models, and the models that make pictures, clips and music beside them.
+BEST_FIELDS = {"text": "recipes", "image": "images", "video": "videos", "music": "music"}
 # How the engine checks a server it just started answers only with the key: an OpenAI-compatible
 # /v1/models that lists the recipe id, stable-diffusion.cpp's model status reporting ready, or
 # acestep.cpp's list of the models it found.
@@ -1035,12 +1038,16 @@ def validate_best(best, recipes):
     if not isinstance(names, list) or not names:
       errors.append(f"{where}.recipes: must be a non-empty list")
       continue
-    # `recipes` choose the agents' model and `use best`; `images`, the image models offered beside them.
-    images = entry.get("images", [])
-    if not isinstance(images, list):
-      errors.append(f"{where}.images: must be a list")
-      images = []
-    for field, kind, name in [("recipes", "text", name) for name in names] + [("images", "image", name) for name in images]:
+    # `recipes` choose the agents' model and `use best text`; the other kinds' lists, the models
+    # recommended beside it, each its own `use best <kind>`.
+    listed = []
+    for kind, field in BEST_FIELDS.items():
+      values = names if field == "recipes" else entry.get(field, [])
+      if not isinstance(values, list):
+        errors.append(f"{where}.{field}: must be a list")
+        continue
+      listed += [(field, kind, name) for name in values]
+    for field, kind, name in listed:
       recipe = recipes.get(name)
       if recipe is None:
         errors.append(f"{where}: unknown recipe '{name}'")
@@ -1168,7 +1175,7 @@ def match_class(best, profile, gpu):
 def resolve_best(catalog, profile, gpu=None, ctx=None, field="recipes"):
   """The first fitting recipe of the class of `gpu`, or, with none named, of this machine's
   GPUs from the strongest down: a pair's class first, then its own node's. `field` is the class's
-  list to choose from: its text recipes, or with "images" its image models."""
+  list to choose from: its text recipes, or another kind's list (BEST_FIELDS)."""
   if gpu is not None:
     return _resolve_class(catalog, profile, gpu, ctx, field)
   gpus = sorted(profile["gpus"], key=lambda g: (g.get("nodes", 1), g["memory_gib"]), reverse=True)
@@ -1193,6 +1200,9 @@ def _resolve_class(catalog, profile, gpu, ctx=None, field="recipes"):
       f"No recommendation for this machine yet ({gpu['family']}, {profile['ram_class']} GB, {profile['platform']}).\n"
       + (f"Recipes measured on the same GPU family: {', '.join(near)}" if near else "No recipes are measured on this GPU family yet.")
     )
+  if not entry.get(field):
+    kind = next((name for name, listed in BEST_FIELDS.items() if listed == field), field)
+    raise LocalError(f"No {kind} model is recommended for this machine yet ({gpu['family']}, {profile['ram_class']} GB)")
   skipped = []
   for rid in entry.get(field, []):
     if rid not in catalog.recipes:
@@ -1217,7 +1227,7 @@ def recipe_listing(catalog, profile, running=()):
     gpu, gpu_error = None, str(error)
   best_ids = set()
   if gpu:
-    for field in ("recipes", "images"):
+    for field in BEST_FIELDS.values():
       try:
         best_ids.add(resolve_best(catalog, profile, field=field)[0])
       except LocalError:
@@ -3069,7 +3079,7 @@ def resolve_model(rid=None, running_only=False):
     return manifest
   manifest = default_model(running_only)
   if not manifest:
-    raise LocalError("No local model is running. Run: omarchy models use best" if running_only else "No local model set up. Run: omarchy models use best")
+    raise LocalError("No local model is running. Run: omarchy models use best text" if running_only else "No local model set up. Run: omarchy models use best text")
   return manifest
 
 
@@ -3230,6 +3240,7 @@ def _lookup_recipe(catalog, target):
 def cmd_use(argv):
   parser = argparse.ArgumentParser(prog="omarchy models use")
   parser.add_argument("target", help="best, or a recipe id")
+  parser.add_argument("kind", nargs="?", choices=KINDS, help="with best: the kind of model, text, image, video or music")
   parser.add_argument("--ctx", type=int)
   parser.add_argument("--gpu")
   parser.add_argument("--seed", help="reuse matching files from this directory before downloading")
@@ -3238,12 +3249,23 @@ def cmd_use(argv):
   catalog = load_catalog()
   profile = machine_profile()
   gpu = choose_gpu(profile, args.gpu) if args.gpu else None
+  if args.target == "best" and args.kind is None:
+    # Every kind has a best of its own, so best alone asks which.
+    say(f"Name the kind of model: omarchy models use best <{'|'.join(KINDS)}>")
+    for kind, field in BEST_FIELDS.items():
+      try:
+        say(f"  {kind}: {resolve_best(catalog, profile, gpu, field=field)[0]}")
+      except LocalError:
+        say(f"  {kind}: none for this machine yet")
+    return 2
+  if args.kind is not None and args.target != "best":
+    raise LocalError(f"A kind goes with best: omarchy models use best {args.kind}")
   if args.target == "best":
-    rid, variant, skipped = resolve_best(catalog, profile, gpu, args.ctx)
+    rid, variant, skipped = resolve_best(catalog, profile, gpu, args.ctx if args.kind == "text" else None, field=BEST_FIELDS[args.kind])
     gpu = recipe_gpu(profile, catalog.recipes[rid], args.gpu, catalog.runtimes.get(catalog.recipes[rid].get("runtime")))
     for skipped_id, reason in skipped:
       say(f"Skipping {skipped_id}: {reason}")
-    say(f"Best for this machine ({gpu['family']}, {profile['ram_class']} GB): {rid}")
+    say(f"Best {args.kind} model for this machine ({gpu['family']}, {profile['ram_class']} GB): {rid}")
   else:
     rid = args.target
     recipe = _lookup_recipe(catalog, rid)
@@ -3899,7 +3921,7 @@ def cmd_status(argv):
     print(json.dumps(record, indent=2))
     return 0
   if not record["models"]:
-    say("No local model has been set up. Run: omarchy models use best")
+    say("No local model has been set up. Run: omarchy models use best text")
     return 0
   for rid, model in record["models"].items():
     state = {"active": "running", "activating": "loading", "deactivating": "stopping"}.get(model["unit"], model["unit"])
@@ -3914,7 +3936,7 @@ def cmd_status(argv):
       if tail:
         say("  " + tail.replace("\n", "\n  "))
   if record["best"] and record["best"] not in record["models"]:
-    say(f"The recommendation for this machine is {record['best']}: omarchy models use best")
+    say(f"The recommendation for this machine is {record['best']}: omarchy models use best text")
   return 0
 
 

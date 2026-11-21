@@ -80,8 +80,9 @@ rejected. `validate <catalog-dir>` checks the records and referenced evidence;
 
 ## Lifecycle
 
-`use best` matches the GPU class and RAM class, tries the class's text recipes
-in order, checks that the runtime runs on the GPU and that the recipe fits, and
+`use best <kind>` (`text`, `image`, `video` or `music`) matches the GPU class and RAM class, tries the
+class's recipes of that kind (`recipes` for text, else `images`, `videos` or `music` in `best.toml`)
+in order; `use best` alone lists each kind's pick for this machine and sets nothing up. It checks that the runtime runs on the GPU and that the recipe fits, and
 chooses the largest fitting context, and at the same context the variant with the larger memory peak that fits.
 A GPU class is its family, except that the N1x (`nvidia-n1x`) shares the GB10's (`nvidia-gb10`): the same
 chip, so what either can run depends only on memory. Measurements keep the family they ran on. `use <recipe>` supports `--ctx`, `--gpu`,

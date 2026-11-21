@@ -1531,6 +1531,14 @@ check("best stays the text recommendation, and image models resolve on their own
 rows = {row["id"]: row for row in a.recipe_listing(img_catalog, profile)}
 check("list rows carry their kind and the best of each kind", (rows["picture"]["kind"], rows["model"]["kind"]) == ("image", "text") and rows["picture"]["best"] and rows["model"]["best"]
       and rows["picture"]["available"] and rows["picture"]["context"] is None and rows["picture"]["reason"] == "", repr(rows["picture"]))
+# Video and music models are recommended beside them the same way, each kind its own use best.
+check("best.toml lists video models of their own", not a.validate_best({"class": [dict(entry, videos=["clip"])]}, {"model": recipe, "clip": clip}))
+check("a kind's list takes only that kind", any(".music: 'picture' is of kind image, not music" in e for e in a.validate_best({"class": [dict(entry, music=["picture"])]}, {"model": recipe, "picture": picture})))
+raises("a kind with nothing recommended says so", lambda: a.resolve_best(img_catalog, profile, gpu, field="videos"), "No video model is recommended")
+said = []
+with patch.object(a, "load_catalog", return_value=img_catalog), patch.object(a, "machine_profile", return_value=profile), patch.object(a, "say", side_effect=said.append):
+  asked = a.cmd_use(["best"])
+check("best alone names each kind's pick and sets nothing up", asked == 2 and "  text: model" in said and "  image: picture" in said and "  video: none for this machine yet" in said, repr(said))
 
 # Status rows say what kind of model they are; an image model's has no context.
 picture_manifest = {"schema": 1, "recipe_id": "picture", "recipe": picture, "runtime": sd_rt, "runtime_id": "sd", "image": sd_rt["image"],
