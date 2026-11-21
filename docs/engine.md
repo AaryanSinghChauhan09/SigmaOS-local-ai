@@ -261,6 +261,10 @@ with `--started <recipe>` or `--stopped <recipe>` from their hooks.
 `list --json` and `status --json` print the corresponding shapes; `profile`
 prints the machine profile. `refresh` rebuilds both caches using the installed
 catalog without changing running models.
+`memory --json` prints what each running model holds now, in GiB, for the panel's memory
+bar while it's open: its unit's anonymous memory and the GTT its processes map, once per GPU
+client, but not the file cache it reads weights through, which the kernel counts as available.
+`observed.ram_used_gib` stays what it took to load.
 
 ## Client integration
 

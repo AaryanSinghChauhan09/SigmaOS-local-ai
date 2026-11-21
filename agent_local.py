@@ -3815,6 +3815,59 @@ def write_status(catalog, profile, transitions=None, pending=None, publish=True)
     return record
 
 
+def held_bytes(cgroup, cgroup_root="/sys/fs/cgroup", proc="/proc"):
+  """What the processes of one cgroup hold now that the machine can't take back: their anonymous
+  memory, and the GPU memory mapped from system RAM (GTT) that the driver charges to no cgroup,
+  counted once per GPU client however many descriptors share it. The file cache they read
+  weights through isn't held: the kernel counts it as available, and frees it under pressure."""
+  base = os.path.join(cgroup_root, cgroup.lstrip("/"))
+  held = 0
+  for line in _read(os.path.join(base, "memory.stat")).splitlines():
+    key, _, value = line.partition(" ")
+    if key == "anon" and value.strip().isdigit():
+      held += int(value)
+  pids = []
+  for folder, _, files in os.walk(base):
+    if "cgroup.procs" in files:
+      pids += [pid for pid in _read(os.path.join(folder, "cgroup.procs")).split() if pid.isdigit()]
+  for pid in pids:
+    clients = {}
+    try:
+      names = os.listdir(os.path.join(proc, pid, "fdinfo"))
+    except OSError:
+      continue
+    for name in names:
+      fields = {}
+      for line in _read(os.path.join(proc, pid, "fdinfo", name)).splitlines():
+        key, _, value = line.partition(":")
+        fields[key] = value.strip()
+      client = fields.get("drm-client-id")
+      gtt = fields.get("drm-memory-gtt", "").split()
+      if client and gtt and gtt[0].isdigit():
+        clients[client] = int(gtt[0]) * (1024 if gtt[1:] == ["KiB"] else 2**20 if gtt[1:] == ["MiB"] else 1)
+    held += sum(clients.values())
+  return held
+
+
+def cmd_memory(argv):
+  """What each running model holds now, in GiB, for the panel's memory bar: observed.ram_used_gib
+  is what it took to load, and an idle model may since have let much of that go."""
+  parser = argparse.ArgumentParser(prog="omarchy models memory")
+  parser.add_argument("--json", action="store_true")
+  args = parser.parse_args(argv)
+  held = {}
+  for rid in known_models():
+    props = unit_props(rid, "ActiveState", "ControlGroup")
+    if props.get("ActiveState") in ("active", "activating", "reloading") and props.get("ControlGroup"):
+      held[rid] = round(gib(held_bytes(props["ControlGroup"])), 1)
+  if args.json:
+    print(json.dumps(held))
+  else:
+    for rid, value in held.items():
+      say(f"{rid}: {value:.1f} GiB")
+  return 0
+
+
 def cmd_status(argv):
   parser = argparse.ArgumentParser(prog="omarchy agent local status")
   parser.add_argument("--json", action="store_true")
@@ -5592,6 +5645,7 @@ COMMANDS = {
   # Plumbing for the panel, omarchy agent, omarchy update and catalog
   # maintainers; they run but aren't listed.
   "profile": cmd_profile,
+  "memory": cmd_memory,
   "refresh": cmd_refresh,
   "dismiss": cmd_dismiss,
   "validate": cmd_validate,
