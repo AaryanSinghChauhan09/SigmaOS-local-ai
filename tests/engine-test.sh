@@ -1532,6 +1532,28 @@ check("best stays the text recommendation, and image models resolve on their own
 rows = {row["id"]: row for row in a.recipe_listing(img_catalog, profile)}
 check("list rows carry their kind and the best of each kind", (rows["picture"]["kind"], rows["model"]["kind"]) == ("image", "text") and rows["picture"]["best"] and rows["model"]["best"]
       and rows["picture"]["available"] and rows["picture"]["context"] is None and rows["picture"]["reason"] == "", repr(rows["picture"]))
+# An experimental recipe is kept for trying by name: listed once set up or when asked for, never recommended.
+trial = dict(copy.deepcopy(recipe), experimental=True)
+trial_catalog = SimpleNamespace(root=str(repo), recipes={"model": recipe, "trial": trial}, runtimes=both, best=images_best)
+check("experimental takes only true or false", any(".experimental: true or false" in e for e in a.validate_recipe("trial", dict(trial, experimental="yes"), {"server": runtime})))
+check("an experimental recipe is otherwise valid", not a.validate_recipe("trial", trial, {"server": runtime}))
+check("best.toml can't recommend an experimental recipe", any("'trial' is experimental" in e for e in a.validate_best({"class": [dict(entry, recipes=["trial", "model"])]}, {"model": recipe, "trial": trial})))
+with patch.object(a, "recipe_installed", return_value=False):
+  hidden = {row["id"] for row in a.recipe_listing(trial_catalog, profile)}
+  asked = {row["id"]: row for row in a.recipe_listing(trial_catalog, profile, experimental=True)}
+check("the listing leaves an experimental recipe out", hidden == {"model"}, repr(hidden))
+check("asked for, it lists it and says it's experimental", asked["trial"]["experimental"] and not asked["model"]["experimental"], repr(asked))
+with patch.object(a, "recipe_installed", side_effect=lambda rid: rid == "trial"):
+  installed = {row["id"] for row in a.recipe_listing(trial_catalog, profile)}
+check("once set up, it's listed so it can be started, stopped and removed", installed == {"model", "trial"}, repr(installed))
+printed, saved = [], []
+with patch.object(a, "load_catalog", return_value=trial_catalog), patch.object(a, "machine_profile", return_value=profile), \
+     patch.object(a, "running_models", return_value=set()), patch.object(a, "recipe_installed", return_value=False), \
+     patch.object(a, "write_list_cache", side_effect=saved.append), patch("builtins.print", side_effect=printed.append):
+  a.cmd_list(["--json", "--experimental"])
+shown = {row["id"] for row in json.loads(printed[0])}
+check("list --experimental shows it, and the panel's saved listing still leaves it out",
+      shown == {"model", "trial"} and len(saved) == 1 and {row["id"] for row in saved[0]} == {"model"}, repr((shown, saved)))
 # Video and music models are recommended beside them the same way, each kind its own use best.
 check("best.toml lists video models of their own", not a.validate_best({"class": [dict(entry, videos=["clip"])]}, {"model": recipe, "clip": clip}))
 check("a kind's list takes only that kind", any(".music: 'picture' is of kind image, not music" in e for e in a.validate_best({"class": [dict(entry, music=["picture"])]}, {"model": recipe, "picture": picture})))

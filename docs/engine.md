@@ -50,7 +50,7 @@ The real records are the examples and source of values:
 | Path | Rules |
 | --- | --- |
 | [catalog.toml](../catalog.toml) | The catalog schema, 1. |
-| [recipes/](../recipes/) | Name, runtime, pinned artifacts, measured hardware, context variants, sampling and optional server arguments. `kind` is `text` (the default: chat models for the agents) `image` (image generation, whose variants may omit `ctx`), `video` (clips) or `music` (songs), which run like image models. Vendor names the panel logo; architecture is `dense` or `moe`; `input` is `["text"]` (the default) or `["text", "image"]`, which the agent overlays declare so agents can send screenshots. |
+| [recipes/](../recipes/) | Name, runtime, pinned artifacts, measured hardware, context variants, sampling and optional server arguments. `kind` is `text` (the default: chat models for the agents) `image` (image generation, whose variants may omit `ctx`), `video` (clips) or `music` (songs), which run like image models. Vendor names the panel logo; architecture is `dense` or `moe`; `input` is `["text"]` (the default) or `["text", "image"]`, which the agent overlays declare so agents can send screenshots. `experimental = true` keeps a recipe for trying by name: `list` and the panel leave it out until it's set up (`list --experimental` shows it), `use <recipe>` says so, and `best.toml` can't recommend it. It needs the same pinned image, review and measurement as any other. |
 | [runtimes/](../runtimes/) | Digest-pinned image, `gpus` (the vendors, `amd`, `intel` or `nvidia`, or the GPU classes such as `amd-strix-halo` its image works on, each reachable through its devices), tier, port, command, standard input mappings, reserved options, nonempty `health.probe` argv and `api` (`openai`, the default, `sdcpp` or `acestep`), which selects the post-start check; an `openai` runtime must map `alias`. A paired runtime adds `listen` (its bind flags), `@PORT@` in its probe and a `[pair]` table: `nodes = 2`, `master_port`, optional `prepare` and `worker` commands (without one, rank 1 runs the head's own invocation, for servers that compare the ranks' arguments), an optional served `model` under `/prepared`, an optional `state` path where each rank's folder is mounted writable for the server's caches (else read-only at `/prepared`), and `env`, `head_env` and `worker_env` (any names but the link's `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA` and `NCCL_IB_GID_INDEX`, which the engine sets), whose values may hold `@RANK@`, `@WORLD@`, `@MASTER_ADDR@`, `@MASTER_PORT@`, `@CTX@`, `@RDMA_DEVICES@`, `@GID_INDEX@` and `@SOCKET_IFNAME@`. |
 | [reviews/](../reviews/) | Third-party image digest, publisher, reviewer, date, license URL/hash and checked properties. |
 | [measurements/](../measurements/) | Speed and memory on one machine class, the evidence `best.toml` recommends by, artifact identities, context, memory, load time and short, long and code-edit prompt timings; for an image model, seconds per image at a size and step count instead. |
@@ -248,8 +248,9 @@ log from the peer. Transition timestamps are Unix milliseconds. Pending activati
 the current manifest's observations until the new setup has been measured.
 
 `list.json` rows contain `id`, `kind`, `name`, `runtime`, `tier`, `publisher`,
-`vendor`, `architecture`, `installed`, `available`, `reason`, `best`, `active`,
-`memory_gib`, `context`, `decode_tok_s` and `prefill_tok_s`. `best` marks the
+`vendor`, `architecture`, `installed`, `experimental`, `available`, `reason`, `best`, `active`,
+`memory_gib`, `context`, `decode_tok_s` and `prefill_tok_s`. An experimental recipe has a row only
+once it's set up. `best` marks the
 recommendation of the row's kind: the class's first fitting text recipe and, apart from it,
 its first fitting image model. Unavailable variants have null memory/context, as image models
 always have a null context; missing measurements have null speeds.
