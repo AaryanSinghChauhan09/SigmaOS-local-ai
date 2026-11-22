@@ -867,6 +867,9 @@ def validate_recipe(rid, recipe, runtimes, root=None):
   # rather than redrawing it from a description.
   if "edit" in recipe and (not isinstance(recipe["edit"], bool) or kind != "image"):
     errors.append(f"{where}.edit: true or false, for image models only")
+  # A model kept for trying by name: out of the listings until it's set up, and never recommended.
+  if "experimental" in recipe and not isinstance(recipe["experimental"], bool):
+    errors.append(f"{where}.experimental: true or false")
   # What a setup downloads, for a first-run screen to say before it starts.
   if "download_gib" in recipe and (not isinstance(recipe["download_gib"], (int, float)) or isinstance(recipe["download_gib"], bool)
                                    or not math.isfinite(recipe["download_gib"]) or recipe["download_gib"] <= 0):
@@ -1055,6 +1058,9 @@ def validate_best(best, recipes):
       if recipe_kind(recipe) != kind:
         errors.append(f"{where}.{field}: '{name}' is of kind {recipe_kind(recipe)}, not {kind}")
         continue
+      if recipe.get("experimental"):
+        errors.append(f"{where}.{field}: '{name}' is experimental, so it can't be recommended")
+        continue
       qualified = any(
         hw.get("ram_class") == entry.get("ram_class")
         and gpu_class(hw.get("gpu")) == gpu_class(entry.get("gpu"))
@@ -1219,7 +1225,9 @@ def _resolve_class(catalog, profile, gpu, ctx=None, field="recipes"):
   raise LocalError(f"No recommended recipe fits this machine: {details}")
 
 
-def recipe_listing(catalog, profile, running=()):
+def recipe_listing(catalog, profile, running=(), experimental=False):
+  """The catalog's recipes for this machine. An experimental one is left out unless it's set up
+  here, so it can still be started, stopped and removed, or experimental asks for them all."""
   rows = []
   try:
     gpu = choose_gpu(profile)
@@ -1234,6 +1242,8 @@ def recipe_listing(catalog, profile, running=()):
         pass
   for rid in sorted(catalog.recipes):
     recipe = catalog.recipes[rid]
+    if recipe.get("experimental") and not experimental and not recipe_installed(rid):
+      continue
     runtime = catalog.runtimes.get(recipe.get("runtime"), {})
     if gpu:
       own = recipe_gpu(profile, recipe, runtime=runtime)
@@ -1253,6 +1263,7 @@ def recipe_listing(catalog, profile, running=()):
       "vendor": recipe.get("vendor", ""),
       "architecture": recipe.get("architecture", ""),
       "installed": recipe_installed(rid),
+      "experimental": bool(recipe.get("experimental")),
       "available": variant is not None,
       "reason": "" if variant else reason,
       # The recommendation of its kind: the agents' model, or the image model beside it.
@@ -3273,6 +3284,8 @@ def cmd_use(argv):
     variant, reason = compatibility(catalog, rid, profile, gpu, args.ctx)
     if variant is None:
       raise LocalError(f"{rid} can't run on this machine: {reason}")
+    if recipe.get("experimental"):
+      say(f"{rid} is experimental: kept for trying, and not recommended for any machine")
   measured_load = load_measurement(catalog, catalog.recipes[rid], profile, gpu).get("load_seconds")
   # Before a detached setup leaves this process, so polkit can still ask in the user's session.
   raise_gpu_memory(variant, gpu, args.detach)
@@ -3453,11 +3466,16 @@ def refresh_list_cache(catalog, profile):
 def cmd_list(argv):
   parser = argparse.ArgumentParser(prog="omarchy models list")
   parser.add_argument("--json", action="store_true")
+  parser.add_argument("--experimental", action="store_true", help="also list the experimental models, which are kept for trying by name")
   args = parser.parse_args(argv)
   profile = machine_profile()
   catalog = load_catalog()
-  rows = recipe_listing(catalog, profile, running_models())
+  running = running_models()
+  rows = recipe_listing(catalog, profile, running)
+  # The panel's cache stays the default listing, whatever this one shows.
   write_list_cache(rows)
+  if args.experimental:
+    rows = recipe_listing(catalog, profile, running, experimental=True)
   if args.json:
     print(json.dumps(rows, indent=2))
     return 0
@@ -3465,7 +3483,7 @@ def cmd_list(argv):
   paired = f" · linked to {profile['pair']['host']}" if profile.get("pair") else ""
   say(f"This machine: {gpu}, {profile['ram_class']} GB, {profile['platform']}{paired}")
   for row in rows:
-    marks = [mark for mark, on in (("best", row["best"]), ("running", row["active"]), ("installed", row["installed"])) if on]
+    marks = [mark for mark, on in (("best", row["best"]), ("experimental", row["experimental"]), ("running", row["active"]), ("installed", row["installed"])) if on]
     tier = f" · third-party ({row['publisher']})" if row["tier"] == "third-party" else ""
     say(f"{'●' if row['available'] else '○'} {row['id']}{' [' + ', '.join(marks) + ']' if marks else ''}")
     say(f"    {row['name']} on {row['runtime']}{tier}")
