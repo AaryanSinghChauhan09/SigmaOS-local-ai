@@ -259,7 +259,11 @@ The panel calls plain `start <recipe>`, `stop <recipe>`, `remove <recipe>`,
 `use --detach <recipe>`, `refresh --quiet` on opening the add view, and
 `status --write` when refreshing admission state, and opens `logs <recipe>` in a
 terminal from a failure's error line. Units call `status --write`
-with `--started <recipe>` or `--stopped <recipe>` from their hooks.
+with `--started <recipe>` or `--stopped <recipe>` from their hooks. The hooks, the share proxy and
+detached setups run the engine by the path of its own entry script, never through the PATH, which a
+systemd user manager needn't share with the desktop; `refresh` and `start` point the hooks of units
+an older engine wrote at the engine running. The cable hook runs `/usr/bin/omarchy-local-ai`, and
+commands for paired machines run `omarchy-local-ai` over SSH.
 `list --json` and `status --json` print the corresponding shapes; `profile`
 prints the machine profile. `refresh` rebuilds both caches using the installed
 catalog without changing running models.
