@@ -38,9 +38,10 @@ COPY requirements-extra.txt /opt/inkling2/requirements-extra.txt
 RUN pip install --no-cache-dir --no-deps --require-hashes -r /opt/inkling2/engine/spark/requirements-spark.lock \
  && pip install --no-cache-dir --no-deps --require-hashes -r /opt/inkling2/requirements-extra.txt \
  && python3 -c "import transformers, fastapi, uvicorn, starlette, marisa_trie, jinja2, PIL, safetensors, tokenizers"
-# The CUDA extension for the GB10 (compute capability 12.1).
+# The CUDA extension for the GB10 (compute capability 12.1), four files at a time: more runs the 16 GB build runner out
+# of memory.
 RUN cd /opt/inkling2/exllamav3 \
- && TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=12 python setup.py build_ext --inplace \
+ && TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=4 python setup.py build_ext --inplace \
  && rm -rf build
 COPY --from=caddy /caddy/caddy /usr/bin/caddy
 COPY --from=caddy /caddy/LICENSE /usr/share/licenses/caddy/LICENSE
