@@ -1546,6 +1546,14 @@ check("asked for, it lists it and says it's experimental", asked["trial"]["exper
 with patch.object(a, "recipe_installed", side_effect=lambda rid: rid == "trial"):
   installed = {row["id"] for row in a.recipe_listing(trial_catalog, profile)}
 check("once set up, it's listed so it can be started, stopped and removed", installed == {"model", "trial"}, repr(installed))
+printed, saved = [], []
+with patch.object(a, "load_catalog", return_value=trial_catalog), patch.object(a, "machine_profile", return_value=profile), \
+     patch.object(a, "running_models", return_value=set()), patch.object(a, "recipe_installed", return_value=False), \
+     patch.object(a, "write_list_cache", side_effect=saved.append), patch("builtins.print", side_effect=printed.append):
+  a.cmd_list(["--json", "--experimental"])
+shown = {row["id"] for row in json.loads(printed[0])}
+check("list --experimental shows it, and the panel's saved listing still leaves it out",
+      shown == {"model", "trial"} and len(saved) == 1 and {row["id"] for row in saved[0]} == {"model"}, repr((shown, saved)))
 # Video and music models are recommended beside them the same way, each kind its own use best.
 check("best.toml lists video models of their own", not a.validate_best({"class": [dict(entry, videos=["clip"])]}, {"model": recipe, "clip": clip}))
 check("a kind's list takes only that kind", any(".music: 'picture' is of kind image, not music" in e for e in a.validate_best({"class": [dict(entry, music=["picture"])]}, {"model": recipe, "picture": picture})))
