@@ -1,5 +1,5 @@
 # The key check in front of the server, which has none of its own: every route needs the key in I2_API_KEY, and the
-# rest streams to the server on loopback as it comes. serve sets where each listens. The site answers any Host,
+# rest streams to the server, on its Unix socket, as it comes. serve sets where each listens. The site answers any Host,
 # since a shared model's requests arrive under the tailnet name, and bind keeps it on the address it's given.
 {
 	admin off

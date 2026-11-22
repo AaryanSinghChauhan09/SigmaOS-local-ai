@@ -1,9 +1,10 @@
 # Inkling 2 Small across two DGX Sparks: oracle9i88/inkling2-exl3 (0xSero's Inkling-2 overlay for exllamav3, with
 # the two-Spark server) on exllamav3 v1.6.6, as runtimes/inkling2-exl3-pair.toml runs it, published as
 # ghcr.io/omacom/omarchy-local-ai/inkling2-exl3. Both at pinned commits, with the engine's own patch and overlay and
-# no changes of ours. Built on NVIDIA's PyTorch container, which the extension is built against. The server checks no
+# one change of ours. Built on NVIDIA's PyTorch container, which the extension is built against. The server checks no
 # key, so on the rank that serves the API, Caddy answers on the engine's port, refuses any request without the key in
-# I2_API_KEY and streams the rest to the server on loopback.
+# I2_API_KEY and streams the rest to the server over a Unix socket in the container's own /tmp: a paired model shares
+# the host's network, where a port on loopback would let any local account past the key.
 
 # nvcr.io/nvidia/pytorch:26.07-py3 for arm64
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch@sha256:7531d90bcbe0e43e1f7363029c7e145ce90eebeb494a7b4695fdba0329d7c3c3
@@ -26,6 +27,11 @@ RUN git init --quiet /opt/inkling2/engine \
  && git clone --quiet --branch "$EXLLAMAV3" --depth 1 https://github.com/turboderp-org/exllamav3 /opt/inkling2/exllamav3 \
  && git -C /opt/inkling2/exllamav3 apply /opt/inkling2/engine/patches/upstream-modifications.patch \
  && cp -r /opt/inkling2/engine/overlay/exllamav3/. /opt/inkling2/exllamav3/exllamav3/
+# Our one change: the server's API on the Unix socket I2_UDS names instead of a TCP port. The grep fails the build
+# if the line it replaces ever changes.
+RUN sed -i 's|^uvicorn.run(app, host=args.host, port=args.port, log_level="warning")$|uvicorn.run(app, uds=os.environ["I2_UDS"], log_level="warning")|' \
+      /opt/inkling2/engine/server/i2_server.py \
+ && grep -qx 'uvicorn.run(app, uds=os.environ\["I2_UDS"\], log_level="warning")' /opt/inkling2/engine/server/i2_server.py
 # The server's wheels, by the hashes the engine's lock file pins, and the few it leaves out, by ours. The import is
 # what the server imports, so a missing one fails here rather than at the end of a ten-minute start.
 COPY requirements-extra.txt /opt/inkling2/requirements-extra.txt
