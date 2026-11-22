@@ -218,6 +218,12 @@ with patch.object(a, "platform_name", return_value="x86"), patch.object(a, "amd_
   halo = a.machine_profile()["gpus"][0]
 needs_more = dict(variant, peak_gpu_gib=38, peak_ram_gib=38)
 check("a unified AMD GPU fits by the cap use can raise it to", halo["max_memory_gib"] == 54 and a.fits(needs_more, profile, halo)[0])
+# A 64 GB Arc B390 on a stock kernel: the page limit holds it to half of RAM, Mesa to three quarters.
+arc_b390 = {"vendor": "intel", "family": "intel-arc-b390", "memory_gib": 31.15, "unified": True}
+with patch.object(a, "platform_name", return_value="x86"), patch.object(a, "amd_gpus", return_value=[]), patch.object(a, "intel_gpus", return_value=[dict(arc_b390)]), patch.object(a, "meminfo", return_value={"MemTotal": 62.3 * 2**30}):
+  arc_b390 = a.machine_profile()["gpus"][0]
+check("an Intel GPU fits by the three quarters Mesa lets it address once use raises the cap", abs(arc_b390["max_memory_gib"] - 46.7) < 0.1 and a.fits(needs_more, profile, arc_b390)[0]
+      and not a.fits(dict(needs_more, peak_gpu_gib=48), profile, arc_b390)[0])
 check("a GPU with VRAM of its own fits only by what it has", not a.fits(needs_more, profile, dict(halo, max_memory_gib=a.gpu_memory_ceiling_gib(dict(halo, unified=False), 62)))[0])
 page = os.sysconf("SC_PAGE_SIZE")
 with patch.object(a, "pending_pages_limit", return_value=54 * 2**30 // page), patch.object(a, "_read", return_value=str(31 * 2**30 // page)), patch.object(a, "choose_gpu", return_value=halo):

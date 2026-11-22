@@ -93,7 +93,7 @@ RAM. A measurement on the machine's class is not needed; it gives the panel spee
 also checks current free RAM and GPU memory and reserves 8 GiB for the desktop.
 An Intel GPU is integrated graphics on the `xe` kernel driver (Lunar Lake and newer), named by
 `INTEL_FAMILIES` or else `intel-xe-<device id>`, addressing
-three quarters of RAM up to the kernel's `ttm.pages_limit`. Memory a GPU driver freed and still
+three quarters of RAM up to the kernel's `ttm.pages_limit`; `use` raises that limit as it does for a unified AMD GPU, so a model fits by the three quarters. Memory a GPU driver freed and still
 holds in its pool (`GPUReclaim` in `/proc/meminfo`) counts as free RAM: the next model loads into it.
 Use, start and removal are serialized. Several models can run at once on distinct,
 stable loopback ports, beginning at 11435.

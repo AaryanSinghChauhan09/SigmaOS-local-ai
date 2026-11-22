@@ -53,10 +53,11 @@ PROGRESS_PUBLISH_SECONDS = 0.5
 PROGRESS_WINDOW_SECONDS = 4
 NOT_ENOUGH_MEMORY = "Not enough memory to start model"
 REBOOT_FOR_GPU_MEMORY = "Reboot to raise the GPU memory limit"
-# The kernel lets a GPU map at most half of RAM. A unified-memory AMD GPU has next to no VRAM of
-# its own, so that is all it can use; use raises the cap to all of RAM but the desktop's reserve,
-# through a kernel parameter in this drop-in that applies at the next boot.
-# The same drop-in Omarchy writes on AMD machines (omarchy-apply-amd-gpu-memory).
+# The kernel lets a GPU map at most half of RAM. A unified-memory AMD or Intel GPU has next to no
+# VRAM of its own, so that is all it can use; use raises the cap to all of RAM but the desktop's
+# reserve, through a kernel parameter in this drop-in that applies at the next boot.
+# The same drop-in Omarchy writes on AMD machines (omarchy-apply-amd-gpu-memory), kept by that name
+# on Intel too so a raise already waiting is found whichever wrote it.
 GPU_MEMORY_DROP_IN = "/etc/limine-entry-tool.d/amd-gpu-memory.conf"
 TTM_PAGES_LIMIT = "/sys/module/ttm/parameters/pages_limit"
 GPU_TOO_SMALL = "Not enough GPU memory"
@@ -322,9 +323,13 @@ def intel_gpus(ram_gib, drm_root="/sys/class/drm"):
 
 def gpu_memory_ceiling_gib(gpu, ram_gib):
   """The most memory this GPU can be given to address: a unified AMD GPU's cap can rise to all of
-  RAM but the desktop's reserve, any other GPU has what it has."""
+  RAM but the desktop's reserve, an Intel one's to the three quarters Mesa lets it address (xe sizes
+  its own share at all of RAM, so the kernel's page limit is all that holds it lower), any other GPU
+  has what it has."""
   if gpu["vendor"] == "amd" and gpu.get("unified"):
     return round(max(gpu["memory_gib"], ram_gib - RESERVE_GIB), 2)
+  if gpu["vendor"] == "intel":
+    return round(max(gpu["memory_gib"], min(ram_gib * INTEL_MEMORY_SHARE, ram_gib - RESERVE_GIB)), 2)
   return gpu["memory_gib"]
 
 
@@ -355,15 +360,15 @@ def gpu_short_error(variant, gpu):
 
 
 def raise_gpu_memory(variant, gpu, detach=False):
-  """Raises a unified AMD GPU's memory cap when the variant needs more than the GPU addresses now.
+  """Raises a unified GPU's memory cap when the variant needs more than the GPU addresses now.
   It applies at the next boot, so the model starts once the machine has rebooted. The panel's
   setup has no terminal for sudo, so polkit asks for the password instead."""
   if variant["peak_gpu_gib"] <= gpu["memory_gib"] or variant["peak_gpu_gib"] > gpu.get("max_memory_gib", gpu["memory_gib"]):
     return
   pages = gpu_pages_limit(meminfo().get("MemTotal", 0))
   if int(_read(TTM_PAGES_LIMIT, "0") or 0) >= pages:
-    raise LocalError(f"The kernel already lets the GPU map {gib(pages * os.sysconf('SC_PAGE_SIZE')):.0f} GiB, but it addresses {gpu['memory_gib']:.0f}: "
-                     "amdgpu.gttsize on the kernel command line may be holding it lower")
+    hint = ": amdgpu.gttsize on the kernel command line may be holding it lower" if gpu["vendor"] == "amd" else ""
+    raise LocalError(f"The kernel already lets the GPU map {gib(pages * os.sysconf('SC_PAGE_SIZE')):.0f} GiB, but it addresses {gpu['memory_gib']:.0f}{hint}")
   if pending_pages_limit() >= pages:
     return
   if not shutil.which("limine-mkinitcpio"):
@@ -394,7 +399,9 @@ def machine_profile():
   gpus = amd_gpus()
   for gpu in gpus:
     gpu["max_memory_gib"] = gpu_memory_ceiling_gib(gpu, ram)
-  gpus += intel_gpus(ram)
+  for gpu in intel_gpus(ram):
+    gpu["max_memory_gib"] = gpu_memory_ceiling_gib(gpu, ram)
+    gpus.append(gpu)
   if platform in NVIDIA_UNIFIED_FAMILIES:
     gpus.append({"vendor": "nvidia", "family": NVIDIA_UNIFIED_FAMILIES[platform], "render_node": "", "vram_gib": 0, "gtt_gib": 0, "unified": True, "memory_gib": round(ram, 2), "sysfs": ""})
   profile = {"platform": platform, "ram_gib": round(ram, 2), "ram_class": ram_class(ram), "gpus": gpus}
