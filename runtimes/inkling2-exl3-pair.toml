@@ -4,9 +4,9 @@
 # OpenAI-compatible API with streaming, reasoning, tool calls and images. torchrun takes the rank and the rendezvous
 # from its PET_* variables. The server checks no key, so on rank 0 the image's Caddy answers on the model's port,
 # refuses any request without the key in I2_API_KEY and streams the rest to the server on loopback.
-image = "localhost/inkling2-exl3@sha256:ac86d4543edbbe50c153dd86a05ca62beccbd9871b3a4dcc7c3cd4f88903e922"
+image = "ghcr.io/omacom/omarchy-local-ai/inkling2-exl3@sha256:8a5c08b9d3c27113eb86e5581b148f745abde6466a8aa1be7df87cd1f67de89b"
 tier = "third-party"
-review = "reviews/inkling2-exl3-ac86d4543edb.toml"
+review = "reviews/inkling2-exl3-8a5c08b9d3c2.toml"
 port = 18100
 command = ["serve"]
 listen = { host = "--host", port = "--port" }
