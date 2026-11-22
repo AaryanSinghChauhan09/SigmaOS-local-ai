@@ -4,9 +4,9 @@
 # OpenAI-compatible API with streaming, reasoning, tool calls and images. torchrun takes the rank and the rendezvous
 # from its PET_* variables. The server checks no key, so on rank 0 the image's Caddy answers on the model's port,
 # refuses any request without the key in I2_API_KEY and streams the rest to the server on loopback.
-image = "localhost/inkling2-exl3@sha256:5bfe02e438d16c0be3cdfe8ca6b059b8c461d639b2c0531fbf4a5406f13e0ed4"
+image = "localhost/inkling2-exl3@sha256:ac86d4543edbbe50c153dd86a05ca62beccbd9871b3a4dcc7c3cd4f88903e922"
 tier = "third-party"
-review = "reviews/inkling2-exl3-5bfe02e438d1.toml"
+review = "reviews/inkling2-exl3-ac86d4543edb.toml"
 port = 18100
 command = ["serve"]
 listen = { host = "--host", port = "--port" }
