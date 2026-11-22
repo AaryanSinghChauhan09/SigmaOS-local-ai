@@ -56,8 +56,9 @@ REBOOT_FOR_GPU_MEMORY = "Reboot to raise the GPU memory limit"
 # The kernel lets a GPU map at most half of RAM. A unified-memory AMD or Intel GPU has next to no
 # VRAM of its own, so that is all it can use; use raises the cap to all of RAM but the desktop's
 # reserve, through a kernel parameter in this drop-in that applies at the next boot.
-# The same drop-in Omarchy writes on AMD machines (omarchy-apply-amd-gpu-memory), kept by that name
-# on Intel too so a raise already waiting is found whichever wrote it.
+# The same drop-in Omarchy writes on AMD and Intel machines (omarchy-apply-gpu-memory; before
+# omacom/omarchy#19765, omarchy-apply-amd-gpu-memory), named from when only AMD got it, so a raise
+# already waiting is found whichever wrote it.
 GPU_MEMORY_DROP_IN = "/etc/limine-entry-tool.d/amd-gpu-memory.conf"
 TTM_PAGES_LIMIT = "/sys/module/ttm/parameters/pages_limit"
 GPU_TOO_SMALL = "Not enough GPU memory"
