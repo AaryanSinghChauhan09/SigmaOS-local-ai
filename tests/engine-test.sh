@@ -470,7 +470,41 @@ pair_port = a.port_for("paired")
 check("the pair unit shares the host network and publishes nothing", "Network=host" in pair_text and "PublishPort" not in pair_text)
 check("the pair unit binds its API to loopback on the model's port", f'"--host" "127.0.0.1" "--port" "{pair_port}"' in pair_text and f"127.0.0.1:{pair_port}/health" in pair_text)
 check("the pair unit mounts rank 0's inputs and reads the link from its environment file", f"models/paired/{a.rank_folder('b' * 16, 0, pair_rt)}:/prepared:ro" in pair_text and "EnvironmentFile=%h/.local/state/omarchy/agent-local/pair/paired.env" in pair_text)
-check("the pair unit starts and stops rank 1 with itself", "ExecStartPre=/usr/bin/env omarchy-models link-worker start paired" in pair_text and "ExecStopPost=-/usr/bin/env omarchy-models link-worker stop paired" in pair_text)
+engine = a._quote(a.ENGINE)
+check("the pair unit starts and stops rank 1 with itself, run by the engine's own path",
+      f"ExecStartPre={engine} link-worker start paired" in pair_text and f"ExecStopPost=-{engine} link-worker stop paired" in pair_text
+      and a.ENGINE.startswith("/") and os.path.basename(a.ENGINE) == "omarchy-local-ai", pair_text)
+check("no unit hook goes through the PATH", "/usr/bin/env" not in pair_text and f"ExecStartPost=-{engine} status --write --started paired" in pair_text)
+# Units an older engine wrote reach it through Omarchy's wrapper on the PATH, or by another engine's
+# path, such as a checkout's; refresh and start point them at the engine running.
+a.write_atomic(a.models_dir() + "/paired.json", "{}")
+for old in ("/usr/bin/env omarchy-models", "/usr/bin/env omarchy-agent-local", '"/home/me/src/omarchy local ai/omarchy-local-ai"'):
+  a.write_atomic(a.quadlet_path("paired"), pair_text.replace(f"{engine} ", f"{old} "))
+  with patch.object(a, "systemctl") as reloaded:
+    first = a.repair_unit_hooks()
+    second = a.repair_unit_hooks()
+  check(f"an older unit's hooks through {old} are pointed at this engine once, and the rest left as it was",
+        first == ["paired"] and second == [] and a._read(a.quadlet_path("paired")) == pair_text.strip() and reloaded.call_count == 1, repr((first, second)))
+# Under the lock: refresh leaves the units alone while another command holds it, as an update may be
+# replacing one, and repairs them once it's free.
+a.write_atomic(a.quadlet_path("paired"), pair_text.replace(f"{engine} ", "/usr/bin/env omarchy-models "))
+import fcntl
+holder = open(os.path.join(a.state_dir(), "lock"), "w")
+fcntl.flock(holder, fcntl.LOCK_EX)
+try:
+  a.repair_unit_hooks(wait=False)
+  busy = False
+except a.LockBusy:
+  busy = True
+check("the repair doesn't wait for a held lock when told not to", busy)
+untouched = "omarchy-models" in a._read(a.quadlet_path("paired")) and a.Lock.held == 0
+fcntl.flock(holder, fcntl.LOCK_UN)
+holder.close()
+with patch.object(a, "systemctl"):
+  freed = a.repair_unit_hooks(wait=False)
+check("while the lock is held it writes nothing; once free it repairs", untouched and freed == ["paired"] and a._read(a.quadlet_path("paired")) == pair_text.strip())
+os.unlink(a.quadlet_path("paired"))
+os.unlink(a.models_dir() + "/paired.json")
 check("a paired runtime may serve its prepared folder", '"--model" "/prepared/model"' in a.render_container("paired", paired, dict(pair_rt, pair=dict(pair_rt["pair"], model="/prepared/model")), paired["variant"][0], {"model": "model"}, pair_gpu, "b" * 16))
 same_rt = copy.deepcopy(pair_rt)
 for key in ("worker", "prepare"):
@@ -1290,7 +1324,7 @@ a.write_atomic(a.remote_key_path("away"), "k" * 32, mode=0o600)
 a.write_atomic(os.path.join(a.remotes_dir(), "away.json"), json.dumps({"host": "away", "dns": "away.tail.ts.net", "ssh": "away"}))
 raises("a network model is named host/recipe", lambda: a.split_remote_id("box/../x"), "host/recipe")
 raises("an SSH target can't smuggle options", lambda: a.ssh_command({"ssh": "-oProxyCommand=x", "dns": ""}, "share", "--export"), "Not an SSH target")
-check("remote commands quote their arguments", a.ssh_command({"ssh": "box", "dns": "box.tail.ts.net"}, "share", "--export")[-2:] == ["box", "omarchy-models share --export"])
+check("remote commands run the engine by its own command, quoted", a.ssh_command({"ssh": "box", "dns": "box.tail.ts.net"}, "share", "--export")[-2:] == ["box", "omarchy-local-ai share --export"])
 
 # A paired, running remote model becomes an overlay with its own provider.
 a.write_atomic(a.remote_key_path("box"), "b" * 32, mode=0o600)

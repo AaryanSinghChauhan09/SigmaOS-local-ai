@@ -46,6 +46,8 @@ SECRET = "omarchy-agent-local-key"
 KEY_ENV = "OMARCHY_LOCAL_KEY"
 KEY_PLACEHOLDER = "@OMARCHY_LOCAL_KEY@"
 RESERVE_GIB = 8
+# This engine's own entry script, which the units and detached setups it writes run by path.
+ENGINE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "omarchy-local-ai")
 # How often a setup rewrites its progress for the panel, and the window its speed is averaged over.
 PROGRESS_PUBLISH_SECONDS = 0.5
 PROGRESS_WINDOW_SECONDS = 4
@@ -1840,21 +1842,22 @@ def render_container(rid, recipe, runtime, variant, roles, gpu, fileset):
     "Restart=on-failure",
     "RestartSec=10s",
   ]
+  # The hooks run this engine by its own path: the systemd user manager's PATH needn't hold
+  # Omarchy's bin, and the engine that wrote the unit is the one that knows it.
+  engine = _quote(ENGINE)
   if pair:
     # Rank 1 starts on the peer first and stops with this unit, however it ends; the start also
     # writes this unit's environment file, the link as it is now.
     lines += [
-      f"ExecStartPre=/usr/bin/env omarchy-models link-worker start {rid}",
-      f"ExecStopPost=-/usr/bin/env omarchy-models link-worker stop {rid}",
+      f"ExecStartPre={engine} link-worker start {rid}",
+      f"ExecStopPost=-{engine} link-worker stop {rid}",
     ]
   lines += [
     # The local models panel watches status.json; every start, stop and crash rewrites it.
-    # systemd resolves a bare name in its own search path, not PATH; env uses the
-    # unit's PATH, which holds Omarchy's bin.
     # Each hook says how the transition ended: systemd still reports it as
     # activating or deactivating while its Post commands run.
-    f"ExecStartPost=-/usr/bin/env omarchy-models status --write --started {rid}",
-    f"ExecStopPost=-/usr/bin/env omarchy-models status --write --stopped {rid}",
+    f"ExecStartPost=-{engine} status --write --started {rid}",
+    f"ExecStopPost=-{engine} status --write --stopped {rid}",
   ]
   return "\n".join(lines) + "\n"
 
@@ -3144,10 +3147,17 @@ def clear_error(rid):
     os.unlink(error_path(rid))
 
 
+class LockBusy(Exception):
+  """Another command holds the lock, and the caller said not to wait for it."""
+
+
 class Lock:
   # A command that holds the lock can run another that takes it (update runs use): only the
   # outermost one locks and unlocks the file.
   held = 0
+
+  def __init__(self, wait=True):
+    self.wait = wait
 
   def __enter__(self):
     Lock.held += 1
@@ -3158,6 +3168,10 @@ class Lock:
     try:
       fcntl.flock(Lock.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+      if not self.wait:
+        Lock.held -= 1
+        Lock.handle.close()
+        raise LockBusy() from None
       say("Another omarchy models command is running; waiting for it")
       fcntl.flock(Lock.handle, fcntl.LOCK_EX)
     return self
@@ -3167,6 +3181,33 @@ class Lock:
     if Lock.held == 0:
       fcntl.flock(Lock.handle, fcntl.LOCK_UN)
       Lock.handle.close()
+
+
+# A model unit's hooks: the command each runs the engine by, then the engine's subcommand. Units
+# an older engine wrote run it through Omarchy's wrapper on the user manager's PATH, which needn't
+# hold Omarchy's bin; others name the path of whichever engine wrote them.
+UNIT_HOOK_RE = re.compile(r'^(Exec(?:StartPre|StartPost|StopPost)=-?)(?:"(?:[^"\\]|\\.)*"|/usr/bin/env \S+|\S+) (link-worker|status) ', re.M)
+
+
+def repair_unit_hooks(wait=True):
+  """Points the hooks of every model unit at this engine, whatever ran them before. A running
+  model keeps its unit as it started; the hooks apply from its next start or stop. Under the lock,
+  so a unit that use, update or remove is replacing is never written back; without wait it raises
+  LockBusy rather than waiting. Returns the models changed."""
+  repaired = []
+  with Lock(wait=wait):
+    for rid in known_models():
+      path = quadlet_path(rid)
+      text = _read(path)
+      if not text:
+        continue
+      fixed = UNIT_HOOK_RE.sub(lambda match: f"{match[1]}{_quote(ENGINE)} {match[2]} ", text)
+      if fixed != text:
+        write_atomic(path, fixed if fixed.endswith("\n") else fixed + "\n")
+        repaired.append(rid)
+    if repaired:
+      systemctl("daemon-reload")
+  return repaired
 
 
 def write_unit_files(rid, container_text):
@@ -3336,7 +3377,7 @@ def detach_use(rid, args, recipe, measured_load=None):
   systemctl("reset-failed", unit)
   if load_model(rid) is None and installing_idle(rid):
     begin_installing(rid, recipe, measured_load)
-  entry = os.path.join(os.path.dirname(os.path.realpath(__file__)), "omarchy-local-ai")
+  entry = ENGINE
   command = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}", f"--description=Set up local model {rid}"]
   # The unit takes these from systemd-run's own environment by name, so the
   # token's value never appears in a process's arguments. The catalog is made
@@ -4031,7 +4072,7 @@ def detach_update(rid, catalog, profile):
   write_atomic(updating_path(rid), "detached\n")
   if installing_idle(rid):
     begin_installing(rid, (load_model(rid) or {}).get("recipe") or {})
-  entry = os.path.join(os.path.dirname(os.path.realpath(__file__)), "omarchy-local-ai")
+  entry = ENGINE
   command = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}", f"--description=Update local model {rid}"]
   env = dict(os.environ)
   if env.get("OMARCHY_LOCAL_AI_CATALOG"):
@@ -4095,6 +4136,8 @@ def _start(args, catalog, profile):
   if unit_active(rid):
     say(f"{rid} is already running at {endpoint(rid)}")
     return 0
+  # Here too, not only at refresh: refresh may be what the old hooks failed to run.
+  repair_unit_hooks()
   gpu = choose_gpu(profile, manifest["gpu"])
   # Shown as loading from the click on; the memory checks below take seconds.
   clear_error(rid)
@@ -4442,6 +4485,10 @@ def cmd_refresh(argv):
   args = parser.parse_args(argv)
   catalog = load_catalog()
   profile = machine_profile()
+  # Not while a setup, update or removal holds the lock, which can be for a long download: the
+  # next refresh or start repairs them.
+  with contextlib.suppress(LockBusy):
+    repair_unit_hooks(wait=False)
   link_probe(profile)
   refresh_list_cache(catalog, profile)
   # The updates show first, their download sizes once the registry and Hugging Face have answered.
@@ -4783,7 +4830,7 @@ def ensure_share_proxy():
     "Description=Omarchy local AI: count who uses the shared models",
     "",
     "[Service]",
-    "ExecStart=/usr/bin/env omarchy-models share-proxy",
+    f"ExecStart={_quote(ENGINE)} share-proxy",
     "Restart=on-failure",
     "",
   ])
@@ -5270,7 +5317,8 @@ def ssh_command(remote, *argv, interactive=False):
   # A host met for the first time is trusted on sight, as the tailnet vouches
   # for who it is; one whose key has changed since is still refused.
   options = ["-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"] + ([] if interactive else ["-o", "BatchMode=yes"])
-  return ["ssh", *options, "--", target, shlex.join(["omarchy-models", *argv])]
+  # The engine's own command, in /usr/bin wherever it's installed: a command over SSH gets no login PATH.
+  return ["ssh", *options, "--", target, shlex.join(["omarchy-local-ai", *argv])]
 
 
 def cmd_pair(argv):
@@ -5313,7 +5361,7 @@ def cmd_pair(argv):
   if result.returncode == 255:
     raise LocalError(f"Can't reach {name} over SSH\nTurn on SSHD on {target} in Setup > Security")
   if result.returncode != 0:
-    raise LocalError(f"Can't run omarchy-models on {name}")
+    raise LocalError(f"Can't run omarchy-local-ai on {name}")
   try:
     export = json.loads(result.stdout.strip().splitlines()[-1])
     host, dns, key = export["host"], export["dns"], export["key"]
