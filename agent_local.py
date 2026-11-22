@@ -3147,10 +3147,17 @@ def clear_error(rid):
     os.unlink(error_path(rid))
 
 
+class LockBusy(Exception):
+  """Another command holds the lock, and the caller said not to wait for it."""
+
+
 class Lock:
   # A command that holds the lock can run another that takes it (update runs use): only the
   # outermost one locks and unlocks the file.
   held = 0
+
+  def __init__(self, wait=True):
+    self.wait = wait
 
   def __enter__(self):
     Lock.held += 1
@@ -3161,6 +3168,10 @@ class Lock:
     try:
       fcntl.flock(Lock.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+      if not self.wait:
+        Lock.held -= 1
+        Lock.handle.close()
+        raise LockBusy() from None
       say("Another omarchy models command is running; waiting for it")
       fcntl.flock(Lock.handle, fcntl.LOCK_EX)
     return self
@@ -3178,22 +3189,24 @@ class Lock:
 UNIT_HOOK_RE = re.compile(r'^(Exec(?:StartPre|StartPost|StopPost)=-?)(?:"(?:[^"\\]|\\.)*"|/usr/bin/env \S+|\S+) (link-worker|status) ', re.M)
 
 
-def repair_unit_hooks():
+def repair_unit_hooks(wait=True):
   """Points the hooks of every model unit at this engine, whatever ran them before. A running
-  model keeps its unit as it started; the hooks apply from its next start or stop. Returns the
-  models changed."""
+  model keeps its unit as it started; the hooks apply from its next start or stop. Under the lock,
+  so a unit that use, update or remove is replacing is never written back; without wait it raises
+  LockBusy rather than waiting. Returns the models changed."""
   repaired = []
-  for rid in known_models():
-    path = quadlet_path(rid)
-    text = _read(path)
-    if not text:
-      continue
-    fixed = UNIT_HOOK_RE.sub(lambda match: f"{match[1]}{_quote(ENGINE)} {match[2]} ", text)
-    if fixed != text:
-      write_atomic(path, fixed if fixed.endswith("\n") else fixed + "\n")
-      repaired.append(rid)
-  if repaired:
-    systemctl("daemon-reload")
+  with Lock(wait=wait):
+    for rid in known_models():
+      path = quadlet_path(rid)
+      text = _read(path)
+      if not text:
+        continue
+      fixed = UNIT_HOOK_RE.sub(lambda match: f"{match[1]}{_quote(ENGINE)} {match[2]} ", text)
+      if fixed != text:
+        write_atomic(path, fixed if fixed.endswith("\n") else fixed + "\n")
+        repaired.append(rid)
+    if repaired:
+      systemctl("daemon-reload")
   return repaired
 
 
@@ -4472,7 +4485,10 @@ def cmd_refresh(argv):
   args = parser.parse_args(argv)
   catalog = load_catalog()
   profile = machine_profile()
-  repair_unit_hooks()
+  # Not while a setup, update or removal holds the lock, which can be for a long download: the
+  # next refresh or start repairs them.
+  with contextlib.suppress(LockBusy):
+    repair_unit_hooks(wait=False)
   link_probe(profile)
   refresh_list_cache(catalog, profile)
   # The updates show first, their download sizes once the registry and Hugging Face have answered.

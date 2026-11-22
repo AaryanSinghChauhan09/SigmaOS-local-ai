@@ -485,6 +485,24 @@ for old in ("/usr/bin/env omarchy-models", "/usr/bin/env omarchy-agent-local", '
     second = a.repair_unit_hooks()
   check(f"an older unit's hooks through {old} are pointed at this engine once, and the rest left as it was",
         first == ["paired"] and second == [] and a._read(a.quadlet_path("paired")) == pair_text.strip() and reloaded.call_count == 1, repr((first, second)))
+# Under the lock: refresh leaves the units alone while another command holds it, as an update may be
+# replacing one, and repairs them once it's free.
+a.write_atomic(a.quadlet_path("paired"), pair_text.replace(f"{engine} ", "/usr/bin/env omarchy-models "))
+import fcntl
+holder = open(os.path.join(a.state_dir(), "lock"), "w")
+fcntl.flock(holder, fcntl.LOCK_EX)
+try:
+  a.repair_unit_hooks(wait=False)
+  busy = False
+except a.LockBusy:
+  busy = True
+check("the repair doesn't wait for a held lock when told not to", busy)
+untouched = "omarchy-models" in a._read(a.quadlet_path("paired")) and a.Lock.held == 0
+fcntl.flock(holder, fcntl.LOCK_UN)
+holder.close()
+with patch.object(a, "systemctl"):
+  freed = a.repair_unit_hooks(wait=False)
+check("while the lock is held it writes nothing; once free it repairs", untouched and freed == ["paired"] and a._read(a.quadlet_path("paired")) == pair_text.strip())
 os.unlink(a.quadlet_path("paired"))
 os.unlink(a.models_dir() + "/paired.json")
 check("a paired runtime may serve its prepared folder", '"--model" "/prepared/model"' in a.render_container("paired", paired, dict(pair_rt, pair=dict(pair_rt["pair"], model="/prepared/model")), paired["variant"][0], {"model": "model"}, pair_gpu, "b" * 16))
