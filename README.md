@@ -1,4 +1,6 @@
-# omarchy-local-ai
+# SigmaOS Local AI
+
+> Forked from [omacom/omarchy-local-ai](https://github.com/omacom/omarchy-local-ai) (MIT). See `SIGMAOS_FORK.md`.
 
 The local-model engine, recipe catalog and internals reference for Omarchy. The Arch package `omarchy-local-ai` installs this tree to `/usr/share/omarchy-local-ai` and symlinks `/usr/bin/omarchy-local-ai` to its executable entry script. Omarchy's thin `omarchy-models` wrapper exposes it as `omarchy models <command>`.
 
