@@ -2,7 +2,7 @@
 
 > Forked from [AaryanSinghChauhan09/SigmaOS-local-ai](https://github.com/AaryanSinghChauhan09/SigmaOS-local-ai) (MIT). See `SIGMAOS_FORK.md`.
 
-The local-model engine, recipe catalog and internals reference for SigmaOS. The Arch package `omarchy-local-ai` installs this tree to `/usr/share/omarchy-local-ai` and symlinks `/usr/bin/omarchy-local-ai` to its executable entry script. SigmaOS's thin `omarchy-models` wrapper exposes it as `omarchy models <command>`.
+The local-model engine, recipe catalog and internals reference for SigmaOS. The Arch package `sigmaos-local-ai` installs this tree to `/usr/share/sigmaos-local-ai` and symlinks `/usr/bin/sigmaos-local-ai` to its executable entry script. SigmaOS's thin `sigmaos-models` wrapper exposes it as `omarchy models <command>`.
 
 The engine resolves recipes, downloads pinned weights, and manages rootless Podman model servers with an internal network, read-only root, dropped capabilities, allowlisted devices and authenticated loopback endpoints. The catalog ships with the engine; it is never fetched at runtime. See [engine contract](docs/engine.md) for the security boundary, lifecycle and state formats.
 
@@ -11,9 +11,9 @@ The engine resolves recipes, downloads pinned weights, and manages rootless Podm
 Python 3.11 or newer is required. On SigmaOS, run:
 
 ```bash
-./omarchy-local-ai list
-./omarchy-local-ai use best text
-./omarchy-local-ai validate .
+./sigmaos-local-ai list
+./sigmaos-local-ai use best text
+./sigmaos-local-ai validate .
 ./tests/engine-test.sh
 ```
 
@@ -35,7 +35,7 @@ The engine reads the catalog beside `agent_local.py`, following the installed en
 ## Add a recipe
 
 1. Add a recipe and any runtime/review it requires, or add a measured hardware class to an existing recipe. Every machine whose GPU the runtime lists in `gpus` and that has the memory for a variant is offered the recipe; `best.toml` decides which machines it is recommended to, and needs a measurement for each class it recommends it for.
-2. Run `./omarchy-local-ai validate .`, then `./omarchy-local-ai use <id>` on the target hardware.
+2. Run `./sigmaos-local-ai validate .`, then `./sigmaos-local-ai use <id>` on the target hardware.
 3. Run `./tools/bench <id> --output measurements/<id>-<gpu>-<ram>.toml` and reference the measurement in the recipe.
 4. Submit the recipe, review and measurement together. CI validates the catalog online and runs engine tests. Merging catalog changes grants software publication authority within the engine's security boundary.
 
@@ -47,8 +47,8 @@ A runtime whose image is built here has its Containerfile in `images/<image>/`: 
 2. Merging it publishes the image: `.github/workflows/images.yml` pushes `ghcr.io/AaryanSinghChauhan09/SigmaOS-local-ai/llamacpp:<version>-<run>` and puts the digest to pin in the run's summary. Run the workflow by hand, naming the image, to rebuild without a change, for the distribution's newer packages.
 3. Pin `ghcr.io/AaryanSinghChauhan09/SigmaOS-local-ai/llamacpp@<digest>` as `image` in `runtimes/llamacpp.toml`.
 4. Review the new digest in `reviews/llamacpp-<first 12 hex of the digest>.toml`, rerunning the checks the last review lists (license, read-only root, no network, key, stop on SIGTERM), and point the runtime's `review` at it. Keep the old review: it records what was reviewed then.
-5. Set the image up with `./omarchy-local-ai use <recipe>` and rebench every recipe on that runtime with `./tools/bench`, since a measurement records the image it was measured on.
-6. Run `./omarchy-local-ai validate .` and `./tests/engine-test.sh`, and submit the runtime, review and measurements together.
+5. Set the image up with `./sigmaos-local-ai use <recipe>` and rebench every recipe on that runtime with `./tools/bench`, since a measurement records the image it was measured on.
+6. Run `./sigmaos-local-ai validate .` and `./tests/engine-test.sh`, and submit the runtime, review and measurements together.
 
 The `llamacpp`, `sdcpp` and `acestep` builds also fail if the image lacks Mesa's AMD or Intel driver, and the `sdcpp` and `acestep` ones if the server uses AVX-512, which Intel laptops and older AMD machines don't have.
 
@@ -56,11 +56,11 @@ To build one locally instead: `podman build --format docker -t llamacpp images/l
 
 ## Releases and packaging
 
-Validate and test, then tag the release `vX.Y.Z`; nothing in the repo is bumped. The `omarchy-pkgs` recipe builds the Arch package from that tag, installing the engine, catalog and docs together. Packaging is maintained in `omarchy-pkgs`; this repository is its source tree.
+Validate and test, then tag the release `vX.Y.Z`; nothing in the repo is bumped. The `sigmaos-pkgs` recipe builds the Arch package from that tag, installing the engine, catalog and docs together. Packaging is maintained in `sigmaos-pkgs`; this repository is its source tree.
 
 `bench/` and `tools/` do not need to ship in the Arch package. Measurement records still ship: recipe validation and the panel use them.
 
-After package updates, `omarchy-models refresh --quiet` rewrites the panel's list and status caches. It does not download a catalog or change running models.
+After package updates, `sigmaos-models refresh --quiet` rewrites the panel's list and status caches. It does not download a catalog or change running models.
 ## Documentation
 
 Wiki documentation is available in the SigmaOS Wiki Staging repository:
