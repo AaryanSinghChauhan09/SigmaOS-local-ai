@@ -61,3 +61,8 @@ Validate and test, then tag the release `vX.Y.Z`; nothing in the repo is bumped.
 `bench/` and `tools/` do not need to ship in the Arch package. Measurement records still ship: recipe validation and the panel use them.
 
 After package updates, `omarchy-models refresh --quiet` rewrites the panel's list and status caches. It does not download a catalog or change running models.
+## Documentation
+
+Wiki documentation is available in the SigmaOS Wiki Staging repository:
+
+- [SigmaOS Wiki Staging](https://github.com/AaryanSinghChauhan09/sigmaos-wiki-staging#SigmaOS-local-ai) - Full Wiki documentation for all SigmaOS components
