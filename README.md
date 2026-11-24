@@ -19,7 +19,7 @@ Python 3.11 or newer is required. On SigmaOS, run:
 
 Running models also requires Podman, crun and the SigmaOS hardware helpers. Tests use a temporary home and do not start containers. If installed, the real Podman Quadlet generator checks generated units in dry-run mode.
 
-The engine reads the catalog beside `agent_local.py`, following the installed entry script's symlink. Set `OMARCHY_LOCAL_AI_CATALOG` to another catalog directory for development. State and model data live in `~/.local/state/omarchy/agent-local` and `~/.local/share/omarchy/agent-local`.
+The engine reads the catalog beside `agent_local.py`, following the installed entry script's symlink. Set `OMARCHY_LOCAL_AI_CATALOG` to another catalog directory for development. State and model data live in `~/.local/state/sigmaos/agent-local` and `~/.local/share/omarchy/agent-local`.
 
 ## Catalog layout
 
