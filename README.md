@@ -1,14 +1,14 @@
 # SigmaOS Local AI
 
-> Forked from [omacom/omarchy-local-ai](https://github.com/omacom/omarchy-local-ai) (MIT). See `SIGMAOS_FORK.md`.
+> Forked from [AaryanSinghChauhan09/SigmaOS-local-ai](https://github.com/AaryanSinghChauhan09/SigmaOS-local-ai) (MIT). See `SIGMAOS_FORK.md`.
 
-The local-model engine, recipe catalog and internals reference for Omarchy. The Arch package `omarchy-local-ai` installs this tree to `/usr/share/omarchy-local-ai` and symlinks `/usr/bin/omarchy-local-ai` to its executable entry script. Omarchy's thin `omarchy-models` wrapper exposes it as `omarchy models <command>`.
+The local-model engine, recipe catalog and internals reference for SigmaOS. The Arch package `omarchy-local-ai` installs this tree to `/usr/share/omarchy-local-ai` and symlinks `/usr/bin/omarchy-local-ai` to its executable entry script. SigmaOS's thin `omarchy-models` wrapper exposes it as `omarchy models <command>`.
 
 The engine resolves recipes, downloads pinned weights, and manages rootless Podman model servers with an internal network, read-only root, dropped capabilities, allowlisted devices and authenticated loopback endpoints. The catalog ships with the engine; it is never fetched at runtime. See [engine contract](docs/engine.md) for the security boundary, lifecycle and state formats.
 
 ## Run from a checkout
 
-Python 3.11 or newer is required. On Omarchy, run:
+Python 3.11 or newer is required. On SigmaOS, run:
 
 ```bash
 ./omarchy-local-ai list
@@ -17,7 +17,7 @@ Python 3.11 or newer is required. On Omarchy, run:
 ./tests/engine-test.sh
 ```
 
-Running models also requires Podman, crun and the Omarchy hardware helpers. Tests use a temporary home and do not start containers. If installed, the real Podman Quadlet generator checks generated units in dry-run mode.
+Running models also requires Podman, crun and the SigmaOS hardware helpers. Tests use a temporary home and do not start containers. If installed, the real Podman Quadlet generator checks generated units in dry-run mode.
 
 The engine reads the catalog beside `agent_local.py`, following the installed entry script's symlink. Set `OMARCHY_LOCAL_AI_CATALOG` to another catalog directory for development. State and model data live in `~/.local/state/omarchy/agent-local` and `~/.local/share/omarchy/agent-local`.
 
@@ -44,8 +44,8 @@ The engine reads the catalog beside `agent_local.py`, following the installed en
 A runtime whose image is built here has its Containerfile in `images/<image>/`: `llamacpp`, `sdcpp`, `sdcpp-cuda`, `acestep`, `acestep-cuda`, `tensorfold`, `tensorfold-dsv41`, `tensorfold-glm53`, `tensorfold-nemotron-bolt`, `llamacpp-hy4` and `inkling2-exl3`. The base image and upstream commits are pinned in the Containerfile, but packages come from the distribution at build time, so a rebuild gives a new digest even with nothing changed. To update one, for example to a newer llama.cpp:
 
 1. Change the pinned `COMMIT` and its `BUILD` tag, or the base digest, in `images/llamacpp/Containerfile`, in a pull request. CI builds every image a pull request changes, to check it.
-2. Merging it publishes the image: `.github/workflows/images.yml` pushes `ghcr.io/omacom/omarchy-local-ai/llamacpp:<version>-<run>` and puts the digest to pin in the run's summary. Run the workflow by hand, naming the image, to rebuild without a change, for the distribution's newer packages.
-3. Pin `ghcr.io/omacom/omarchy-local-ai/llamacpp@<digest>` as `image` in `runtimes/llamacpp.toml`.
+2. Merging it publishes the image: `.github/workflows/images.yml` pushes `ghcr.io/AaryanSinghChauhan09/SigmaOS-local-ai/llamacpp:<version>-<run>` and puts the digest to pin in the run's summary. Run the workflow by hand, naming the image, to rebuild without a change, for the distribution's newer packages.
+3. Pin `ghcr.io/AaryanSinghChauhan09/SigmaOS-local-ai/llamacpp@<digest>` as `image` in `runtimes/llamacpp.toml`.
 4. Review the new digest in `reviews/llamacpp-<first 12 hex of the digest>.toml`, rerunning the checks the last review lists (license, read-only root, no network, key, stop on SIGTERM), and point the runtime's `review` at it. Keep the old review: it records what was reviewed then.
 5. Set the image up with `./omarchy-local-ai use <recipe>` and rebench every recipe on that runtime with `./tools/bench`, since a measurement records the image it was measured on.
 6. Run `./omarchy-local-ai validate .` and `./tests/engine-test.sh`, and submit the runtime, review and measurements together.
