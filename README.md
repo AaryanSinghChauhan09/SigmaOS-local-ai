@@ -2,7 +2,7 @@
 
 > Forked from [AaryanSinghChauhan09/SigmaOS-local-ai](https://github.com/AaryanSinghChauhan09/SigmaOS-local-ai) (MIT). See `SIGMAOS_FORK.md`.
 
-The local-model engine, recipe catalog and internals reference for SigmaOS. The Arch package `sigmaos-local-ai` installs this tree to `/usr/share/sigmaos-local-ai` and symlinks `/usr/bin/sigmaos-local-ai` to its executable entry script. SigmaOS's thin `sigmaos-models` wrapper exposes it as `omarchy models <command>`.
+The local-model engine, recipe catalog and internals reference for SigmaOS. The Arch package `sigmaos-local-ai` installs this tree to `/usr/share/sigmaos-local-ai` and symlinks `/usr/bin/sigmaos-local-ai` to its executable entry script. SigmaOS's thin `sigmaos-models` wrapper exposes it as `sigmaos models <command>`.
 
 The engine resolves recipes, downloads pinned weights, and manages rootless Podman model servers with an internal network, read-only root, dropped capabilities, allowlisted devices and authenticated loopback endpoints. The catalog ships with the engine; it is never fetched at runtime. See [engine contract](docs/engine.md) for the security boundary, lifecycle and state formats.
 
@@ -19,7 +19,7 @@ Python 3.11 or newer is required. On SigmaOS, run:
 
 Running models also requires Podman, crun and the SigmaOS hardware helpers. Tests use a temporary home and do not start containers. If installed, the real Podman Quadlet generator checks generated units in dry-run mode.
 
-The engine reads the catalog beside `agent_local.py`, following the installed entry script's symlink. Set `OMARCHY_LOCAL_AI_CATALOG` to another catalog directory for development. State and model data live in `~/.local/state/sigmaos/agent-local` and `~/.local/share/omarchy/agent-local`.
+The engine reads the catalog beside `agent_local.py`, following the installed entry script's symlink. Set `SIGMAOS_LOCAL_AI_CATALOG` to another catalog directory for development. State and model data live in `~/.local/state/sigmaos/agent-local` and `~/.local/share/sigmaos/agent-local`.
 
 ## Catalog layout
 
